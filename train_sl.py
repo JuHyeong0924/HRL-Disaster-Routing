@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime
 
 # [Warning Suppression] Filter PyTorch Prototype Warnings
 import warnings
@@ -178,7 +179,10 @@ def train_sl(args):
     mgr_criterion = nn.CrossEntropyLoss(ignore_index=-100)
     wkr_criterion = nn.CrossEntropyLoss()
     
-    save_dir = "logs/sl_pretrain"
+    # 타임스탬프 서브폴더 생성: logs/sl_pretrain/<YYYY-MM-DD_HHMM>_sl_ep<N>/
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
+    run_label = f"{timestamp}_sl_ep{args.epochs}"
+    save_dir = os.path.join("logs", "sl_pretrain", run_label)
     os.makedirs(save_dir, exist_ok=True)
     
     # 학습 곡선 기록용
@@ -869,8 +873,8 @@ def train_sl(args):
                 curr_node_idx = pred
             wkr_total += 1
         
-        # [Check] Save Checkpoint every 10 epochs (User Request)
-        if epoch % 10 == 0:
+        # [Check] Save Checkpoint every 20 epochs (총 에폭이 20 이하면 final만 저장)
+        if args.epochs > 20 and epoch % 20 == 0:
             ckpt_path = os.path.join(save_dir, f"model_sl_epoch{epoch}.pt")
             checkpoint_data = {
                 'manager_state': manager.state_dict(),

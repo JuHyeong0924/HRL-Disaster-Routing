@@ -1,0 +1,41 @@
+\begin{table}[t]
+  \centering
+  \caption{Hyperparameters and Training Settings}
+  \label{tab:hyperparameters}
+  \begin{tabular}{l l}
+    \toprule
+    \textbf{Parameter} & \textbf{Value} \\
+    \midrule
+    \multicolumn{2}{l}{\textit{Architecture}} \\
+    \quad Hidden Dimension ($H$) & 256 \\
+    \quad Manager Encoder Layers & 3 \\
+    \quad Manager Attention Heads & 4 \\
+    \quad Worker GATv2 Layers & 3 (Residual) \\
+    \quad Worker Scorer Heads & 4 \\
+    \quad Laplacian PE Eigenvectors ($k$) & 8 \\
+    \quad Dropout & 0.2 \\
+    \midrule
+    \multicolumn{2}{l}{\textit{SL Pre-training}} \\
+    \quad Epochs & 20 \\
+    \quad Batch Size & 32 \\
+    \quad Teacher Forcing Ratio & $1.0 \to 0.0$ \\
+    \midrule
+    \multicolumn{2}{l}{\textit{RL Fine-tuning (Phase 1 APTE)}} \\
+    \quad Learning Rate & 0.0001 \\
+    \quad POMO Batch Size & 32 \\
+    \quad Episodes & 10000 \\
+    \quad Max Rollout Steps & 400 \\
+    \quad LR Schedule & CosineAnnealing \\
+    \quad LR Floor ($\eta_{\min}$) & 1e-05 \\
+    \midrule
+    \multicolumn{2}{l}{\textit{Reward Function}} \\
+    \quad Goal Reward ($R_3$) & 40.0 \\
+    \quad Fail Penalty ($P_3$) & -20.0 \\
+    \quad PBRS Scale & 6.5 \\
+    \quad PBRS Discount ($\gamma$) & 0.99 \\
+    \quad Efficiency Max ($R_4$) & 8.0 \\
+    \quad Loop Limit & 6 \\
+    \quad Stagnation Patience & 24 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

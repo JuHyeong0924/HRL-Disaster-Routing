@@ -35,7 +35,7 @@ class ManagerStageTrainer(DOMOTrainer):
             p.requires_grad_(False)
         self.mgr_opt = optim.Adam(self.manager.parameters(), lr=self.config.lr)
         self.wkr_opt = None
-        self.sparse_warmstart_ratio = 0.35
+        self.sparse_warmstart_ratio = 0.20  # [Refactor: Task 1] 초반 20%% A* Anchor CE 웜스타트
 
     def _compute_manager_plan_score(self, plan_diag):
         plan_lengths = plan_diag['plan_lengths']

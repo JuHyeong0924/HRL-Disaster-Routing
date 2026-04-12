@@ -59,8 +59,13 @@ class WorkerLSTM(nn.Module):
             ) for _ in range(num_scorer_heads)
         ])
         
-        # 4. Value Head (Critic)
-        self.critic = nn.Linear(hidden_dim, 1)
+        # 4. Value Head (Critic): [Refactor: Task 2] 2-Layer MLP 고도화
+        # Why: 복잡한 PBRS 보상 환경에서 Explained Variance 붕괴 방지
+        self.critic = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
         
     def predict_next_hop(self, x: torch.Tensor, edge_index: torch.Tensor, 
                          h_state: torch.Tensor, c_state: torch.Tensor, 

@@ -124,7 +124,7 @@ class WorkerStageTrainer(DOMOTrainer):
         self.wkr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.wkr_opt,
             T_max=episodes,
-            eta_min=self.config.lr * 0.1,
+            eta_min=max(self.config.lr * 0.1, 1e-5),  # [Refactor: Task 5] 최소 학습률 1e-5 보장
         )
 
         history = {'rewards': [], 'losses': [], 'path_lengths': [], 'success_rates': []}
@@ -168,7 +168,7 @@ class WorkerStageTrainer(DOMOTrainer):
                 plan_diag=plan_diag,
                 detach_spatial=False,
                 collect_worker_aux=True,
-                handoff_aux_boost=2.0,
+                handoff_aux_boost=5.0,  # [Refactor: Task 4] Handoff 직후 A* 모방 가중치 5배 증폭
                 enable_skip=False,
             )
 

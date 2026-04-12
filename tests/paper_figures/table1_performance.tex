@@ -1,0 +1,16 @@
+\begin{table}[t]
+  \centering
+  \caption{Quantitative Performance Comparison on Anaheim Network (416 nodes)}
+  \label{tab:performance}
+  \begin{tabular}{lccc}
+    \toprule
+    \textbf{Method} & \textbf{Success Rate (\%)} & \textbf{PLR (vs.\ A*)} & \textbf{Latency (ms/step)} \\
+    \midrule
+    A* Search (Expert) & 100.0 & 1.000 (Optimal) & 0.22 \\
+    SL Pre-train (Baseline) & 100.0 & 1.188 & 8.60 \\
+    Proposed HRL (Ours) & 100.0 & 1.197 & 8.66 \\
+    \bottomrule
+  \end{tabular}
+  \vspace{2mm}
+  \footnotesize{PLR: Path Length Ratio (actual steps / optimal hops). Lower is better.}
+\end{table}

@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.amp import autocast, GradScaler  # AMP: VRAM 절감용 혼합 정밀도
 from tqdm import tqdm
 
 class DOMOTrainer: 
@@ -47,7 +48,7 @@ class DOMOTrainer:
             'MILESTONE_50': 1.5,
             'MILESTONE_75': 3.0,
             'FAIL_PENALTY': -20.0,
-            'LOOP_PENALTY_SCALE': 0.3,
+            'LOOP_PENALTY_SCALE': 0.1,
             'EXPLORATION_BONUS': 0.0,
             'BASE_STEP_PENALTY': -0.02,
             'TIME_PRESSURE_SCALE': 2.0,
@@ -78,19 +79,25 @@ class DOMOTrainer:
             'return_eps': 1e-6,
             'huber_beta': 1.0,
         }
-        self.mgr_max_grad_norm = float(getattr(config, 'mgr_max_grad_norm', 10.0))
+        self.mgr_max_grad_norm = float(getattr(config, 'mgr_max_grad_norm', 5.0))
         self.wkr_max_grad_norm = float(getattr(config, 'wkr_max_grad_norm', 5.0))
         self.mgr_aux_start = float(getattr(config, 'mgr_aux_start', 0.20))
-        self.mgr_aux_end = float(getattr(config, 'mgr_aux_end', 0.05))
+        self.mgr_aux_end = float(getattr(config, 'mgr_aux_end', 0.15))
         self.wkr_aux_start = float(getattr(config, 'wkr_aux_start', 0.20))
         self.wkr_aux_end = float(getattr(config, 'wkr_aux_end', 0.05))
-        self.mgr_lr_scale = float(getattr(config, 'mgr_lr_scale', 0.5))
+        self.mgr_lr_scale = float(getattr(config, 'mgr_lr_scale', 0.7))
         self.mgr_eta_min_scale = float(getattr(config, 'mgr_eta_min_scale', 0.1))
         self.stage = str(getattr(config, 'stage', 'joint'))
         self.ret_ema_mean = None
         self.ret_ema_std = None
         self._handoff_target_warned = False
+        # [Refactor: Task 4] Goal에서 멀어지는 행동 페널티 (Post-Handoff 시 3.0으로 강화)
+        self.goal_regression_penalty_large = float(getattr(config, "goal_regression_penalty_large", 0.35))
         self._run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # AMP: Mixed Precision 설정 (VRAM 30~40% 절감)
+        self.use_amp = torch.cuda.is_available()
+        self.grad_scaler = GradScaler('cuda', enabled=self.use_amp)
 
         self.manager.to(self.device).train()
         self.worker.to(self.device).train()
@@ -157,16 +164,18 @@ class DOMOTrainer:
             temperature = max(0.5, 1.5 - curriculum_ratio)
             # edge_attr 슬라이싱: Env 9D → 모델 5D [length, damage, is_closed, is_danger, speed]
             ea = self.env.pyg_data.edge_attr[:, [0, 1, 4, 6, 8]]
-            sequences, _ = self.manager.generate(
-                x_mgr_in,
-                edge_index,
-                batch_vec,
-                max_len=20,
-                temperature=temperature,
-                apsp_matrix=self.env.hop_matrix,
-                node_positions=self.env.pos_tensor,
-                edge_attr=ea,
-            )
+            # AMP: Manager generate는 autocast로 감싸 메모리 절감
+            with autocast('cuda', enabled=self.use_amp):
+                sequences, _ = self.manager.generate(
+                    x_mgr_in,
+                    edge_index,
+                    batch_vec,
+                    max_len=20,
+                    temperature=temperature,
+                    apsp_matrix=self.env.hop_matrix,
+                    node_positions=self.env.pos_tensor,
+                    edge_attr=ea,
+                )
             
             # 3. Vectorized Execution
             x_pos = self.env.pyg_data.x[:, :2].clone()
@@ -205,29 +214,35 @@ class DOMOTrainer:
             # sequences contains indices [0~N-1] and EOS [N] and PAD/Dummy
             # We need to gather from node_enc(x_mgr_in) and eos_emb
             
-            # 1. Base Node Embeddings (GATv2Conv)
-            node_emb_all = self.manager.topology_enc(x_mgr_in, edge_index, edge_attr=ea) # [B*N, H]
-            from torch_geometric.utils import to_dense_batch
-            node_emb_dense, mask_dense = to_dense_batch(node_emb_all, batch_vec) # [B, N, H]
+            # AMP: Manager loss 계산을 autocast로 감싸 VRAM 절감
+            with autocast('cuda', enabled=self.use_amp):
+                # 1. Base Node Embeddings (GATv2Conv)
+                node_emb_all = self.manager.topology_enc(x_mgr_in, edge_index, edge_attr=ea) # [B*N, H]
+                from torch_geometric.utils import to_dense_batch
+                node_emb_dense, mask_dense = to_dense_batch(node_emb_all, batch_vec) # [B, N, H]
+                
+                # 2. Append EOS Embedding
+                B, N, H = node_emb_dense.shape
+                eos_node_emb = self.manager.eos_token_emb.expand(B, 1, H)
+                full_ref_embs = torch.cat([node_emb_dense, eos_node_emb], dim=1) # [B, N+1, H]
+                
+                # 3. Gather teacher-forcing embeddings for sampled rollout sequence
+                target_seq_emb = self._gather_manager_teacher_embeddings(full_ref_embs, target_seq, N)
+                
+                # Forward
+                mgr_logits = self.manager(x_mgr_in, edge_index, batch_vec, target_seq_emb, edge_attr=ea)
+                mgr_logits = mgr_logits[:, :-1, :].contiguous()
+                # [Fix] Logit clamping: NLL 폭발 방지 (logit이 ±20 이상이면 CE가 수십~수백으로 폭주)
+                mgr_logits = mgr_logits.clamp(-20.0, 20.0)
             
-            # 2. Append EOS Embedding
-            B, N, H = node_emb_dense.shape
-            eos_node_emb = self.manager.eos_token_emb.expand(B, 1, H)
-            full_ref_embs = torch.cat([node_emb_dense, eos_node_emb], dim=1) # [B, N+1, H]
-            
-            # 3. Gather teacher-forcing embeddings for sampled rollout sequence
-            target_seq_emb = self._gather_manager_teacher_embeddings(full_ref_embs, target_seq, N)
-            
-            # Forward
-            mgr_logits = self.manager(x_mgr_in, edge_index, batch_vec, target_seq_emb, edge_attr=ea)
-            mgr_logits = mgr_logits[:, :-1, :].contiguous()
-            
+            # AMP 경고: CE Loss는 float32에서 수행 (수치 안정성)
+            mgr_logits_f32 = mgr_logits.float()
             # [Fix 3] Log-Prob 정규화
             # vocab_size is dynamic (N+1)
-            vocab_size = mgr_logits.size(-1) 
+            vocab_size = mgr_logits_f32.size(-1) 
             
             mgr_nll = F.cross_entropy(
-                mgr_logits.view(-1, vocab_size), 
+                mgr_logits_f32.view(-1, vocab_size), 
                 target_seq.view(-1), 
                 reduction='none', 
                 ignore_index=self.manager.PAD_TOKEN
@@ -252,12 +267,18 @@ class DOMOTrainer:
             if ref_token_count < aux_seq_len:
                 aux_target_seq[:, ref_token_count] = N
 
-            aux_target_seq_emb = self._gather_manager_teacher_embeddings(full_ref_embs, aux_target_seq, N)
-            aux_logits = self.manager(x_mgr_in, edge_index, batch_vec, aux_target_seq_emb, edge_attr=ea)
-            aux_logits = aux_logits[:, :-1, :].contiguous()
-            aux_vocab_size = aux_logits.size(-1)
+            # AMP: Aux forward도 autocast
+            with autocast('cuda', enabled=self.use_amp):
+                aux_target_seq_emb = self._gather_manager_teacher_embeddings(full_ref_embs, aux_target_seq, N)
+                aux_logits = self.manager(x_mgr_in, edge_index, batch_vec, aux_target_seq_emb, edge_attr=ea)
+                aux_logits = aux_logits[:, :-1, :].contiguous()
+                aux_logits = aux_logits.clamp(-20.0, 20.0)  # [Fix] Aux CE도 logit clamping
+
+            # Aux CE도 float32에서 수행 (수치 안정성)
+            aux_logits_f32 = aux_logits.float()
+            aux_vocab_size = aux_logits_f32.size(-1)
             aux_nll = F.cross_entropy(
-                aux_logits.view(-1, aux_vocab_size),
+                aux_logits_f32.view(-1, aux_vocab_size),
                 aux_target_seq.view(-1),
                 reduction='none',
                 ignore_index=self.manager.PAD_TOKEN,
@@ -279,10 +300,9 @@ class DOMOTrainer:
             # Critic Loss
             critic_loss = 0.5 * val_loss_sum.mean()
             
-            # Entropy Bonus (Manager)
-            mgr_probs = F.softmax(mgr_logits, dim=-1)
+            mgr_probs = F.softmax(mgr_logits_f32, dim=-1)
             mgr_entropy = -(mgr_probs * torch.log(mgr_probs + 1e-8)).sum(dim=-1)
-            entropy_bonus = -0.01 * (mgr_entropy * valid_mask).mean()
+            entropy_bonus = -0.03 * (mgr_entropy * valid_mask).mean()
             
             # [Fix 2026-03] Worker Entropy Bonus 추가
             # execute_batch_plan에서 반환받는 entropy_sum 활용
@@ -299,18 +319,34 @@ class DOMOTrainer:
             self.mgr_opt.zero_grad()
             self.wkr_opt.zero_grad()
             if loss.requires_grad:
-                loss.backward()
+                # AMP: GradScaler로 loss를 스케일링하여 backward 수행
+                self.grad_scaler.scale(loss).backward()
+                
+                # 각 optimizer에 실제 gradient가 존재하는지 확인
+                # (loss 연산 그래프에 참여하지 않은 optimizer는 inf 체크가 등록되지 않아 step() 시 AssertionError 발생)
+                mgr_has_grad = any(p.grad is not None for p in self.manager.parameters())
+                wkr_has_grad = any(p.grad is not None for p in self.worker.parameters())
+                
+                # AMP: unscale 후 gradient clipping (스케일링된 상태에서 clip하면 안 됨)
+                if mgr_has_grad:
+                    self.grad_scaler.unscale_(self.mgr_opt)
+                if wkr_has_grad:
+                    self.grad_scaler.unscale_(self.wkr_opt)
                 
                 # Manager/Worker는 gradient scale이 달라 별도 threshold를 사용한다.
                 mgr_preclip_norm = float(
                     nn.utils.clip_grad_norm_(self.manager.parameters(), max_norm=self.mgr_max_grad_norm)
-                )
+                ) if mgr_has_grad else 0.0
                 wkr_preclip_norm = float(
                     nn.utils.clip_grad_norm_(self.worker.parameters(), max_norm=self.wkr_max_grad_norm)
-                )
+                ) if wkr_has_grad else 0.0
                 
-                self.mgr_opt.step()
-                self.wkr_opt.step()
+                # AMP: scaler가 optimizer.step() 대행 (inf/nan 감지 시 스킵)
+                if mgr_has_grad:
+                    self.grad_scaler.step(self.mgr_opt)
+                if wkr_has_grad:
+                    self.grad_scaler.step(self.wkr_opt)
+                self.grad_scaler.update()
             else:
                 mgr_preclip_norm = 0.0
                 wkr_preclip_norm = 0.0
@@ -320,18 +356,24 @@ class DOMOTrainer:
             self.wkr_scheduler.step()
             
             avg_reward = (avg_reward * 0.95) + (rewards.mean().item() * 0.05)
-            pbar.set_postfix({'Rw': f"{rewards.mean().item():.1f}", 'Len': f"{path_lengths.float().mean():.1f}"})
-            
-            # 학습 곡선 기록
-            rl_history['rewards'].append(rewards.mean().item())
-            rl_history['losses'].append(loss.item())
-            rl_history['path_lengths'].append(path_lengths.float().mean().item())
-            
-            # 성공률 EMA
+
+            # 성공률 EMA (tqdm 표시를 위해 postfix 직전에 계산)
             is_success = (self.env.current_node == g0)
             ep_success = is_success.float().mean().item()
             success_ema = success_ema * 0.95 + ep_success * 0.05
             rl_history['success_rates'].append(success_ema)
+
+            pbar.set_postfix({
+                'EMA': f"{success_ema*100:.1f}%",
+                'Succ': f"{ep_success*100:.1f}%",
+                'Loss': f"{loss.item():.2f}",
+                'Rw': f"{rewards.mean().item():.1f}",
+            })
+
+            # 학습 곡선 기록
+            rl_history['rewards'].append(rewards.mean().item())
+            rl_history['losses'].append(loss.item())
+            rl_history['path_lengths'].append(path_lengths.float().mean().item())
 
             if self._collect_debug_this_episode and self._last_debug_tensors is not None:
                 diag, sample_payload = self._build_debug_episode(
@@ -1927,7 +1969,12 @@ class DOMOTrainer:
                 next_target_hops + 1.0 <= current_to_next_hops
             )
             last_target = valid_active_subgoal & (~next_exists)
-            soft_arrived_subgoal = (~arrived_subgoal) & near_subgoal & (passed_subgoal | last_target)
+            # [Refactor: Task 3] Soft-Arrival 조건 완화 - 다음 목표 접근 시 도착 인정
+            # Why: 정확히 노드를 밟으려다 Worker가 갇히는 문제 해결
+            approaching_next = next_exists & (next_target_hops < current_to_next_hops)
+            soft_arrived_subgoal = (~arrived_subgoal) & near_subgoal & (
+                passed_subgoal | last_target | approaching_next
+            )
             valid_arrived_subgoal = valid_active_subgoal & (arrived_subgoal | soft_arrived_subgoal)
             exact_arrived_subgoal = valid_active_subgoal & arrived_subgoal
             switch_reason_exact_mask_any = switch_reason_exact_mask_any | exact_arrived_subgoal
@@ -2152,11 +2199,13 @@ class DOMOTrainer:
             # [Fix] 동적으로 edge_attr 5D 슬라이싱 (환경이 변할 수 있으므로 매 스텝 계산)
             ea = self.env.pyg_data.edge_attr[:, [0, 1, 4, 6, 8]]
             
+            # AMP: Worker forward pass를 autocast로 감싸 VRAM 절감 (LSTM BPTT 메모리 핵심)
             # RL에서는 spatial encoder를 고정해 매-step full-graph backward 비용을 줄인다.
-            scores, h_n, c_n, value_pred = self.worker.predict_next_hop(
-                wkr_in, self.env.pyg_data.edge_index, h, c, self.env.pyg_data.batch,
-                detach_spatial=detach_spatial, edge_attr=ea
-            )
+            with autocast('cuda', enabled=self.use_amp):
+                scores, h_n, c_n, value_pred = self.worker.predict_next_hop(
+                    wkr_in, self.env.pyg_data.edge_index, h, c, self.env.pyg_data.batch,
+                    detach_spatial=detach_spatial, edge_attr=ea
+                )
             
             # Value 예측 저장 (Critic 학습 및 초기 예측 Advantage용)
             v_sq = value_pred.squeeze(-1)
@@ -2246,6 +2295,8 @@ class DOMOTrainer:
                 )
                 pending_goal_hops_after_handoff = torch.zeros_like(pending_goal_hops_after_handoff)
             active_subgoal_hops_after = self.env.hop_matrix[self.env.current_node, targets].float()
+            # [Refactor: Task 4] Goal Regression 감지 (best_goal_hops 업데이트 전 계산 필수)
+            goal_regressed = active_before_step & (goal_hops_after > best_goal_hops + 0.5)
             goal_progress_mask = goal_hops_after < (best_goal_hops - 1e-6)
             subgoal_progress_mask = valid_active_subgoal & (active_subgoal_hops_after < (best_subgoal_hops - 1e-6))
             progress_mask = active_before_step & (
@@ -2310,6 +2361,18 @@ class DOMOTrainer:
             )
             loop_penalty_sum = torch.where(
                 active_mask, loop_penalty_sum - revisit_penalty, loop_penalty_sum
+            )
+            
+            # [Refactor: Task 4] Goal Regression 페널티 (Handoff 후 3.0x 스케일)
+            # Why: Post-Handoff 구간에서 코앞의 Goal을 놓치면 치명적 → 강력한 페널티
+            regression_scale = torch.where(
+                in_post_last_subgoal_phase,
+                torch.full_like(goal_hops_after, 3.0),
+                torch.full_like(goal_hops_after, self.goal_regression_penalty_large),
+            )
+            goal_regression_penalty = goal_regressed.float() * regression_scale
+            loop_penalty_sum = torch.where(
+                active_mask, loop_penalty_sum - goal_regression_penalty, loop_penalty_sum
             )
             
             # E: 탐색 보너스 (처음 방문하는 노드에 소액 보상)
