@@ -1,0 +1,767 @@
+=== APTE Phase1 Debug Log (LR=0.0001, POMO=32) ===
+
+[Ep 0] Wkr LR: 0.000100, SuccessEMA: 3.4%, Loss: 1.53
+  Success / GoalDist / Progress: 68.8% / 5562.28 / -22.5%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 3.00 / 0.00 / 2.31 / 0.69
+  BestGoalDist / Goal per100: 1036.09 / 10.96
+  Stag / Loop / Timeout: 31.2% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 5.073 / 0.00 / 0.0% / 0.0%
+  Hit@1 / Hit@2 / Hit@3+: 0.0% / 0.0% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 71.9% / 91.7% / 71.9% / 95.7%
+  GoalRegress / NearGoalCE: 62.5% / 17.7%
+  Goal<=8/4/2: 100.0% / 100.0% / 90.6%
+  StagReset best/near/4/2: 2.44 / 0.91 / 0.00 / 0.91
+  AuxCE / Entropy / ExplVar: 6.520 / 0.636 / 0.004
+  Grad pre/post: 0.9088 / 0.9088 (clip 0.0%)
+  HiddenBonus/AuxWeight: 2.000 / 0.200
+
+[Ep 200] Wkr LR: 0.000100, SuccessEMA: 57.2%, Loss: 1.02
+  Success / GoalDist / Progress: 62.5% / 7146.44 / 53.8%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 3.00 / 0.00 / 2.38 / 0.62
+  BestGoalDist / Goal per100: 1996.50 / 9.62
+  Stag / Loop / Timeout: 34.4% / 3.1% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 8.833 / 0.00 / 0.0% / 0.0%
+  Hit@1 / Hit@2 / Hit@3+: 0.0% / 0.0% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 75.0% / 80.0% / 75.0% / 83.3%
+  GoalRegress / NearGoalCE: 78.1% / 14.2%
+  Goal<=8/4/2: 100.0% / 100.0% / 100.0%
+  StagReset best/near/4/2: 5.19 / 1.00 / 0.00 / 1.00
+  AuxCE / Entropy / ExplVar: 4.075 / 0.561 / 0.015
+  Grad pre/post: 0.5692 / 0.5692 (clip 0.0%)
+  HiddenBonus/AuxWeight: 2.000 / 0.200
+
+[Ep 400] Wkr LR: 0.000100, SuccessEMA: 62.3%, Loss: 0.86
+  Success / GoalDist / Progress: 50.0% / 13358.78 / 54.2%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 11.00 / 2.00 / 5.44 / 3.22
+  BestGoalDist / Goal per100: 8148.28 / 1.47
+  Stag / Loop / Timeout: 43.8% / 6.2% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.972 / 2.00 / 65.6% / 45.3%
+  Hit@1 / Hit@2 / Hit@3+: 65.6% / 25.0% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 50.0% / 84.2% / 50.0% / 100.0%
+  GoalRegress / NearGoalCE: 40.6% / 4.6%
+  Goal<=8/4/2: 93.8% / 56.2% / 53.1%
+  StagReset best/near/4/2: 11.84 / 1.09 / 0.56 / 0.53
+  AuxCE / Entropy / ExplVar: 3.981 / 0.566 / 0.049
+  Grad pre/post: 0.6170 / 0.6170 (clip 0.0%)
+  HiddenBonus/AuxWeight: 1.500 / 0.170
+
+[Ep 600] Wkr LR: 0.000099, SuccessEMA: 67.4%, Loss: 0.82
+  Success / GoalDist / Progress: 53.1% / 8622.88 / 16.7%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 6.00 / 1.00 / 3.53 / 1.16
+  BestGoalDist / Goal per100: 2070.72 / 2.58
+  Stag / Loop / Timeout: 46.9% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 5.333 / 1.00 / 78.1% / 78.1%
+  Hit@1 / Hit@2 / Hit@3+: 78.1% / 0.0% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 59.4% / 65.4% / 59.4% / 89.5%
+  GoalRegress / NearGoalCE: 75.0% / 8.4%
+  Goal<=8/4/2: 100.0% / 93.8% / 87.5%
+  StagReset best/near/4/2: 5.34 / 1.81 / 0.94 / 0.88
+  AuxCE / Entropy / ExplVar: 3.517 / 0.556 / 0.094
+  Grad pre/post: 1.1332 / 1.1332 (clip 0.0%)
+  HiddenBonus/AuxWeight: 1.500 / 0.170
+
+[Ep 800] Wkr LR: 0.000099, SuccessEMA: 66.1%, Loss: 0.60
+  Success / GoalDist / Progress: 71.9% / 4504.44 / 77.7%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 8.00 / 1.00 / 2.03 / 0.78
+  BestGoalDist / Goal per100: 1740.78 / 4.67
+  Stag / Loop / Timeout: 25.0% / 3.1% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.250 / 1.00 / 90.6% / 90.6%
+  Hit@1 / Hit@2 / Hit@3+: 90.6% / 0.0% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 81.2% / 79.3% / 81.2% / 88.5%
+  GoalRegress / NearGoalCE: 71.9% / 11.9%
+  Goal<=8/4/2: 100.0% / 93.8% / 87.5%
+  StagReset best/near/4/2: 8.72 / 1.81 / 0.94 / 0.88
+  AuxCE / Entropy / ExplVar: 2.986 / 0.554 / 0.100
+  Grad pre/post: 0.8960 / 0.8960 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 1000] Wkr LR: 0.000098, SuccessEMA: 72.1%, Loss: 0.60
+  Success / GoalDist / Progress: 71.9% / 4704.25 / 78.5%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 23.00 / 2.00 / 1.75 / 0.62
+  BestGoalDist / Goal per100: 1727.56 / 3.40
+  Stag / Loop / Timeout: 28.1% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 1.584 / 2.00 / 21.9% / 12.5%
+  Hit@1 / Hit@2 / Hit@3+: 21.9% / 3.1% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 75.0% / 88.5% / 75.0% / 95.8%
+  GoalRegress / NearGoalCE: 84.4% / 8.9%
+  Goal<=8/4/2: 100.0% / 96.9% / 96.9%
+  StagReset best/near/4/2: 9.81 / 1.94 / 0.97 / 0.97
+  AuxCE / Entropy / ExplVar: 3.353 / 0.598 / 0.168
+  Grad pre/post: 2.7459 / 2.7459 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 1200] Wkr LR: 0.000097, SuccessEMA: 68.8%, Loss: 0.67
+  Success / GoalDist / Progress: 84.4% / 3986.41 / 79.6%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 11.00 / 2.00 / 1.38 / 0.84
+  BestGoalDist / Goal per100: 1971.75 / 2.73
+  Stag / Loop / Timeout: 15.6% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.423 / 2.00 / 59.4% / 50.0%
+  Hit@1 / Hit@2 / Hit@3+: 59.4% / 40.6% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 84.4% / 93.1% / 84.4% / 100.0%
+  GoalRegress / NearGoalCE: 50.0% / 7.6%
+  Goal<=8/4/2: 96.9% / 90.6% / 87.5%
+  StagReset best/near/4/2: 9.62 / 1.78 / 0.91 / 0.88
+  AuxCE / Entropy / ExplVar: 3.318 / 0.579 / 0.141
+  Grad pre/post: 4.1817 / 4.1817 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 1400] Wkr LR: 0.000096, SuccessEMA: 69.4%, Loss: 0.57
+  Success / GoalDist / Progress: 59.4% / 5865.78 / 74.5%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 10.00 / 2.00 / 2.59 / 1.44
+  BestGoalDist / Goal per100: 3484.81 / 2.62
+  Stag / Loop / Timeout: 40.6% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 4.366 / 2.00 / 81.2% / 56.2%
+  Hit@1 / Hit@2 / Hit@3+: 81.2% / 31.2% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 62.5% / 76.0% / 62.5% / 95.0%
+  GoalRegress / NearGoalCE: 65.6% / 5.8%
+  Goal<=8/4/2: 100.0% / 90.6% / 71.9%
+  StagReset best/near/4/2: 9.44 / 1.62 / 0.91 / 0.72
+  AuxCE / Entropy / ExplVar: 3.157 / 0.552 / 0.129
+  Grad pre/post: 1.5116 / 1.5116 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 1600] Wkr LR: 0.000094, SuccessEMA: 74.1%, Loss: 0.41
+  Success / GoalDist / Progress: 100.0% / 0.00 / 100.0%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 12.00 / 2.00 / 0.00 / 0.00
+  BestGoalDist / Goal per100: 0.00 / 6.24
+  Stag / Loop / Timeout: 0.0% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 1.714 / 2.00 / 40.6% / 32.8%
+  Hit@1 / Hit@2 / Hit@3+: 40.6% / 25.0% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 100.0% / 91.4% / 100.0% / 100.0%
+  GoalRegress / NearGoalCE: 37.5% / 18.1%
+  Goal<=8/4/2: 100.0% / 100.0% / 100.0%
+  StagReset best/near/4/2: 10.25 / 2.00 / 1.00 / 1.00
+  AuxCE / Entropy / ExplVar: 3.413 / 0.563 / -3.135
+  Grad pre/post: 1.7489 / 1.7489 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 1800] Wkr LR: 0.000093, SuccessEMA: 74.9%, Loss: 0.57
+  Success / GoalDist / Progress: 81.2% / 4432.34 / 73.6%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 24.00 / 2.00 / 2.06 / 0.44
+  BestGoalDist / Goal per100: 752.44 / 4.46
+  Stag / Loop / Timeout: 18.8% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 1.147 / 2.00 / 3.1% / 1.6%
+  Hit@1 / Hit@2 / Hit@3+: 3.1% / 0.0% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 84.4% / 86.7% / 84.4% / 96.3%
+  GoalRegress / NearGoalCE: 68.8% / 11.5%
+  Goal<=8/4/2: 100.0% / 96.9% / 96.9%
+  StagReset best/near/4/2: 8.91 / 1.94 / 0.97 / 0.97
+  AuxCE / Entropy / ExplVar: 3.302 / 0.520 / 0.231
+  Grad pre/post: 1.1809 / 1.1809 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 2000] Wkr LR: 0.000091, SuccessEMA: 75.6%, Loss: 0.53
+  Success / GoalDist / Progress: 81.2% / 5184.38 / 77.1%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 15.00 / 2.00 / 2.25 / 1.00
+  BestGoalDist / Goal per100: 2108.78 / 2.45
+  Stag / Loop / Timeout: 18.8% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.504 / 2.00 / 68.8% / 53.1%
+  Hit@1 / Hit@2 / Hit@3+: 68.8% / 37.5% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 84.4% / 83.9% / 84.4% / 96.3%
+  GoalRegress / NearGoalCE: 50.0% / 7.7%
+  Goal<=8/4/2: 93.8% / 90.6% / 84.4%
+  StagReset best/near/4/2: 12.94 / 1.75 / 0.91 / 0.84
+  AuxCE / Entropy / ExplVar: 3.333 / 0.571 / 0.123
+  Grad pre/post: 0.9326 / 0.9326 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 2200] Wkr LR: 0.000090, SuccessEMA: 79.5%, Loss: 0.45
+  Success / GoalDist / Progress: 90.6% / 2788.56 / 91.5%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 10.00 / 2.00 / 1.03 / 0.62
+  BestGoalDist / Goal per100: 1498.25 / 4.23
+  Stag / Loop / Timeout: 9.4% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.316 / 2.00 / 46.9% / 39.1%
+  Hit@1 / Hit@2 / Hit@3+: 46.9% / 31.2% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 90.6% / 72.5% / 90.6% / 100.0%
+  GoalRegress / NearGoalCE: 53.1% / 12.9%
+  Goal<=8/4/2: 96.9% / 90.6% / 90.6%
+  StagReset best/near/4/2: 12.81 / 1.81 / 0.91 / 0.91
+  AuxCE / Entropy / ExplVar: 3.127 / 0.572 / 0.063
+  Grad pre/post: 1.0236 / 1.0236 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 2400] Wkr LR: 0.000088, SuccessEMA: 74.8%, Loss: 0.47
+  Success / GoalDist / Progress: 87.5% / 3346.31 / 89.6%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 12.00 / 2.00 / 1.38 / 0.62
+  BestGoalDist / Goal per100: 1846.44 / 3.69
+  Stag / Loop / Timeout: 12.5% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.518 / 2.00 / 28.1% / 28.1%
+  Hit@1 / Hit@2 / Hit@3+: 28.1% / 28.1% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 90.6% / 84.8% / 90.6% / 96.6%
+  GoalRegress / NearGoalCE: 34.4% / 11.8%
+  Goal<=8/4/2: 96.9% / 93.8% / 90.6%
+  StagReset best/near/4/2: 14.62 / 1.84 / 0.94 / 0.91
+  AuxCE / Entropy / ExplVar: 2.983 / 0.568 / 0.298
+  Grad pre/post: 1.1212 / 1.1212 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 2600] Wkr LR: 0.000086, SuccessEMA: 74.0%, Loss: 0.50
+  Success / GoalDist / Progress: 90.6% / 3041.06 / 87.7%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 16.00 / 2.00 / 1.28 / 0.75
+  BestGoalDist / Goal per100: 1480.12 / 3.09
+  Stag / Loop / Timeout: 9.4% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.398 / 2.00 / 34.4% / 25.0%
+  Hit@1 / Hit@2 / Hit@3+: 34.4% / 15.6% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 90.6% / 80.6% / 90.6% / 100.0%
+  GoalRegress / NearGoalCE: 53.1% / 9.9%
+  Goal<=8/4/2: 93.8% / 93.8% / 90.6%
+  StagReset best/near/4/2: 13.34 / 1.84 / 0.94 / 0.91
+  AuxCE / Entropy / ExplVar: 3.257 / 0.520 / -0.038
+  Grad pre/post: 3.5778 / 3.5778 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 2800] Wkr LR: 0.000084, SuccessEMA: 80.2%, Loss: 0.52
+  Success / GoalDist / Progress: 81.2% / 5039.12 / 83.1%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 19.00 / 2.00 / 2.19 / 1.75
+  BestGoalDist / Goal per100: 3821.53 / 2.44
+  Stag / Loop / Timeout: 12.5% / 6.2% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.102 / 2.00 / 43.8% / 25.0%
+  Hit@1 / Hit@2 / Hit@3+: 43.8% / 6.2% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 81.2% / 96.3% / 81.2% / 100.0%
+  GoalRegress / NearGoalCE: 46.9% / 6.8%
+  Goal<=8/4/2: 84.4% / 84.4% / 84.4%
+  StagReset best/near/4/2: 14.84 / 1.69 / 0.84 / 0.84
+  AuxCE / Entropy / ExplVar: 3.150 / 0.568 / 0.143
+  Grad pre/post: 1.0671 / 1.0671 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 3000] Wkr LR: 0.000081, SuccessEMA: 79.0%, Loss: 0.48
+  Success / GoalDist / Progress: 87.5% / 1504.84 / 95.1%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 11.00 / 2.00 / 0.75 / 0.28
+  BestGoalDist / Goal per100: 650.16 / 3.24
+  Stag / Loop / Timeout: 12.5% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.301 / 2.00 / 81.2% / 62.5%
+  Hit@1 / Hit@2 / Hit@3+: 81.2% / 43.8% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 93.8% / 75.7% / 93.8% / 93.3%
+  GoalRegress / NearGoalCE: 62.5% / 11.1%
+  Goal<=8/4/2: 100.0% / 96.9% / 96.9%
+  StagReset best/near/4/2: 12.91 / 1.94 / 0.97 / 0.97
+  AuxCE / Entropy / ExplVar: 3.007 / 0.469 / 0.073
+  Grad pre/post: 0.7681 / 0.7681 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 3200] Wkr LR: 0.000079, SuccessEMA: 79.5%, Loss: 0.57
+  Success / GoalDist / Progress: 65.6% / 8809.41 / 79.4%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 16.00 / 2.00 / 3.84 / 2.12
+  BestGoalDist / Goal per100: 4887.50 / 1.64
+  Stag / Loop / Timeout: 34.4% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.572 / 2.00 / 34.4% / 21.9%
+  Hit@1 / Hit@2 / Hit@3+: 34.4% / 9.4% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 75.0% / 65.6% / 75.0% / 87.5%
+  GoalRegress / NearGoalCE: 62.5% / 6.2%
+  Goal<=8/4/2: 87.5% / 81.2% / 81.2%
+  StagReset best/near/4/2: 20.09 / 1.62 / 0.81 / 0.81
+  AuxCE / Entropy / ExplVar: 2.952 / 0.545 / 0.211
+  Grad pre/post: 1.6362 / 1.6362 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 3400] Wkr LR: 0.000077, SuccessEMA: 78.8%, Loss: 0.48
+  Success / GoalDist / Progress: 87.5% / 2552.56 / 92.8%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 10.00 / 2.00 / 0.97 / 0.44
+  BestGoalDist / Goal per100: 1019.69 / 2.68
+  Stag / Loop / Timeout: 12.5% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 4.216 / 2.00 / 71.9% / 51.6%
+  Hit@1 / Hit@2 / Hit@3+: 71.9% / 31.2% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 93.8% / 70.0% / 93.8% / 93.3%
+  GoalRegress / NearGoalCE: 50.0% / 10.1%
+  Goal<=8/4/2: 100.0% / 96.9% / 93.8%
+  StagReset best/near/4/2: 17.59 / 1.91 / 0.97 / 0.94
+  AuxCE / Entropy / ExplVar: 2.880 / 0.515 / 0.200
+  Grad pre/post: 0.9420 / 0.9420 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 3600] Wkr LR: 0.000074, SuccessEMA: 82.7%, Loss: 0.44
+  Success / GoalDist / Progress: 93.8% / 565.94 / 98.2%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 9.00 / 1.00 / 0.28 / 0.06
+  BestGoalDist / Goal per100: 201.28 / 6.54
+  Stag / Loop / Timeout: 6.2% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.069 / 1.00 / 59.4% / 59.4%
+  Hit@1 / Hit@2 / Hit@3+: 59.4% / 0.0% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 100.0% / 88.2% / 100.0% / 93.8%
+  GoalRegress / NearGoalCE: 81.2% / 23.7%
+  Goal<=8/4/2: 100.0% / 100.0% / 100.0%
+  StagReset best/near/4/2: 9.75 / 2.00 / 1.00 / 1.00
+  AuxCE / Entropy / ExplVar: 2.700 / 0.502 / 0.198
+  Grad pre/post: 0.8366 / 0.8366 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 3800] Wkr LR: 0.000072, SuccessEMA: 81.2%, Loss: 0.49
+  Success / GoalDist / Progress: 71.9% / 7573.53 / 78.7%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 13.00 / 2.00 / 3.31 / 1.91
+  BestGoalDist / Goal per100: 4309.88 / 2.09
+  Stag / Loop / Timeout: 28.1% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.481 / 2.00 / 87.5% / 71.9%
+  Hit@1 / Hit@2 / Hit@3+: 87.5% / 56.2% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 75.0% / 95.8% / 75.0% / 95.8%
+  GoalRegress / NearGoalCE: 50.0% / 5.9%
+  Goal<=8/4/2: 87.5% / 84.4% / 81.2%
+  StagReset best/near/4/2: 16.47 / 1.66 / 0.84 / 0.81
+  AuxCE / Entropy / ExplVar: 2.496 / 0.510 / 0.196
+  Grad pre/post: 0.7051 / 0.7051 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 4000] Wkr LR: 0.000069, SuccessEMA: 84.4%, Loss: 0.38
+  Success / GoalDist / Progress: 90.6% / 2798.41 / 92.7%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 16.00 / 2.00 / 1.22 / 0.53
+  BestGoalDist / Goal per100: 1323.34 / 2.69
+  Stag / Loop / Timeout: 9.4% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.479 / 2.00 / 59.4% / 43.8%
+  Hit@1 / Hit@2 / Hit@3+: 59.4% / 28.1% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 90.6% / 85.3% / 90.6% / 100.0%
+  GoalRegress / NearGoalCE: 59.4% / 8.3%
+  Goal<=8/4/2: 96.9% / 96.9% / 93.8%
+  StagReset best/near/4/2: 16.88 / 1.91 / 0.97 / 0.94
+  AuxCE / Entropy / ExplVar: 2.821 / 0.475 / 0.180
+  Grad pre/post: 1.0884 / 1.0884 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 4200] Wkr LR: 0.000066, SuccessEMA: 83.1%, Loss: 0.50
+  Success / GoalDist / Progress: 78.1% / 7665.91 / 85.0%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 17.00 / 2.00 / 2.91 / 1.47
+  BestGoalDist / Goal per100: 4332.91 / 1.72
+  Stag / Loop / Timeout: 15.6% / 6.2% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.151 / 2.00 / 28.1% / 21.9%
+  Hit@1 / Hit@2 / Hit@3+: 28.1% / 15.6% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 84.4% / 86.2% / 84.4% / 92.6%
+  GoalRegress / NearGoalCE: 65.6% / 5.4%
+  Goal<=8/4/2: 93.8% / 87.5% / 84.4%
+  StagReset best/near/4/2: 22.53 / 1.72 / 0.88 / 0.84
+  AuxCE / Entropy / ExplVar: 2.992 / 0.510 / 0.152
+  Grad pre/post: 0.9580 / 0.9580 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 4400] Wkr LR: 0.000063, SuccessEMA: 83.9%, Loss: 0.52
+  Success / GoalDist / Progress: 87.5% / 1146.78 / 97.2%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 13.00 / 2.00 / 0.53 / 0.25
+  BestGoalDist / Goal per100: 430.66 / 2.79
+  Stag / Loop / Timeout: 12.5% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.375 / 2.00 / 75.0% / 64.1%
+  Hit@1 / Hit@2 / Hit@3+: 75.0% / 53.1% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 90.6% / 71.8% / 90.6% / 96.6%
+  GoalRegress / NearGoalCE: 56.2% / 8.6%
+  Goal<=8/4/2: 100.0% / 100.0% / 96.9%
+  StagReset best/near/4/2: 15.31 / 1.97 / 1.00 / 0.97
+  AuxCE / Entropy / ExplVar: 2.844 / 0.505 / 0.045
+  Grad pre/post: 1.1146 / 1.1146 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 4600] Wkr LR: 0.000061, SuccessEMA: 85.2%, Loss: 0.58
+  Success / GoalDist / Progress: 71.9% / 8647.62 / 79.4%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 18.00 / 2.00 / 3.44 / 2.16
+  BestGoalDist / Goal per100: 5461.59 / 1.75
+  Stag / Loop / Timeout: 28.1% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.873 / 2.00 / 25.0% / 17.2%
+  Hit@1 / Hit@2 / Hit@3+: 25.0% / 9.4% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 78.1% / 85.2% / 78.1% / 92.0%
+  GoalRegress / NearGoalCE: 50.0% / 5.4%
+  Goal<=8/4/2: 87.5% / 87.5% / 78.1%
+  StagReset best/near/4/2: 19.31 / 1.66 / 0.88 / 0.78
+  AuxCE / Entropy / ExplVar: 2.916 / 0.550 / 0.089
+  Grad pre/post: 1.6071 / 1.6071 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 4800] Wkr LR: 0.000058, SuccessEMA: 84.5%, Loss: 0.41
+  Success / GoalDist / Progress: 90.6% / 3804.97 / 91.5%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 15.00 / 2.00 / 1.34 / 1.00
+  BestGoalDist / Goal per100: 3402.34 / 3.00
+  Stag / Loop / Timeout: 9.4% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.402 / 2.00 / 40.6% / 34.4%
+  Hit@1 / Hit@2 / Hit@3+: 40.6% / 28.1% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 90.6% / 96.7% / 90.6% / 100.0%
+  GoalRegress / NearGoalCE: 31.2% / 8.6%
+  Goal<=8/4/2: 93.8% / 90.6% / 90.6%
+  StagReset best/near/4/2: 16.59 / 1.81 / 0.91 / 0.91
+  AuxCE / Entropy / ExplVar: 2.574 / 0.550 / 0.253
+  Grad pre/post: 0.8226 / 0.8226 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 5000] Wkr LR: 0.000055, SuccessEMA: 82.9%, Loss: 0.63
+  Success / GoalDist / Progress: 56.2% / 11150.81 / 78.4%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 13.00 / 2.00 / 3.66 / 1.28
+  BestGoalDist / Goal per100: 5758.47 / 1.97
+  Stag / Loop / Timeout: 43.8% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 4.089 / 2.00 / 78.1% / 65.6%
+  Hit@1 / Hit@2 / Hit@3+: 78.1% / 53.1% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 68.8% / 78.3% / 68.8% / 81.8%
+  GoalRegress / NearGoalCE: 75.0% / 4.5%
+  Goal<=8/4/2: 100.0% / 93.8% / 81.2%
+  StagReset best/near/4/2: 17.19 / 1.75 / 0.94 / 0.81
+  AuxCE / Entropy / ExplVar: 2.711 / 0.538 / 0.078
+  Grad pre/post: 2.1236 / 2.1236 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 5200] Wkr LR: 0.000052, SuccessEMA: 83.3%, Loss: 0.52
+  Success / GoalDist / Progress: 71.9% / 8877.12 / 82.3%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 14.00 / 2.00 / 2.78 / 1.88
+  BestGoalDist / Goal per100: 6095.12 / 2.02
+  Stag / Loop / Timeout: 25.0% / 3.1% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.674 / 2.00 / 53.1% / 42.2%
+  Hit@1 / Hit@2 / Hit@3+: 53.1% / 31.2% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 71.9% / 92.0% / 71.9% / 100.0%
+  GoalRegress / NearGoalCE: 40.6% / 4.6%
+  Goal<=8/4/2: 90.6% / 84.4% / 71.9%
+  StagReset best/near/4/2: 19.94 / 1.56 / 0.84 / 0.72
+  AuxCE / Entropy / ExplVar: 2.775 / 0.511 / 0.212
+  Grad pre/post: 1.5010 / 1.5010 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 5400] Wkr LR: 0.000049, SuccessEMA: 84.0%, Loss: 0.47
+  Success / GoalDist / Progress: 87.5% / 2478.31 / 93.8%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 15.00 / 2.00 / 1.16 / 0.53
+  BestGoalDist / Goal per100: 1159.94 / 2.34
+  Stag / Loop / Timeout: 12.5% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.040 / 2.00 / 40.6% / 29.7%
+  Hit@1 / Hit@2 / Hit@3+: 40.6% / 18.8% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 87.5% / 90.3% / 87.5% / 100.0%
+  GoalRegress / NearGoalCE: 71.9% / 6.9%
+  Goal<=8/4/2: 100.0% / 96.9% / 90.6%
+  StagReset best/near/4/2: 20.78 / 1.88 / 0.97 / 0.91
+  AuxCE / Entropy / ExplVar: 2.856 / 0.517 / 0.164
+  Grad pre/post: 1.2163 / 1.2163 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 5600] Wkr LR: 0.000047, SuccessEMA: 83.4%, Loss: 0.51
+  Success / GoalDist / Progress: 90.6% / 3103.66 / 93.9%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 18.00 / 2.00 / 1.12 / 0.81
+  BestGoalDist / Goal per100: 2125.19 / 2.16
+  Stag / Loop / Timeout: 9.4% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.677 / 2.00 / 37.5% / 25.0%
+  Hit@1 / Hit@2 / Hit@3+: 37.5% / 12.5% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 93.8% / 82.9% / 93.8% / 96.7%
+  GoalRegress / NearGoalCE: 34.4% / 6.2%
+  Goal<=8/4/2: 93.8% / 93.8% / 93.8%
+  StagReset best/near/4/2: 24.09 / 1.88 / 0.94 / 0.94
+  AuxCE / Entropy / ExplVar: 2.682 / 0.523 / -0.066
+  Grad pre/post: 3.2892 / 3.2892 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 5800] Wkr LR: 0.000044, SuccessEMA: 86.6%, Loss: 0.42
+  Success / GoalDist / Progress: 93.8% / 1612.06 / 96.9%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 16.00 / 2.00 / 0.53 / 0.44
+  BestGoalDist / Goal per100: 1508.09 / 2.47
+  Stag / Loop / Timeout: 6.2% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.701 / 2.00 / 34.4% / 23.4%
+  Hit@1 / Hit@2 / Hit@3+: 34.4% / 12.5% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 93.8% / 93.8% / 93.8% / 100.0%
+  GoalRegress / NearGoalCE: 28.1% / 7.7%
+  Goal<=8/4/2: 100.0% / 93.8% / 93.8%
+  StagReset best/near/4/2: 22.53 / 1.88 / 0.94 / 0.94
+  AuxCE / Entropy / ExplVar: 2.756 / 0.513 / 0.118
+  Grad pre/post: 0.6222 / 0.6222 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 6000] Wkr LR: 0.000041, SuccessEMA: 83.9%, Loss: 0.48
+  Success / GoalDist / Progress: 84.4% / 4598.53 / 92.5%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 16.00 / 2.00 / 1.44 / 0.53
+  BestGoalDist / Goal per100: 1932.16 / 2.35
+  Stag / Loop / Timeout: 15.6% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.873 / 2.00 / 65.6% / 43.8%
+  Hit@1 / Hit@2 / Hit@3+: 65.6% / 21.9% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 90.6% / 77.1% / 90.6% / 93.1%
+  GoalRegress / NearGoalCE: 84.4% / 8.9%
+  Goal<=8/4/2: 96.9% / 96.9% / 96.9%
+  StagReset best/near/4/2: 21.41 / 1.94 / 0.97 / 0.97
+  AuxCE / Entropy / ExplVar: 2.530 / 0.481 / 0.144
+  Grad pre/post: 0.8341 / 0.8341 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 6200] Wkr LR: 0.000038, SuccessEMA: 84.0%, Loss: 0.51
+  Success / GoalDist / Progress: 84.4% / 2974.94 / 94.5%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 14.00 / 2.00 / 1.44 / 0.56
+  BestGoalDist / Goal per100: 1059.28 / 2.32
+  Stag / Loop / Timeout: 15.6% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.433 / 2.00 / 53.1% / 35.9%
+  Hit@1 / Hit@2 / Hit@3+: 53.1% / 18.8% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 84.4% / 90.0% / 84.4% / 100.0%
+  GoalRegress / NearGoalCE: 68.8% / 6.5%
+  Goal<=8/4/2: 96.9% / 96.9% / 93.8%
+  StagReset best/near/4/2: 22.84 / 1.91 / 0.97 / 0.94
+  AuxCE / Entropy / ExplVar: 2.837 / 0.495 / 0.206
+  Grad pre/post: 0.7052 / 0.7052 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 6400] Wkr LR: 0.000036, SuccessEMA: 88.2%, Loss: 0.56
+  Success / GoalDist / Progress: 84.4% / 2428.81 / 89.4%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 15.00 / 2.00 / 0.81 / 0.19
+  BestGoalDist / Goal per100: 443.88 / 6.19
+  Stag / Loop / Timeout: 15.6% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 1.565 / 2.00 / 46.9% / 29.7%
+  Hit@1 / Hit@2 / Hit@3+: 46.9% / 12.5% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 96.9% / 65.9% / 96.9% / 87.1%
+  GoalRegress / NearGoalCE: 75.0% / 19.3%
+  Goal<=8/4/2: 100.0% / 100.0% / 100.0%
+  StagReset best/near/4/2: 9.12 / 2.00 / 1.00 / 1.00
+  AuxCE / Entropy / ExplVar: 2.776 / 0.524 / 0.266
+  Grad pre/post: 1.3903 / 1.3903 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 6600] Wkr LR: 0.000033, SuccessEMA: 90.9%, Loss: 0.35
+  Success / GoalDist / Progress: 100.0% / 0.00 / 100.0%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 18.00 / 2.00 / 0.00 / 0.00
+  BestGoalDist / Goal per100: 0.00 / 3.06
+  Stag / Loop / Timeout: 0.0% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.059 / 2.00 / 71.9% / 46.9%
+  Hit@1 / Hit@2 / Hit@3+: 71.9% / 21.9% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 100.0% / 97.0% / 100.0% / 100.0%
+  GoalRegress / NearGoalCE: 59.4% / 9.1%
+  Goal<=8/4/2: 100.0% / 100.0% / 100.0%
+  StagReset best/near/4/2: 17.88 / 2.00 / 1.00 / 1.00
+  AuxCE / Entropy / ExplVar: 3.013 / 0.465 / -1.149
+  Grad pre/post: 1.0894 / 1.0894 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 6800] Wkr LR: 0.000031, SuccessEMA: 87.4%, Loss: 0.35
+  Success / GoalDist / Progress: 96.9% / 1085.69 / 97.3%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 13.00 / 2.00 / 0.34 / 0.03
+  BestGoalDist / Goal per100: 70.94 / 3.95
+  Stag / Loop / Timeout: 3.1% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.243 / 2.00 / 100.0% / 71.9%
+  Hit@1 / Hit@2 / Hit@3+: 100.0% / 43.8% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 100.0% / 83.8% / 100.0% / 96.9%
+  GoalRegress / NearGoalCE: 50.0% / 12.6%
+  Goal<=8/4/2: 100.0% / 100.0% / 100.0%
+  StagReset best/near/4/2: 16.00 / 2.00 / 1.00 / 1.00
+  AuxCE / Entropy / ExplVar: 2.595 / 0.433 / 0.332
+  Grad pre/post: 0.9405 / 0.9405 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 7000] Wkr LR: 0.000029, SuccessEMA: 86.5%, Loss: 0.39
+  Success / GoalDist / Progress: 96.9% / 1432.22 / 96.3%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 10.00 / 2.00 / 0.47 / 0.16
+  BestGoalDist / Goal per100: 531.31 / 3.95
+  Stag / Loop / Timeout: 3.1% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.700 / 2.00 / 71.9% / 57.8%
+  Hit@1 / Hit@2 / Hit@3+: 71.9% / 43.8% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 96.9% / 96.9% / 96.9% / 100.0%
+  GoalRegress / NearGoalCE: 56.2% / 11.2%
+  Goal<=8/4/2: 100.0% / 96.9% / 96.9%
+  StagReset best/near/4/2: 15.53 / 1.94 / 0.97 / 0.97
+  AuxCE / Entropy / ExplVar: 2.654 / 0.483 / 0.104
+  Grad pre/post: 0.9295 / 0.9295 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 7200] Wkr LR: 0.000026, SuccessEMA: 90.2%, Loss: 0.47
+  Success / GoalDist / Progress: 84.4% / 4659.62 / 90.9%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 19.00 / 2.00 / 1.81 / 1.28
+  BestGoalDist / Goal per100: 3288.44 / 2.07
+  Stag / Loop / Timeout: 12.5% / 3.1% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.590 / 2.00 / 46.9% / 32.8%
+  Hit@1 / Hit@2 / Hit@3+: 46.9% / 18.8% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 84.4% / 69.2% / 84.4% / 100.0%
+  GoalRegress / NearGoalCE: 59.4% / 6.7%
+  Goal<=8/4/2: 93.8% / 93.8% / 84.4%
+  StagReset best/near/4/2: 21.31 / 1.78 / 0.94 / 0.84
+  AuxCE / Entropy / ExplVar: 2.534 / 0.509 / 0.163
+  Grad pre/post: 0.8194 / 0.8194 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 7400] Wkr LR: 0.000024, SuccessEMA: 90.8%, Loss: 0.49
+  Success / GoalDist / Progress: 87.5% / 2329.88 / 89.0%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 15.00 / 2.00 / 1.47 / 0.75
+  BestGoalDist / Goal per100: 1178.12 / 3.80
+  Stag / Loop / Timeout: 12.5% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 1.835 / 2.00 / 71.9% / 62.5%
+  Hit@1 / Hit@2 / Hit@3+: 71.9% / 53.1% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 87.5% / 77.8% / 87.5% / 100.0%
+  GoalRegress / NearGoalCE: 65.6% / 11.4%
+  Goal<=8/4/2: 96.9% / 90.6% / 87.5%
+  StagReset best/near/4/2: 12.06 / 1.78 / 0.91 / 0.88
+  AuxCE / Entropy / ExplVar: 2.896 / 0.525 / 0.296
+  Grad pre/post: 1.8045 / 1.8045 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 7600] Wkr LR: 0.000022, SuccessEMA: 87.5%, Loss: 0.49
+  Success / GoalDist / Progress: 87.5% / 2671.41 / 88.2%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 15.00 / 2.00 / 1.47 / 0.69
+  BestGoalDist / Goal per100: 1031.25 / 3.08
+  Stag / Loop / Timeout: 9.4% / 3.1% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.290 / 2.00 / 40.6% / 23.4%
+  Hit@1 / Hit@2 / Hit@3+: 40.6% / 6.2% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 87.5% / 93.3% / 87.5% / 100.0%
+  GoalRegress / NearGoalCE: 50.0% / 8.8%
+  Goal<=8/4/2: 93.8% / 93.8% / 93.8%
+  StagReset best/near/4/2: 15.59 / 1.88 / 0.94 / 0.94
+  AuxCE / Entropy / ExplVar: 2.827 / 0.512 / 0.170
+  Grad pre/post: 1.2771 / 1.2771 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 7800] Wkr LR: 0.000020, SuccessEMA: 88.5%, Loss: 0.35
+  Success / GoalDist / Progress: 96.9% / 1198.09 / 96.4%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 13.00 / 2.00 / 0.53 / 0.12
+  BestGoalDist / Goal per100: 412.50 / 4.60
+  Stag / Loop / Timeout: 3.1% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 1.853 / 2.00 / 71.9% / 68.8%
+  Hit@1 / Hit@2 / Hit@3+: 71.9% / 65.6% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 96.9% / 100.0% / 96.9% / 100.0%
+  GoalRegress / NearGoalCE: 37.5% / 12.5%
+  Goal<=8/4/2: 100.0% / 100.0% / 96.9%
+  StagReset best/near/4/2: 14.00 / 1.97 / 1.00 / 0.97
+  AuxCE / Entropy / ExplVar: 2.769 / 0.428 / 0.496
+  Grad pre/post: 1.5821 / 1.5821 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 8000] Wkr LR: 0.000019, SuccessEMA: 88.7%, Loss: 0.53
+  Success / GoalDist / Progress: 90.6% / 1311.81 / 93.3%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 7.00 / 1.00 / 0.56 / 0.38
+  BestGoalDist / Goal per100: 1118.72 / 6.52
+  Stag / Loop / Timeout: 9.4% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.737 / 1.00 / 65.6% / 65.6%
+  Hit@1 / Hit@2 / Hit@3+: 65.6% / 0.0% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 90.6% / 100.0% / 90.6% / 100.0%
+  GoalRegress / NearGoalCE: 81.2% / 17.1%
+  Goal<=8/4/2: 100.0% / 96.9% / 93.8%
+  StagReset best/near/4/2: 8.41 / 1.91 / 0.97 / 0.94
+  AuxCE / Entropy / ExplVar: 2.931 / 0.551 / 0.276
+  Grad pre/post: 1.1516 / 1.1516 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 8200] Wkr LR: 0.000017, SuccessEMA: 89.9%, Loss: 0.24
+  Success / GoalDist / Progress: 100.0% / 0.00 / 100.0%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 12.00 / 2.00 / 0.00 / 0.00
+  BestGoalDist / Goal per100: 0.00 / 4.54
+  Stag / Loop / Timeout: 0.0% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.034 / 2.00 / 53.1% / 48.4%
+  Hit@1 / Hit@2 / Hit@3+: 53.1% / 43.8% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 100.0% / 100.0% / 100.0% / 100.0%
+  GoalRegress / NearGoalCE: 50.0% / 13.1%
+  Goal<=8/4/2: 100.0% / 100.0% / 100.0%
+  StagReset best/near/4/2: 15.03 / 2.00 / 1.00 / 1.00
+  AuxCE / Entropy / ExplVar: 2.418 / 0.522 / -1.630
+  Grad pre/post: 0.8973 / 0.8973 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 8400] Wkr LR: 0.000016, SuccessEMA: 91.5%, Loss: 0.39
+  Success / GoalDist / Progress: 93.8% / 1730.88 / 96.3%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 19.00 / 2.00 / 0.81 / 0.50
+  BestGoalDist / Goal per100: 988.38 / 2.36
+  Stag / Loop / Timeout: 6.2% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.418 / 2.00 / 15.6% / 9.4%
+  Hit@1 / Hit@2 / Hit@3+: 15.6% / 3.1% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 93.8% / 90.9% / 93.8% / 100.0%
+  GoalRegress / NearGoalCE: 56.2% / 7.3%
+  Goal<=8/4/2: 96.9% / 96.9% / 96.9%
+  StagReset best/near/4/2: 22.75 / 1.94 / 0.97 / 0.97
+  AuxCE / Entropy / ExplVar: 2.669 / 0.504 / 0.294
+  Grad pre/post: 0.7255 / 0.7255 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 8600] Wkr LR: 0.000014, SuccessEMA: 87.6%, Loss: 0.59
+  Success / GoalDist / Progress: 65.6% / 12135.91 / 78.4%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 17.00 / 2.00 / 3.59 / 2.44
+  BestGoalDist / Goal per100: 9020.69 / 1.77
+  Stag / Loop / Timeout: 34.4% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.274 / 2.00 / 37.5% / 28.1%
+  Hit@1 / Hit@2 / Hit@3+: 37.5% / 18.8% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 65.6% / 100.0% / 65.6% / 100.0%
+  GoalRegress / NearGoalCE: 50.0% / 3.8%
+  Goal<=8/4/2: 87.5% / 81.2% / 68.8%
+  StagReset best/near/4/2: 20.50 / 1.50 / 0.81 / 0.69
+  AuxCE / Entropy / ExplVar: 2.567 / 0.491 / 0.180
+  Grad pre/post: 1.7253 / 1.7253 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 8800] Wkr LR: 0.000013, SuccessEMA: 89.0%, Loss: 0.36
+  Success / GoalDist / Progress: 100.0% / 0.00 / 100.0%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 14.00 / 2.00 / 0.00 / 0.00
+  BestGoalDist / Goal per100: 0.00 / 3.16
+  Stag / Loop / Timeout: 0.0% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.478 / 2.00 / 81.2% / 64.1%
+  Hit@1 / Hit@2 / Hit@3+: 81.2% / 46.9% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 100.0% / 91.4% / 100.0% / 100.0%
+  GoalRegress / NearGoalCE: 78.1% / 9.9%
+  Goal<=8/4/2: 100.0% / 100.0% / 100.0%
+  StagReset best/near/4/2: 16.19 / 2.00 / 1.00 / 1.00
+  AuxCE / Entropy / ExplVar: 2.336 / 0.454 / -3.427
+  Grad pre/post: 1.8497 / 1.8497 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 9000] Wkr LR: 0.000012, SuccessEMA: 91.6%, Loss: 0.37
+  Success / GoalDist / Progress: 93.8% / 1885.97 / 95.1%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 13.00 / 2.00 / 0.62 / 0.44
+  BestGoalDist / Goal per100: 1485.00 / 3.67
+  Stag / Loop / Timeout: 6.2% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.288 / 2.00 / 78.1% / 59.4%
+  Hit@1 / Hit@2 / Hit@3+: 78.1% / 40.6% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 93.8% / 90.9% / 93.8% / 100.0%
+  GoalRegress / NearGoalCE: 34.4% / 10.6%
+  Goal<=8/4/2: 100.0% / 93.8% / 93.8%
+  StagReset best/near/4/2: 14.78 / 1.88 / 0.94 / 0.94
+  AuxCE / Entropy / ExplVar: 2.373 / 0.526 / 0.041
+  Grad pre/post: 0.7965 / 0.7965 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 9200] Wkr LR: 0.000011, SuccessEMA: 92.3%, Loss: 0.09
+  Success / GoalDist / Progress: 100.0% / 0.00 / 100.0%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 3.00 / 0.00 / 0.00 / 0.00
+  BestGoalDist / Goal per100: 0.00 / 26.59
+  Stag / Loop / Timeout: 0.0% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 1.740 / 0.00 / 0.0% / 0.0%
+  Hit@1 / Hit@2 / Hit@3+: 0.0% / 0.0% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 100.0% / 84.2% / 100.0% / 100.0%
+  GoalRegress / NearGoalCE: 21.9% / 66.5%
+  Goal<=8/4/2: 100.0% / 100.0% / 100.0%
+  StagReset best/near/4/2: 3.00 / 1.00 / 0.00 / 1.00
+  AuxCE / Entropy / ExplVar: 2.763 / 0.490 / -0.872
+  Grad pre/post: 2.5185 / 2.5185 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 9400] Wkr LR: 0.000011, SuccessEMA: 89.8%, Loss: 0.50
+  Success / GoalDist / Progress: 81.2% / 4230.69 / 84.9%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 12.00 / 2.00 / 1.75 / 0.88
+  BestGoalDist / Goal per100: 2177.94 / 2.97
+  Stag / Loop / Timeout: 18.8% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 2.883 / 2.00 / 40.6% / 29.7%
+  Hit@1 / Hit@2 / Hit@3+: 40.6% / 18.8% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 84.4% / 72.2% / 84.4% / 96.3%
+  GoalRegress / NearGoalCE: 53.1% / 9.8%
+  Goal<=8/4/2: 96.9% / 90.6% / 90.6%
+  StagReset best/near/4/2: 14.22 / 1.81 / 0.91 / 0.91
+  AuxCE / Entropy / ExplVar: 2.581 / 0.441 / 0.332
+  Grad pre/post: 1.0477 / 1.0477 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 9600] Wkr LR: 0.000010, SuccessEMA: 89.5%, Loss: 0.43
+  Success / GoalDist / Progress: 96.9% / 749.09 / 95.0%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 12.00 / 2.00 / 0.28 / 0.06
+  BestGoalDist / Goal per100: 247.50 / 14.69
+  Stag / Loop / Timeout: 3.1% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 0.667 / 2.00 / 0.0% / 0.0%
+  Hit@1 / Hit@2 / Hit@3+: 0.0% / 0.0% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 96.9% / 83.8% / 96.9% / 100.0%
+  GoalRegress / NearGoalCE: 28.1% / 42.6%
+  Goal<=8/4/2: 100.0% / 100.0% / 100.0%
+  StagReset best/near/4/2: 5.00 / 2.00 / 1.00 / 1.00
+  AuxCE / Entropy / ExplVar: 2.642 / 0.446 / 0.301
+  Grad pre/post: 1.9821 / 1.9821 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 9800] Wkr LR: 0.000010, SuccessEMA: 88.9%, Loss: 0.21
+  Success / GoalDist / Progress: 100.0% / 0.00 / 100.0%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 21.00 / 2.00 / 0.00 / 0.00
+  BestGoalDist / Goal per100: 0.00 / 8.84
+  Stag / Loop / Timeout: 0.0% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 0.665 / 2.00 / 96.9% / 48.4%
+  Hit@1 / Hit@2 / Hit@3+: 96.9% / 0.0% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 100.0% / 76.2% / 100.0% / 100.0%
+  GoalRegress / NearGoalCE: 40.6% / 26.8%
+  Goal<=8/4/2: 100.0% / 100.0% / 100.0%
+  StagReset best/near/4/2: 8.72 / 2.00 / 1.00 / 1.00
+  AuxCE / Entropy / ExplVar: 2.218 / 0.512 / -0.407
+  Grad pre/post: 1.0209 / 1.0209 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
+[Ep 9999] Wkr LR: 0.000010, SuccessEMA: 91.3%, Loss: 0.31
+  Success / GoalDist / Progress: 96.9% / 1131.91 / 97.1%
+  TeacherHop / HiddenCount / GoalHop / BestHop: 9.00 / 1.00 / 0.44 / 0.25
+  BestGoalDist / Goal per100: 1049.41 / 3.39
+  Stag / Loop / Timeout: 3.1% / 0.0% / 0.0%
+  PathRatio / HiddenCount / HiddenHit / Completion: 3.510 / 1.00 / 56.2% / 56.2%
+  Hit@1 / Hit@2 / Hit@3+: 56.2% / 0.0% / 0.0%
+  GoalNbr / GoalNbrSucc / Hop1 / Hop1->Succ: 96.9% / 81.6% / 96.9% / 100.0%
+  GoalRegress / NearGoalCE: 46.9% / 11.6%
+  Goal<=8/4/2: 100.0% / 96.9% / 96.9%
+  StagReset best/near/4/2: 15.78 / 1.94 / 0.97 / 0.97
+  AuxCE / Entropy / ExplVar: 2.436 / 0.482 / 0.152
+  Grad pre/post: 0.6290 / 0.6290 (clip 0.0%)
+  HiddenBonus/AuxWeight: 0.750 / 0.120
+
