@@ -49,6 +49,7 @@ def main():
     parser.add_argument('--hidden_dim_rl', type=int, default=256, help='Hidden dim for RL Phase (Default: 256)')
     parser.add_argument('--lr_rl', type=float, default=1e-4, help='Learning rate for RL Phase')
     parser.add_argument('--batch_rl', type=int, default=16, help='Batch size (POMO) for RL Phase')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging for RL Phase')
     
     # Viz Args
     parser.add_argument('--skip_viz', action='store_true', help='Skip Visualization Phase')
@@ -83,6 +84,9 @@ def main():
             f'--lr {args.lr_rl} '
             f'--batch_size {args.batch_rl}'
         )
+        if args.debug:
+            cmd_rl += ' --debug'
+        
         run_command(cmd_rl, "Phase 1: RL Training (Worker → Manager → Joint)")
         
     # 3. Visualization
