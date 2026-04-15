@@ -40,7 +40,7 @@ def main():
     parser.add_argument('--epochs_sl', type=int, default=50, help='Epochs for SL Phase (Default: 50)')
     parser.add_argument('--batch_sl', type=int, default=64, help='Batch size for SL Phase')
     parser.add_argument('--hidden_dim_sl', type=int, default=256, help='Hidden dim for SL Phase (Default: 256)')
-    parser.add_argument('--lr_manager_sl', type=float, default=5e-4, help='Manager Learning rate (SL)')
+    parser.add_argument('--lr_manager_sl', type=float, default=1e-4, help='Manager Learning rate (SL)')
     parser.add_argument('--lr_worker_sl', type=float, default=1e-4, help='Worker Learning rate (SL)')
     
     # RL Args
