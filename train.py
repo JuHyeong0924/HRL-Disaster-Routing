@@ -71,42 +71,28 @@ def main():
         )
         run_command(cmd_sl, "Phase 1: Supervised Learning (Pre-training)")
     
-    # 2. Reinforcement Learning (Fine-tuning)
+    # 2. Reinforcement Learning (Phase 1: worker → manager → joint)
     if not args.skip_rl:
-        # Phase 1: Static Environment
-        cmd_rl_p1 = (
+        cmd_rl = (
             f'"{sys.executable}" train_rl.py '
             f'--data {args.data} '
             f'--map {args.map} '
-            f'--episodes {args.episodes_rl // 2} '
+            f'--stage phase1 '
+            f'--episodes {args.episodes_rl} '
             f'--hidden_dim {args.hidden_dim_rl} '
             f'--lr {args.lr_rl} '
             f'--batch_size {args.batch_rl}'
         )
-        run_command(cmd_rl_p1, "Phase 2-1: Reinforcement Learning (Phase 1: Static Route Optimization)")
-        
-        # Phase 2: Dynamic Environment
-        cmd_rl_p2 = (
-            f'"{sys.executable}" train_rl.py '
-            f'--data {args.data} '
-            f'--map {args.map} '
-            f'--episodes {args.episodes_rl // 2} '
-            f'--hidden_dim {args.hidden_dim_rl} '
-            f'--lr {args.lr_rl} '
-            f'--batch_size {args.batch_rl} '
-            f'--disaster'
-        )
-        run_command(cmd_rl_p2, "Phase 2-2: Reinforcement Learning (Phase 2: Dynamic Disaster Adaptation)")
+        run_command(cmd_rl, "Phase 1: RL Training (Worker → Manager → Joint)")
         
     # 3. Visualization
     if not args.skip_viz:
-        # Viz Phase 1 Model
-        cmd_viz_p1 = f'"{sys.executable}" tests/visualize_result.py --map {args.map} --episodes {args.eval_episodes} --viz_episodes {args.viz_episodes} --mode rl --phase 1 --hidden_dim {args.hidden_dim_rl}'
-        run_command(cmd_viz_p1, "Phase 3-1: Visualization & Verification (RL Phase 1 Model)")
-        
-        # Viz Phase 2 Model
-        cmd_viz_p2 = f'"{sys.executable}" tests/visualize_result.py --map {args.map} --episodes {args.eval_episodes} --viz_episodes {args.viz_episodes} --mode rl --phase 2 --disaster --hidden_dim {args.hidden_dim_rl}'
-        run_command(cmd_viz_p2, "Phase 3-2: Visualization & Verification (RL Phase 2 Model)")
+        cmd_viz = (
+            f'"{sys.executable}" tests/evaluate.py paper '
+            f'--map {args.map} '
+            f'--eval-episodes {args.eval_episodes}'
+        )
+        run_command(cmd_viz, "Phase 2: Evaluation & Paper Figures")
 
 if __name__ == "__main__":
     main()

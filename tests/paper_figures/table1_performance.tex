@@ -1,16 +1,26 @@
-\begin{table}[t]
+\begin{table*}[t]
   \centering
-  \caption{Quantitative Performance Comparison on Anaheim Network (416 nodes)}
-  \label{tab:performance}
-  \begin{tabular}{lccc}
+  \caption{Performance Comparison Across Multiple Road Networks}
+  \label{tab:scalability}
+  \begin{tabular}{l r l c c r r}
     \toprule
-    \textbf{Method} & \textbf{Success Rate (\%)} & \textbf{PLR (vs.\ A*)} & \textbf{Latency (ms/step)} \\
+    \textbf{Network} & \textbf{Nodes} & \textbf{Method} & \textbf{SR (\%)} & \textbf{PLR} & \textbf{Per-Decision (ms)} & \textbf{Total Path (ms)} \\
     \midrule
-    A* Search (Expert) & 100.0 & 1.000 (Optimal) & 0.22 \\
-    SL Pre-train (Baseline) & 100.0 & 1.188 & 8.60 \\
-    Proposed HRL (Ours) & 100.0 & 1.197 & 8.66 \\
+    \multirow{3}{*}{SiouxFalls} & \multirow{3}{*}{24} & A* Expert & 100.0 & 1.000 & 0.02 & 0.02 \\
+    & & RL (Worker Only) & 100.0 & 1.009 & 3.81 & 12.57 \\
+    & & \textbf{Proposed HRL} & 100.0 & 1.077 & 3.79 & 23.45 \\
+    \midrule
+    \multirow{3}{*}{Anaheim} & \multirow{3}{*}{416} & A* Expert & 100.0 & 1.000 & 0.23 & 0.23 \\
+    & & RL (Worker Only) & 100.0 & 1.189 & 3.59 & 45.60 \\
+    & & \textbf{Proposed HRL} & 99.4 & 2.927 & 3.58 & 134.50 \\
+    \midrule
+    \multirow{3}{*}{ChicagoSketch} & \multirow{3}{*}{933} & A* Expert & 100.0 & 1.000 & 0.51 & 0.51 \\
+    & & RL (Worker Only) & 100.0 & 1.243 & 3.54 & 56.31 \\
+    & & \textbf{Proposed HRL} & 90.8 & 3.852 & 3.56 & 224.07 \\
+    \midrule
+    \multirow{3}{*}{Goldcoast} & \multirow{3}{*}{4807} & A* Expert & 100.0 & 1.000 & 3.31 & 3.31 \\
+    & & RL (Worker Only) & 91.4 & 2.038 & 7.39 & 727.70 \\
+    & & \textbf{Proposed HRL} & 39.6 & 1.826 & 7.37 & 692.00 \\
     \bottomrule
   \end{tabular}
-  \vspace{2mm}
-  \footnotesize{PLR: Path Length Ratio (actual steps / optimal hops). Lower is better.}
-\end{table}
+\end{table*}

@@ -170,7 +170,7 @@ class DOMOTrainer:
                     x_mgr_in,
                     edge_index,
                     batch_vec,
-                    max_len=20,
+                    max_len=50,  # [성능 고도화] 대형 맵에서도 끝까지 서브골 생성 가능하도록 확장 (20→50)
                     temperature=temperature,
                     apsp_matrix=self.env.hop_matrix,
                     node_positions=self.env.pos_tensor,
@@ -267,7 +267,7 @@ class DOMOTrainer:
             if ref_token_count < aux_seq_len:
                 aux_target_seq[:, ref_token_count] = N
 
-            # AMP: Aux forward도 autocast
+            # AMP: Aux forward도 autocast (Pointer Network NaN은 manager.py 내부에서 FP32 격리로 해결)
             with autocast('cuda', enabled=self.use_amp):
                 aux_target_seq_emb = self._gather_manager_teacher_embeddings(full_ref_embs, aux_target_seq, N)
                 aux_logits = self.manager(x_mgr_in, edge_index, batch_vec, aux_target_seq_emb, edge_attr=ea)
@@ -307,6 +307,14 @@ class DOMOTrainer:
             # [Fix 2026-03] Worker Entropy Bonus 추가
             # execute_batch_plan에서 반환받는 entropy_sum 활용
             entropy_bonus = entropy_bonus - 0.01 * (entropy_sum.mean() / path_lengths.float().clamp(min=1.0).mean())
+            
+            # [성능 고도화] Entropy Decay: 커리큘럼 80% 이후 엔트로피 보너스를 0으로 점진 감소
+            # Why: 학습 후반부에 탐색(Exploration)을 줄이고 최적 경로 집중(Exploitation)으로 전환
+            if curriculum_ratio >= 0.8:
+                entropy_decay = max(0.0, 1.0 - (curriculum_ratio - 0.8) / 0.2)
+            else:
+                entropy_decay = 1.0
+            entropy_bonus = entropy_bonus * entropy_decay
             
             loss = (
                 policy_loss
@@ -657,7 +665,7 @@ class DOMOTrainer:
             'reference_token_count': ref_token_count,
         }
 
-    def _build_reference_sequence(self, start_idx, goal_idx, batch_size, max_len=20):
+    def _build_reference_sequence(self, start_idx, goal_idx, batch_size, max_len=50):
         ref_meta = self._build_reference_metadata(start_idx, goal_idx)
         reference_anchor_nodes = ref_meta['reference_anchor_nodes']
         ref_token_count = int(ref_meta['reference_token_count'])
@@ -872,12 +880,22 @@ class DOMOTrainer:
             ((segment_overshoot * early_weight) > 1e-6).float()
             * valid_mask.float()
         ).sum(dim=1) / plan_lengths.clamp(min=1.0)
+        # [성능 고도화] 밀도(Density) 초과 페널티: 서브골이 너무 촘촘하면 강한 벌점 부여
+        # Why: Density가 목표(0.20)보다 높으면(촘촘하면) PLR이 비효율적으로 높아짐.
+        #      이 페널티가 없으면 매니저가 1~2칸마다 서브골을 남발하여 경로 비용이 3~4x로 폭등.
+        density_excess = torch.clamp(
+            plan_density - self.reward_cfg['PLAN_DENSITY_TARGET'],
+            min=0.0,
+        )
+        density_penalty = self.reward_cfg['PLAN_DENSITY_WEIGHT'] * density_excess
+        
         plan_penalty = (
             - self.reward_cfg['PLAN_CORRIDOR_WEIGHT'] * corridor_deficit
             - far_plan_penalty
             - over_plan_penalty
             - self.reward_cfg['SPACING_PENALTY_SCALE'] * spacing_error_mean
             - self.reward_cfg['MONOTONIC_PENALTY_SCALE'] * monotonic_violation_mean
+            - density_penalty  # [성능 고도화] 밀도 초과 시 페널티 실제 적용
             + anchor_reward
             + first_anchor_penalty
             + empty_plan_penalty
@@ -2213,6 +2231,10 @@ class DOMOTrainer:
                 self._last_initial_values = v_sq # Save for Actor-Critic Advantage Baseline
             
             h, c = h_n, c_n
+            # [Fix] Truncated BPTT: 50스텝마다 hidden state detach → VRAM 일정 유지
+            if t > 0 and t % 50 == 0:
+                h = h.detach()
+                c = c.detach()
             
             # Masking & Sampling
             mask = self.env.get_mask() # [Batch, Num_Nodes]

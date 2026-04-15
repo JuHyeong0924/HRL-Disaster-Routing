@@ -363,19 +363,24 @@ class GraphTransformerManager(nn.Module):
         dec_output = self.decoder(tgt=dec_input, memory=memory_extended, tgt_mask=tgt_mask, memory_key_padding_mask=padding_mask_float)
         
         # Pointer Attention
+        # [AMP NaN Fix] Pointer Network의 tanh + matmul 연산에서 FP16 overflow가 발생하므로
+        # 이 부분만 FP32로 격리하여 VRAM 절약과 수치 안정성을 동시에 확보
         # Q: dec_output [B, L, H]
         # K: memory_extended [B, N+1, H]
-        Q = self.pointer_query(dec_output).unsqueeze(2) # [B, L, 1, H]
-        K = self.pointer_key(memory_extended).unsqueeze(1) # [B, 1, N+1, H]
-        
-        attn_logits = torch.tanh(Q + K)
-        attn_logits = torch.matmul(attn_logits, self.pointer_v).squeeze(-1) # [B, L, N+1]
-        
-        # Masking (Use Bool mask here for simple masking)
-        # memory_mask_extended is Bool, True where Valid.
-        # So ~memory_mask_extended is True where Invalid.
-        expanded_mask = (~memory_mask_extended).unsqueeze(1).expand_as(attn_logits)
-        attn_logits.masked_fill_(expanded_mask, float('-inf'))
+        with torch.amp.autocast('cuda', enabled=False):
+            dec_f32 = dec_output.float()
+            mem_f32 = memory_extended.float()
+            Q = self.pointer_query(dec_f32).unsqueeze(2) # [B, L, 1, H]
+            K = self.pointer_key(mem_f32).unsqueeze(1) # [B, 1, N+1, H]
+            
+            attn_logits = torch.tanh(Q + K)
+            attn_logits = torch.matmul(attn_logits, self.pointer_v.float()).squeeze(-1) # [B, L, N+1]
+            
+            # Masking (Use Bool mask here for simple masking)
+            # memory_mask_extended is Bool, True where Valid.
+            # So ~memory_mask_extended is True where Invalid.
+            expanded_mask = (~memory_mask_extended).unsqueeze(1).expand_as(attn_logits)
+            attn_logits.masked_fill_(expanded_mask, float('-inf'))
         
         return attn_logits # [B, L, N+1] (Last index is EOS)
 
@@ -453,6 +458,11 @@ class GraphTransformerManager(nn.Module):
                     hops_from_curr = apsp_matrix[c_idx].float()
                     shortest_hops = float(apsp_matrix[start_idx, goal_idx].item())
                     current_goal_hops = float(apsp_matrix[c_idx, goal_idx].item())
+                    # inf 방어: 연결 불가능 노드 쌍인 경우 안전한 기본값 사용
+                    if not math.isfinite(shortest_hops):
+                        shortest_hops = 1.0
+                    if not math.isfinite(current_goal_hops):
+                        current_goal_hops = shortest_hops
                     target_segment_hops = max(float(self.decode_bias_cfg.get('target_segment_hops', 4.5)), 1.0)
                     k_ref = max(1.0, float(math.ceil(max(shortest_hops, 1.0) / target_segment_hops)))
                     remaining_slots = max(1.0, k_ref - float(k))

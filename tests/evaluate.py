@@ -2836,7 +2836,7 @@ def parse_args() -> argparse.Namespace:
     p_cmp = subparsers.add_parser("compare", help="SL vs RL 모델 비교 평가")
     p_cmp.add_argument("--sl", required=True, help="SL 체크포인트 경로")
     p_cmp.add_argument("--rl", required=True, help="RL 체크포인트 경로")
-    p_cmp.add_argument("--episodes", type=int, default=50, help="평가 에피소드 수")
+    p_cmp.add_argument("--episodes", type=int, default=500, help="평가 에피소드 수")
     p_cmp.add_argument("--map", default="Anaheim", help="맵 이름")
     p_cmp.add_argument("--seed", type=int, default=42, help="시드")
 
@@ -2854,7 +2854,7 @@ def parse_args() -> argparse.Namespace:
     # ── paper 서브커맨드 (기존 generate_paper_figures.py) ──
     p_pap = subparsers.add_parser("paper", help="논문용 Figure/Table 자동 생성")
     p_pap.add_argument("--map", default="Anaheim", help="맵 이름")
-    p_pap.add_argument("--eval-episodes", type=int, default=50, help="Table 1 평가 에피소드 수")
+    p_pap.add_argument("--eval-episodes", type=int, default=500, help="Table 1 평가 에피소드 수")
     p_pap.add_argument("--output-dir", default="tests/paper_figures", help="출력 디렉토리")
     p_pap.add_argument("--skip-eval", action="store_true", help="Table 1 평가 건너뛰기")
     p_pap.add_argument("--seed", type=int, default=42, help="시드")
@@ -3332,16 +3332,64 @@ def cmd_paper(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 체크포인트 로드
-    hrl_ckpt = core.find_latest_checkpoint("logs/rl_phase1_apte", "final.pt")
+    # 체크포인트 로드: 새 파이프라인 (joint > worker > legacy phase1) 순서 탐색
+    # Worker 체크포인트 탐색: joint > worker_stage > phase1_apte(레거시)
+    joint_ckpt = core.find_latest_checkpoint("logs/rl_joint_stage", "final.pt")
+    # [Fix] Joint 학습 미완주 시 best.pt로 폴백
+    if joint_ckpt is None:
+        # 특정 런 우선 사용 (EMA 25.6% 달성)
+        preferred = Path("logs/rl_joint_stage/2026-04-14_0315_joint_pomo32/best.pt")
+        if preferred.exists():
+            joint_ckpt = preferred
+        else:
+            joint_ckpt = core.find_latest_checkpoint("logs/rl_joint_stage", "best.pt")
+    worker_ckpt = core.find_latest_checkpoint("logs/rl_worker_stage", "final.pt")
+    legacy_ckpt = core.find_latest_checkpoint("logs/rl_phase1_apte", "final.pt")
     sl_ckpt = core.find_sl_checkpoint()
 
+    # Worker 로드: joint(둘 다 포함) > worker_stage > phase1(레거시) > SL
+    hrl_ckpt = joint_ckpt or worker_ckpt or legacy_ckpt
     if not hrl_ckpt:
-        print("❌ HRL 체크포인트를 찾을 수 없습니다.")
+        print("❌ Worker 체크포인트를 찾을 수 없습니다.")
         return
 
-    worker_hrl, _, _ = core.load_checkpoint(str(hrl_ckpt), device=device)
-    print(f"📦 HRL: {hrl_ckpt}")
+    worker_hrl, manager_hrl, _ = core.load_checkpoint(str(hrl_ckpt), device=device, load_manager=True)
+    print(f"📦 Worker loaded from: {hrl_ckpt}")
+
+    # Manager 로드: 체크포인트에 없으면 manager_stage > SL pretrain fallback
+    if manager_hrl is None:
+        mgr_ckpt = core.find_latest_checkpoint("logs/rl_manager_stage", "final.pt")
+        from src.models.manager import GraphTransformerManager
+        manager_hrl = GraphTransformerManager(node_dim=4, hidden_dim=256).to(device)
+
+        mgr_loaded = False
+        # 1순위: manager_stage 체크포인트
+        if mgr_ckpt:
+            try:
+                import torch
+                mgr_payload = torch.load(str(mgr_ckpt), map_location=device, weights_only=False)
+                if "manager_state" in mgr_payload:
+                    manager_hrl.load_state_dict(mgr_payload["manager_state"])
+                    mgr_loaded = True
+                    print(f"📦 Manager loaded from: {mgr_ckpt}")
+            except Exception as e:
+                print(f"⚠️ Manager stage 로드 실패: {e}")
+
+        # 2순위: SL pretrain 체크포인트
+        if not mgr_loaded and sl_ckpt:
+            try:
+                import torch
+                sl_payload = torch.load(str(sl_ckpt), map_location=device, weights_only=False)
+                if "manager_state" in sl_payload:
+                    manager_hrl.load_state_dict(sl_payload["manager_state"])
+                    mgr_loaded = True
+                    print(f"📦 Manager loaded from SL: {sl_ckpt}")
+            except Exception as e:
+                print(f"⚠️ SL Manager 로드 실패: {e}")
+
+        if not mgr_loaded:
+            print("⚠️ Manager 체크포인트를 찾을 수 없어 초기화 상태를 사용합니다.")
+        manager_hrl.eval()
 
     worker_sl = None
     if sl_ckpt:
@@ -3356,34 +3404,62 @@ def cmd_paper(args: argparse.Namespace) -> None:
     print("📊 Figure 1: Concept Diagram 생성 중...")
     _paper_fig1_concept(env, worker_hrl, output_dir / "fig1_concept_diagram.png")
 
-    # Figure 4: Inference Latency
-    print("📊 Figure 4: Inference Latency 벤치마킹...")
-    maps_config = []
-    # Anaheim
-    astar_res = core.benchmark_astar(env, num_queries=100)
-    hrl_res = core.evaluate_worker_batch(worker_hrl, env, 20, label="HRL")
-    maps_config.append({"name": args.map, "nodes": env.num_nodes, "astar_ms": astar_res["mean_ms"], "hrl_ms": hrl_res["inference_latency_ms"]})
-    # SiouxFalls
-    try:
-        sf_env = core.setup_env("SiouxFalls", device)
-        sf_astar = core.benchmark_astar(sf_env, 50)
-        sf_hrl = core.evaluate_worker_batch(worker_hrl, sf_env, 10, label="HRL-SF")
-        maps_config.insert(0, {"name": "SiouxFalls", "nodes": sf_env.num_nodes, "astar_ms": sf_astar["mean_ms"], "hrl_ms": sf_hrl["inference_latency_ms"]})
-    except Exception:
-        pass
+    # Figure 4 + Table 1: 멀티맵 Scalability 비교
+    # 사용 가능한 맵을 노드 수 오름차순으로 정렬하여 순회
+    multi_map_names = ["SiouxFalls", "Anaheim", "ChicagoSketch", "Goldcoast"]
+    maps_config = []  # Figure 4용
+    multi_table_rows = []  # Table 1용 (멀티맵)
+
+    for mname in multi_map_names:
+        try:
+            m_env = core.setup_env(mname, device)
+        except (FileNotFoundError, Exception) as e:
+            print(f"  ⚠️ {mname} 맵 로드 실패, 건너뜀: {e}")
+            continue
+        print(f"\n📊 [{mname}] ({m_env.num_nodes} nodes) 평가 중...")
+
+        # A* 벤치마크
+        m_astar = core.benchmark_astar(m_env, num_queries=100)
+
+        # RL (Worker Only) 평가
+        m_worker_eval = core.evaluate_worker_batch(
+            worker_hrl, m_env, args.eval_episodes,
+            label=f"RL-{mname}", seed=args.seed,
+        )
+
+        # Proposed HRL (Worker + Manager) 평가
+        m_hrl_eval = core.evaluate_joint_batch(
+            worker_hrl, manager_hrl, m_env, args.eval_episodes,
+            label=f"HRL-{mname}", seed=args.seed,
+        )
+
+        # Figure 4 데이터 수집
+        maps_config.append({
+            "name": mname, "nodes": m_env.num_nodes,
+            "astar_ms": m_astar["mean_ms"],
+            "hrl_ms": m_hrl_eval["inference_latency_ms"],
+        })
+
+        # Table 1 데이터 수집
+        multi_table_rows.append({
+            "map": mname, "nodes": m_env.num_nodes,
+            "astar_lat": m_astar["mean_ms"],
+            "worker_sr": m_worker_eval["success_rate"],
+            "worker_plr": m_worker_eval["path_length_ratio"],
+            "worker_lat": m_worker_eval["inference_latency_ms"],
+            "worker_per_step": m_worker_eval["per_step_latency_ms"],
+            "hrl_sr": m_hrl_eval["success_rate"],
+            "hrl_plr": m_hrl_eval["path_length_ratio"],
+            "hrl_lat": m_hrl_eval["inference_latency_ms"],
+            "hrl_per_step": m_hrl_eval["per_step_latency_ms"],
+        })
+
+    # Figure 4 생성
     _paper_fig4_latency(maps_config, output_dir / "fig4_inference_latency.png")
 
-    # Table 1: Performance (skip_eval 체크)
-    if not args.skip_eval:
-        print(f"\n📋 Table 1: Performance Evaluation")
-        models = []
-        models.append({"label": "A* Expert", "sr": 100.0, "plr": 1.0, "lat": astar_res["mean_ms"]})
-        if worker_sl:
-            sl_eval = core.evaluate_worker_batch(worker_sl, env, args.eval_episodes, label="SL Baseline", seed=args.seed)
-            models.append({"label": "SL Pre-train (Baseline)", "sr": sl_eval["success_rate"], "plr": sl_eval["path_length_ratio"], "lat": sl_eval["inference_latency_ms"]})
-        hrl_eval = core.evaluate_worker_batch(worker_hrl, env, args.eval_episodes, label="Proposed HRL", seed=args.seed)
-        models.append({"label": "Proposed HRL (Ours)", "sr": hrl_eval["success_rate"], "plr": hrl_eval["path_length_ratio"], "lat": hrl_eval["inference_latency_ms"]})
-        _paper_table1(models, output_dir / "table1_performance.tex", args.map, env.num_nodes)
+    # Table 1: 멀티맵 비교표 생성
+    if not args.skip_eval and multi_table_rows:
+        _paper_table1_multimap(multi_table_rows, output_dir / "table1_performance.tex")
 
     # Figure 5a: Learning Curves
     print("📊 Figure 5a: Learning Curves 생성 중...")
@@ -3445,8 +3521,8 @@ def _paper_fig1_concept(env: DisasterEnv, worker, output_path: Path) -> None:
         sm.set_array([])
         cbar = fig.colorbar(sm, ax=ax, orientation='horizontal', fraction=0.046, pad=0.05, aspect=40)
         cbar.set_ticks([0, max(len(worker_path) - 2, 1)])
-        cbar.set_ticklabels(['Start', 'Goal'])
-        cbar.set_label('Worker Progress (Local Path Step)', fontsize=12)
+        cbar.set_ticklabels(['Start', 'Goal'], fontsize=14)
+        cbar.set_label('Worker Progress (Local Path Step)', fontsize=16)
     sg_arr = np.array(subgoals)
     ax.scatter(positions[sg_arr, 0], positions[sg_arr, 1], marker="*", s=500, facecolors="#fbbf24", edgecolors="#92400e", linewidths=1.5, label="Subgoals")
     for idx, (x, y) in enumerate(zip(positions[sg_arr, 0], positions[sg_arr, 1])):
@@ -3456,7 +3532,8 @@ def _paper_fig1_concept(env: DisasterEnv, worker, output_path: Path) -> None:
     ax.scatter(positions[start_idx, 0], positions[start_idx, 1], marker="o", s=250, color="#22c55e", edgecolors="black", linewidths=1.5, label="Start")
     ax.scatter(positions[goal_idx, 0], positions[goal_idx, 1], marker="X", s=280, color="#ef4444", edgecolors="black", linewidths=1.5, label="Goal")
     # Title removed per user request
-    ax.legend(fontsize=11)
+    ax.legend(fontsize=14)
+    ax.tick_params(axis='both', labelsize=13)
     ax.set_aspect("equal")
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -3471,12 +3548,13 @@ def _paper_fig4_latency(maps_config, output_path: Path) -> None:
     width = 0.35
     ax.bar(x - width / 2, [m["astar_ms"] for m in maps_config], width, label="A* (Dijkstra)", color="#ef4444", alpha=0.85)
     ax.bar(x + width / 2, [m["hrl_ms"] for m in maps_config], width, label="Proposed HRL", color="#3b82f6", alpha=0.85)
-    ax.set_xlabel("Road Network", fontsize=13, fontweight="bold")
-    ax.set_ylabel("Latency (ms)", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Road Network", fontsize=16, fontweight="bold")
+    ax.set_ylabel("Latency (ms)", fontsize=16, fontweight="bold")
     # Title removed per user request
     ax.set_xticks(x)
-    ax.set_xticklabels([f"{n}\n({m['nodes']})" for n, m in zip(names, maps_config)])
-    ax.legend(fontsize=12)
+    ax.set_xticklabels([f"{n}\n({m['nodes']})" for n, m in zip(names, maps_config)], fontsize=14)
+    ax.legend(fontsize=14)
+    ax.tick_params(axis='y', labelsize=13)
     ax.set_ylim(bottom=0)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -3505,62 +3583,110 @@ def _paper_table1(models, output_path: Path, map_name: str, num_nodes: int) -> N
     print("\n".join(lines))
 
 
-def _paper_fig5a_curves(output_path: Path) -> None:
-    """Figure 5a: Learning Curves (SR, Loss, PLR) without titles."""
-    candidate_files = list(Path("logs/rl_phase1_apte").glob("**/debug_metrics.csv"))
-    if not candidate_files:
-        print("  ⚠️ debug_metrics.csv 를 찾을 수 없어 Fig 5a 생성을 건너뜁니다.")
-        return
-    # 가장 최근에 생성된(수정된) 파일 선택
-    metrics_file = max(candidate_files, key=lambda p: p.stat().st_mtime)
-    import pandas as pd
-    df = pd.read_csv(metrics_file)
-    if df.empty: return
+def _paper_table1_multimap(rows: list, output_path: Path) -> None:
+    """Table 1: 멀티맵 Scalability 비교 LaTeX 표 생성.
 
-    # Smoothen data using rolling average for cleaner lines
-    smooth_win = max(len(df) // 20, 1)
-    df_smooth = df.rolling(smooth_win, min_periods=1).mean()
+    각 맵에 대해 A* / RL(Worker Only) / HRL(Worker+Manager) 3가지 방법을 비교한다.
+    Per-Decision Latency(재경로 1회 비용)와 Total Path Latency(전체 경로 완성 비용) 두 가지를 모두 기재한다.
+    """
+    lines = [
+        r"\begin{table*}[t]",
+        r"  \centering",
+        r"  \caption{Performance Comparison Across Multiple Road Networks}",
+        r"  \label{tab:scalability}",
+        r"  \begin{tabular}{l r l c c r r}",
+        r"    \toprule",
+        r"    \textbf{Network} & \textbf{Nodes} & \textbf{Method} & \textbf{SR (\%)} & \textbf{PLR} & \textbf{Per-Decision (ms)} & \textbf{Total Path (ms)} \\",
+        r"    \midrule",
+    ]
+    for i, row in enumerate(rows):
+        map_label = f"{row['map']}"
+        nodes_str = f"{row['nodes']}"
+        # A* Expert: per-decision = total (단일 호출로 전체 경로 산출)
+        lines.append(f"    \\multirow{{3}}{{*}}{{{map_label}}} & \\multirow{{3}}{{*}}{{{nodes_str}}} & A* Expert & 100.0 & 1.000 & {row['astar_lat']:.2f} & {row['astar_lat']:.2f} \\\\")
+        # RL (Worker Only): per-decision = 1스텝 평균, total = 전체 경로 합계
+        w_plr = f"{row['worker_plr']:.3f}" if math.isfinite(row['worker_plr']) else "N/A"
+        lines.append(f"    & & RL (Worker Only) & {row['worker_sr']:.1f} & {w_plr} & {row['worker_per_step']:.2f} & {row['worker_lat']:.2f} \\\\")
+        # HRL (Worker+Manager): per-decision = Worker 1스텝 평균, total = Manager+Worker 합계
+        h_plr = f"{row['hrl_plr']:.3f}" if math.isfinite(row['hrl_plr']) else "N/A"
+        lines.append(f"    & & \\textbf{{Proposed HRL}} & {row['hrl_sr']:.1f} & {h_plr} & {row['hrl_per_step']:.2f} & {row['hrl_lat']:.2f} \\\\")
+        if i < len(rows) - 1:
+            lines.append(r"    \midrule")
+    lines.extend([r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"])
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"\n  ✅ Saved: {output_path}")
+    print("\n--- Table 1 (Multi-Map) Preview ---")
+    print("\n".join(lines))
+
+def _paper_fig5a_curves(output_path: Path) -> None:
+    """Figure 5a: Learning Curves (SR, Loss, PLR) comparing stages."""
+    import pandas as pd
+    
+    stages = {
+        "Worker Only": ("logs/rl_worker_stage", "#3b82f6"),    # Blue
+        "Manager Only": ("logs/rl_manager_stage", "#ef4444"),  # Red
+        "Proposed HRL": ("logs/rl_joint_stage", "#10b981")     # Green
+    }
+    
+    dfs = {}
+    for label, (log_dir, color) in stages.items():
+        candidate_files = list(Path(log_dir).glob("**/debug_metrics.csv"))
+        if candidate_files:
+            metrics_file = max(candidate_files, key=lambda p: p.stat().st_mtime)
+            df = pd.read_csv(metrics_file)
+            if not df.empty:
+                dfs[label] = (df, color)
+    
+    if not dfs:
+        print("  ⚠️ No debug_metrics.csv found in any stage to plot curves.")
+        return
+
+    def plot_metric(metric_keys, y_label, suffix):
+        fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+        has_data = False
+        
+        # metric_keys can be a list of fallbacks
+        if isinstance(metric_keys, str):
+            metric_keys = [metric_keys]
+            
+        for label, (df, color) in dfs.items():
+            # Find the first available metric
+            valid_col = None
+            for key in metric_keys:
+                if key in df.columns:
+                    valid_col = key
+                    break
+                    
+            if valid_col:
+                has_data = True
+                smooth_win = max(len(df) // 20, 1)
+                df_smooth = df[valid_col].rolling(smooth_win, min_periods=1).mean()
+                
+                # Plot faint raw and bold smoothed
+                ax.plot(df["ep"] if "ep" in df.columns else df.index, df[valid_col], color=color, alpha=0.15)
+                ax.plot(df["ep"] if "ep" in df.columns else df.index, df_smooth, color=color, linewidth=2.5, label=label)
+        
+        if has_data:
+            ax.set_ylabel(y_label, fontsize=20, fontweight="bold")
+            ax.set_xlabel("Episode", fontsize=20)
+            ax.tick_params(axis='both', labelsize=17)
+            ax.legend(fontsize=14, loc="best")
+            
+            p = output_path.with_name(f"fig5a_{suffix}.png")
+            fig.savefig(p, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  ✅ Saved: {p}")
+        else:
+            plt.close(fig)
 
     # 1. Success Rate
-    if "success_rate" in df.columns:
-        fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
-        ax.plot(df["episode"], df["success_rate"], color="#d1d5db", alpha=0.3)
-        ax.plot(df["episode"], df_smooth["success_rate"], color="#2563eb", linewidth=2.5)
-        ax.set_ylabel("Success Rate", fontweight="bold")
-        ax.set_xlabel("Episode")
-        p = output_path.with_name("fig5a_1_success_rate.png")
-        fig.savefig(p, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        print(f"  ✅ Saved: {p}")
+    plot_metric(["success_rate", "success_ema"], "Success Rate (%)", "1_success_rate")
+    
+    # 2. Reward / Loss
+    plot_metric(["total_reward", "reward_mean", "loss_mean"], "Reward", "2_reward")
 
-    # 2. Loss or Reward
-    if "loss" in df.columns or "reward_mean" in df.columns:
-        fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
-        if "loss" in df.columns:
-            ax.plot(df["episode"], df["loss"], color="#fca5a5", alpha=0.3)
-            ax.plot(df["episode"], df_smooth["loss"], color="#ef4444", linewidth=2.5)
-            ax.set_ylabel("Loss", fontweight="bold")
-        else:
-            ax.plot(df["episode"], df["reward_mean"], color="#fca5a5", alpha=0.3)
-            ax.plot(df["episode"], df_smooth["reward_mean"], color="#ef4444", linewidth=2.5)
-            ax.set_ylabel("Reward", fontweight="bold")
-        ax.set_xlabel("Episode")
-        p = output_path.with_name("fig5a_2_loss.png")
-        fig.savefig(p, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        print(f"  ✅ Saved: {p}")
-
-    # 3. PLR
-    if "path_length_ratio" in df.columns:
-        fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
-        ax.plot(df["episode"], df["path_length_ratio"], color="#a7f3d0", alpha=0.3)
-        ax.plot(df["episode"], df_smooth["path_length_ratio"], color="#10b981", linewidth=2.5)
-        ax.set_ylabel("Path Length Ratio", fontweight="bold")
-        ax.set_xlabel("Episode")
-        p = output_path.with_name("fig5a_3_plr.png")
-        fig.savefig(p, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        print(f"  ✅ Saved: {p}")
+    # 3. Progress / PLR
+    plot_metric(["progress_mean", "path_length_ratio"], "Goal Progress / PLR", "3_progress")
 
 
 def _paper_fig5b_path_viz(env, worker, output_path: Path) -> None:
@@ -3610,6 +3736,194 @@ def _paper_fig5b_path_viz(env, worker, output_path: Path) -> None:
     ax.legend(fontsize=12, loc="best")
     ax.set_aspect("equal")
     
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ✅ Saved: {output_path}")
+
+
+
+def _paper_fig_trajectory_comparison(
+    env,
+    worker,
+    manager,
+    output_path: Path,
+    map_name: str = "Goldcoast",
+    seed: int = 77,
+) -> None:
+    """Flat RL (Worker Only) vs HRL (Worker+Manager) 궤적 비교 시각화.
+
+    동일한 (start, goal) 쌍에 대해 두 모델의 경로를 나란히 보여준다.
+    """
+    import tests.eval_core as core
+    import random
+    import matplotlib.colors as mcolors
+
+    core.set_seed(seed)
+    positions = env.pos_tensor.detach().cpu().numpy()
+
+    # ── 1. Worker Only가 성공하지만 PLR이 높은 쌍 탐색 ──
+    print(f"  🔍 [{map_name}] 비교용 (start, goal) 쌍 탐색 중...")
+    candidates = []
+    for _ in range(200):
+        s = random.randint(0, env.num_nodes - 1)
+        g = random.randint(0, env.num_nodes - 1)
+        if s == g:
+            continue
+        h = float(env.hop_matrix[s, g].item())
+        if not math.isfinite(h) or h < 10:
+            continue
+        w_result = core.run_worker_rollout(worker, env, s, g, temperature=0.0)
+        if w_result["success"] and w_result["path_length_ratio"] > 1.3:
+            candidates.append((s, g, w_result))
+            if len(candidates) >= 5:
+                break
+
+    if not candidates:
+        # 폴백
+        for _ in range(100):
+            s = random.randint(0, env.num_nodes - 1)
+            g = random.randint(0, env.num_nodes - 1)
+            if s == g:
+                continue
+            h = float(env.hop_matrix[s, g].item())
+            if math.isfinite(h) and h >= 8:
+                w_result = core.run_worker_rollout(worker, env, s, g, temperature=0.0)
+                if w_result["success"]:
+                    candidates.append((s, g, w_result))
+                    break
+
+    if not candidates:
+        print("  ❌ 적절한 (start, goal) 쌍을 찾지 못했습니다.")
+        return
+
+    best = max(candidates, key=lambda x: x[2]["path_length_ratio"] if math.isfinite(x[2]["path_length_ratio"]) else 0)
+    start_idx, goal_idx, worker_result = best
+    worker_path = worker_result["path_nodes"]
+    worker_plr = worker_result["path_length_ratio"]
+    optimal_hops = worker_result["optimal_hops"]
+
+    print(f"  📍 선택된 쌍: start={start_idx}, goal={goal_idx}, "
+          f"optimal_hops={optimal_hops:.0f}, Worker PLR={worker_plr:.3f}")
+
+    # ── 2. HRL 롤아웃 ──
+    hrl_result = core.run_joint_rollout(
+        worker, manager, env, start_idx, goal_idx,
+        temperature=0.0, mgr_temperature=0.0,
+    )
+    hrl_path = hrl_result["path"]
+    hrl_success = hrl_result["success"]
+    hrl_plr = hrl_result["path_length_ratio"] if hrl_result["success"] else float("inf")
+    hrl_subgoals = hrl_result.get("plan_subgoals", [])
+
+    print(f"  📍 HRL: success={hrl_success}, PLR={hrl_plr:.3f}, subgoals={len(hrl_subgoals)}")
+
+    # ── 3. A* 최적 경로 복원 ──
+    astar_path = None
+    try:
+        # BFS/Dijkstra 기반 최적 경로 복원
+        from collections import deque
+        hop_mat = env.hop_matrix
+        queue = deque([(goal_idx, [goal_idx])])
+        visited = {goal_idx}
+        while queue:
+            node, path_so_far = queue.popleft()
+            if node == start_idx:
+                astar_path = list(reversed(path_so_far))
+                break
+            neighbors = env.map_core.graph.neighbors(
+                [k for k, v in env.node_mapping.items() if v == node][0]
+            )
+            for nb_raw in neighbors:
+                nb = env.node_mapping[nb_raw]
+                if nb not in visited:
+                    visited.add(nb)
+                    queue.append((nb, path_so_far + [nb]))
+    except Exception:
+        pass
+
+    # ── 4. Side-by-side 시각화 ──
+    fig, (ax_flat, ax_hrl) = plt.subplots(1, 2, figsize=(24, 11), constrained_layout=True)
+
+    for ax in (ax_flat, ax_hrl):
+        for src, dst in env.map_core.graph.edges():
+            u, v = env.node_mapping[src], env.node_mapping[dst]
+            ax.plot(
+                [positions[u, 0], positions[v, 0]],
+                [positions[u, 1], positions[v, 1]],
+                color="#d1d5db", linewidth=0.4, alpha=0.5,
+            )
+        ax.set_aspect("equal")
+        ax.tick_params(axis='both', labelsize=13)
+
+    # ── (a) Flat RL ──
+    cmap_flat = plt.get_cmap("autumn")
+    if len(worker_path) > 1:
+        norm_f = mcolors.Normalize(vmin=0, vmax=max(len(worker_path) - 2, 1))
+        for i in range(len(worker_path) - 1):
+            ax_flat.plot(
+                [positions[worker_path[i], 0], positions[worker_path[i + 1], 0]],
+                [positions[worker_path[i], 1], positions[worker_path[i + 1], 1]],
+                color=cmap_flat(norm_f(i)), linewidth=2.5, alpha=0.85,
+            )
+    if astar_path and len(astar_path) > 1:
+        a_arr = np.array(astar_path)
+        ax_flat.plot(positions[a_arr, 0], positions[a_arr, 1],
+                     "--", color="#3b82f6", linewidth=2.0, alpha=0.7, label="A* Optimal")
+    ax_flat.scatter(positions[start_idx, 0], positions[start_idx, 1],
+                    marker="o", s=350, color="#22c55e", edgecolors="black",
+                    linewidths=2.0, zorder=10, label="Start")
+    ax_flat.scatter(positions[goal_idx, 0], positions[goal_idx, 1],
+                    marker="X", s=400, color="#ef4444", edgecolors="black",
+                    linewidths=2.0, zorder=10, label="Goal")
+    sr_w = "✓ Success" if worker_result["success"] else "✗ Fail"
+    ax_flat.set_title(
+        f"(a) Flat RL (Worker Only)\n"
+        f"Steps: {len(worker_path)-1} | PLR: {worker_plr:.2f} | {sr_w}",
+        fontsize=20, fontweight="bold", pad=14,
+    )
+    ax_flat.legend(fontsize=15, loc="upper left")
+
+    # ── (b) HRL ──
+    cmap_hrl = plt.get_cmap("cool")
+    if len(hrl_path) > 1:
+        norm_h = mcolors.Normalize(vmin=0, vmax=max(len(hrl_path) - 2, 1))
+        for i in range(len(hrl_path) - 1):
+            ax_hrl.plot(
+                [positions[hrl_path[i], 0], positions[hrl_path[i + 1], 0]],
+                [positions[hrl_path[i], 1], positions[hrl_path[i + 1], 1]],
+                color=cmap_hrl(norm_h(i)), linewidth=2.5, alpha=0.85,
+            )
+    if hrl_subgoals:
+        sg_valid = [sg for sg in hrl_subgoals if sg < env.num_nodes]
+        if sg_valid:
+            sg_arr = np.array(sg_valid)
+            ax_hrl.scatter(positions[sg_arr, 0], positions[sg_arr, 1],
+                           marker="*", s=500, facecolors="#fbbf24", edgecolors="#92400e",
+                           linewidths=1.5, zorder=8, label="Subgoals")
+            for idx, sg in enumerate(sg_arr):
+                ax_hrl.text(positions[sg, 0] + 0.001, positions[sg, 1] + 0.001,
+                            f"$S_{{{idx+1}}}$", fontsize=14, fontweight="bold",
+                            bbox=dict(facecolor="white", edgecolor="#fbbf24",
+                                      boxstyle="round,pad=0.2", alpha=0.9))
+    if astar_path and len(astar_path) > 1:
+        a_arr = np.array(astar_path)
+        ax_hrl.plot(positions[a_arr, 0], positions[a_arr, 1],
+                    "--", color="#3b82f6", linewidth=2.0, alpha=0.7, label="A* Optimal")
+    ax_hrl.scatter(positions[start_idx, 0], positions[start_idx, 1],
+                   marker="o", s=350, color="#22c55e", edgecolors="black",
+                   linewidths=2.0, zorder=10, label="Start")
+    ax_hrl.scatter(positions[goal_idx, 0], positions[goal_idx, 1],
+                   marker="X", s=400, color="#ef4444", edgecolors="black",
+                   linewidths=2.0, zorder=10, label="Goal")
+    sr_h = "✓ Success" if hrl_success else "✗ Fail"
+    hrl_plr_s = f"{hrl_plr:.2f}" if math.isfinite(hrl_plr) else "N/A"
+    ax_hrl.set_title(
+        f"(b) Proposed HRL (Worker + Manager)\n"
+        f"Steps: {len(hrl_path)-1} | PLR: {hrl_plr_s} | {sr_h}",
+        fontsize=20, fontweight="bold", pad=14,
+    )
+    ax_hrl.legend(fontsize=15, loc="upper left")
+
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  ✅ Saved: {output_path}")

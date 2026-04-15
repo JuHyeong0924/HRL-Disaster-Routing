@@ -1,5 +1,10 @@
-# === 학습 로그 및 체크포인트 (용량이 크고 재생성 가능) ===
-logs/
+# === 학습 로그 및 체크포인트 (SL pretrain만 추적) ===
+logs/rl_worker_stage/
+logs/rl_joint_stage/
+logs/cache/
+
+# === 논문 산출물 (로컬 생성, 재생성 가능) ===
+tests/paper_figures/
 
 # === Python ===
 __pycache__/

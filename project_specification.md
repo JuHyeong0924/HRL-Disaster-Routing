@@ -1,7 +1,7 @@
 # 재난 대응 UGV 경로 탐색 - 상세 설계서 (Low-Level Design)
 
-**문서 버전:** 3.7
-**최종 업데이트:** 2026-04-07 (v3.7: Phase1 APTE 트레이너 3대 버그 수정)
+**문서 버전:** 3.8
+**최종 업데이트:** 2026-04-13 (v3.8: Phase1 worker→manager→joint 자동 순차 파이프라인 구축)
 **작성 언어:** Korean (한국어)
 **문서 설명:** 본 문서는 프로젝트의 모든 클래스, 함수 시그니처, 텐서 차원(Shape), 데이터 흐름을 코드를 보지 않고도 이해할 수 있도록 상세히 기술한 해설서입니다. 2026-04-07 기준 최신 RL 분리학습 구조, 성능 최적화, 버그 수정까지 포함합니다.
 
@@ -25,25 +25,22 @@
 이 때문에 2026-03 후반부터 Phase 1 RL은 단일 trainer 기반 joint fine-tuning에서 벗어나, **Manager-only → Worker-only → readiness check → Joint(optional)** 구조로 재편되었습니다.
 
 ### 0.2 현재 RL 아키텍처 스냅샷
-현재 RL 엔트리포인트는 [train_rl.py](/d:/연구실/연구/재난드론/Code/train_rl.py)이며, 다음 다섯 가지 실행 모드를 지원합니다.
+현재 RL 엔트리포인트는 [train_rl.py](/d:/연구실/연구/재난드론/Code/train_rl.py)이며, 다음 네 가지 실행 모드를 지원합니다.
 
 *   `--stage manager`: Manager-only RL
-*   `--stage worker`: Worker-only RL
-*   `--stage joint`: Joint RL
-*   `--stage phase1`: `manager -> worker -> readiness -> joint(optional)`를 자동 실행
-*   `--disaster`: Phase 2 재난 적응 RL
-
-추가로, joint readiness를 무시하고 강제로 joint를 실행해야 할 때는 `--force_joint`를 사용합니다. (2026-04-08: APTE 브랜치의 레거시 제한 에러를 제거하여 정상 동작하도록 수정됨)
+*   `--stage worker`: Worker-only RL (Phase1GuidedWorkerTrainer 사용)
+*   `--stage joint`: Joint RL (DOMOTrainer 사용)
+*   `--stage phase1`: **`worker → manager → joint`를 자동 순차 실행** (에피소드 비율: 50%/25%/25%)
 
 즉, 현재 학습 파이프라인의 기준 checkpoint 흐름은 다음과 같습니다.
 
-1.  **SL Pretrain**: `logs/sl_pretrain/model_sl_final.pt`
-2.  **Phase 1 Manager**: `logs/rl_phase1_manager/best.pt`
-3.  **Phase 1 Worker**: `logs/rl_phase1_worker/best.pt`
-4.  **Phase 1 Joint**: `logs/rl_phase1_joint/best.pt`
-5.  **Phase 2 Disaster RL**: `logs/rl_finetune_phase2`
+1.  **SL Pretrain**: `logs/sl_pretrain/model_sl_final.pt` (Worker + Manager)
+2.  **RL Worker Stage**: `logs/rl_worker_stage/<timestamp>/final.pt` (Worker + Manager)
+3.  **RL Manager Stage**: `logs/rl_manager_stage/<timestamp>/final.pt` (Worker + Manager)
+4.  **RL Joint Stage**: `logs/rl_joint_stage/<timestamp>/final.pt` (Worker + Manager)
+5.  **Phase 2 Disaster RL**: 향후 구현 예정
 
-재난 적응 phase(`--disaster`)의 시작 checkpoint는 이제 항상 `logs/rl_phase1_joint/best.pt`입니다.
+> **참고:** 모든 체크포인트에 `worker_state`와 `manager_state`가 함께 저장됩니다. (v3.8에서 `Phase1GuidedWorkerTrainer._save_worker_checkpoint`에 `manager_state` 추가)
 
 ### 0.3 2026-04-06 기준 반영된 주요 구조 변경
 #### A. Worker 인터페이스 정상화
@@ -1614,3 +1611,9 @@ evaluate_worker_batch(worker, env, num_episodes, label, seed) -> Dict
 benchmark_astar(env, num_queries) -> Dict
 compute_path_overlap(worker_path, optimal_path) -> Dict
 `
+
+## 10. 	ests/eval_core.py 업데이트 (Joint Rollout 및 GPU 타이머 추가)
+- **Module Target**: 	ests/eval_core.py
+- **추가 기능**: Manager와 Worker를 동시에 롤아웃하여 성능을 측정하는 evaluate_joint_batch 추가.
+- **수정본 Signature**: def run_joint_rollout(worker, manager, env, ... measure_time: bool = False) -> Dict
+- **Data Flow 변화**: Manager 텐서 처리 후 	orch.cuda.synchronize()를 호출하여 GPU 기반 HRL Latency를 정확하게 분리 측정.

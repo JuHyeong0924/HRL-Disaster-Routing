@@ -68,12 +68,21 @@ def setup_env(
     enable_disaster: bool = False,
     verbose: bool = False,
 ) -> DisasterEnv:
-    """DisasterEnv 인스턴스를 생성하여 반환한다."""
+    """DisasterEnv 인스턴스를 생성하여 반환한다.
+
+    파일명 규칙: {map_name}_net.tntp 또는 {map_name}_network.tntp 자동 탐색.
+    """
     if device is None:
         device = get_device()
+    # 네트워크 파일명 자동 탐색 (_net.tntp → _network.tntp 순서)
+    net_path = Path(f"data/{map_name}_net.tntp")
+    if not net_path.exists():
+        net_path = Path(f"data/{map_name}_network.tntp")
+    if not net_path.exists():
+        raise FileNotFoundError(f"네트워크 파일을 찾을 수 없습니다: data/{map_name}_net.tntp 또는 data/{map_name}_network.tntp")
     env = DisasterEnv(
         f"data/{map_name}_node.tntp",
-        f"data/{map_name}_net.tntp",
+        str(net_path),
         device=str(device),
         verbose=verbose,
         enable_disaster=enable_disaster,
@@ -374,18 +383,27 @@ def run_worker_rollout(
     final_node = int(env.current_node.item())
     success = final_node == goal_idx
 
-    # 경로 품질 계산
+    # 경로 품질 계산 (Distance 기반 PLR)
     optimal_hops = float(env.hop_matrix[start_idx, goal_idx].item())
+    optimal_dist = float(env.apsp_matrix[start_idx, goal_idx].item())
     actual_steps = len(path_nodes) - 1
-    plr = actual_steps / max(optimal_hops, 1.0) if math.isfinite(optimal_hops) else float("inf")
+    # 물리적 거리 합산
+    path_distance = sum(
+        float(env.apsp_matrix[path_nodes[i], path_nodes[i + 1]].item())
+        for i in range(len(path_nodes) - 1)
+    ) if len(path_nodes) > 1 else 0.0
+    plr = path_distance / max(optimal_dist, 1e-6) if math.isfinite(optimal_dist) and optimal_dist > 0 else float("inf")
 
     return {
         "success": success,
         "path_nodes": path_nodes,
         "actual_steps": actual_steps,
         "optimal_hops": optimal_hops,
+        "optimal_dist": optimal_dist,
+        "path_distance": path_distance,
         "path_length_ratio": plr,
-        "inference_time_ms": float(np.mean(inference_times)) if inference_times else 0.0,
+        "inference_time_ms": float(np.sum(inference_times)) if inference_times else 0.0,
+        "per_step_time_ms": float(np.mean(inference_times)) if inference_times else 0.0,
     }
 
 
@@ -403,11 +421,12 @@ def run_joint_rollout(
     max_steps: int = MAX_ROLLOUT_STEPS,
     temperature: float = 0.0,
     mgr_temperature: float = 0.5,
+    measure_time: bool = False,
 ) -> Dict[str, Any]:
     """Manager Plan → Worker 실행 조인트 롤아웃.
 
     Returns:
-        success, path, plan_subgoals, subgoal_reached_log 등 포함 딕셔너리.
+        success, path, plan_subgoals, subgoal_reached_log, inference_time_ms 등 포함 딕셔너리.
     """
     device = env.device
     configure_single_problem(env, start_idx, goal_idx)
@@ -421,7 +440,9 @@ def run_joint_rollout(
     edge_index = env.pyg_data.edge_index
     batch_vec = env.pyg_data.batch
     ea = select_edge_attr(env.pyg_data.edge_attr)
+    inference_times: List[float] = []
 
+    t0_mgr = time.perf_counter() if measure_time else 0.0
     sequences, _ = manager.generate(
         x_mgr, edge_index, batch_vec,
         max_len=20, temperature=mgr_temperature,
@@ -429,6 +450,10 @@ def run_joint_rollout(
         node_positions=env.pos_tensor,
         edge_attr=ea,
     )
+    if measure_time:
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        inference_times.append((time.perf_counter() - t0_mgr) * 1000.0)
 
     # Plan 파싱
     plan_raw = sequences[0].tolist()
@@ -493,11 +518,16 @@ def run_joint_rollout(
         env_x = env.pyg_data.x
         worker_input = torch.cat([env_x[:, :4], env_x[:, 5:]], dim=1)
         edge_attr = select_edge_attr(env.pyg_data.edge_attr)
+        t0_wk = time.perf_counter() if measure_time else 0.0
         scores, h, c, _ = worker.predict_next_hop(
             worker_input, env.pyg_data.edge_index,
             h, c, env.pyg_data.batch,
             detach_spatial=False, edge_attr=edge_attr,
         )
+        if measure_time:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            inference_times.append((time.perf_counter() - t0_wk) * 1000.0)
         row_scores = scores.view(1, -1)[0]
         mask = env.get_mask()[0]
         row_scores = row_scores.masked_fill(~mask.bool(), float("-inf"))
@@ -512,7 +542,12 @@ def run_joint_rollout(
         path.append(int(env.current_node.item()))
 
     actual_steps = len(path) - 1
-    optimality_ratio = actual_steps / optimal_hops if optimal_hops > 0 and success else float("inf")
+    # Distance 기반 PLR 계산
+    path_distance = sum(
+        float(env.apsp_matrix[path[i], path[i + 1]].item())
+        for i in range(len(path) - 1)
+    ) if len(path) > 1 else 0.0
+    dist_plr = path_distance / max(optimal_dist, 1e-6) if optimal_dist > 0 and success else float("inf")
     final_dist = float(env.apsp_matrix[path[-1], goal_idx].item())
     progress = 1.0 - (final_dist / optimal_dist) if optimal_dist > 0 else 0.0
 
@@ -523,11 +558,16 @@ def run_joint_rollout(
         "path": path,
         "actual_steps": actual_steps,
         "optimal_hops": optimal_hops,
-        "optimality_ratio": optimality_ratio if success else None,
+        "optimal_dist": optimal_dist,
+        "path_distance": path_distance,
+        "optimality_ratio": dist_plr if success else None,
         "progress": progress,
         "plan_subgoals": plan_subgoals,
         "subgoal_reached_log": subgoal_reached_log,
         "subgoal_reach_rate": len(subgoal_reached_log) / max(len(plan_subgoals), 1),
+        "inference_time_ms": float(np.sum(inference_times)) if inference_times else 0.0,
+        "per_step_time_ms": float(np.mean(inference_times[1:])) if len(inference_times) > 1 else 0.0,
+        "path_length_ratio": dist_plr,
     }
 
 
@@ -601,8 +641,10 @@ def evaluate_worker_batch(
 
     successes = [r for r in results if r["success"]]
     success_rate = len(successes) / max(len(results), 1) * 100.0
-    avg_plr = float(np.mean([r["path_length_ratio"] for r in successes])) if successes else float("inf")
+    avg_plr_values = [r["path_length_ratio"] for r in successes if math.isfinite(r["path_length_ratio"])]
+    avg_plr = float(np.mean(avg_plr_values)) if avg_plr_values else float("inf")
     avg_latency = float(np.mean([r["inference_time_ms"] for r in results]))
+    avg_per_step = float(np.mean([r["per_step_time_ms"] for r in results]))
 
     return {
         "label": label,
@@ -610,6 +652,65 @@ def evaluate_worker_batch(
         "success_rate": success_rate,
         "path_length_ratio": avg_plr,
         "inference_latency_ms": avg_latency,
+        "per_step_latency_ms": avg_per_step,
+        "results": results,
+    }
+
+
+def evaluate_joint_batch(
+    worker: WorkerLSTM,
+    manager: GraphTransformerManager,
+    env: DisasterEnv,
+    num_episodes: int,
+    temperature: float = 0.0,
+    mgr_temperature: float = 0.0,
+    label: str = "HRL Model",
+    seed: int = 42,
+    min_hops: int = 2,
+) -> Dict[str, Any]:
+    """Worker + Manager 모델을 N회 rollout 후 통계 반환."""
+    results: List[Dict[str, Any]] = []
+    worker.eval()
+    manager.eval()
+    rng = random.Random(seed)
+
+    for ep in range(num_episodes):
+        s = rng.randint(0, env.num_nodes - 1)
+        g = rng.randint(0, env.num_nodes - 1)
+        while g == s:
+            g = rng.randint(0, env.num_nodes - 1)
+
+        hop_dist = float(env.hop_matrix[s, g].item())
+        if not math.isfinite(hop_dist) or hop_dist < min_hops:
+             g = rng.randint(0, env.num_nodes - 1)
+             while g == s:
+                 g = rng.randint(0, env.num_nodes - 1)
+
+        result = run_joint_rollout(
+            worker, manager, env, s, g,
+            temperature=temperature, mgr_temperature=mgr_temperature,
+            measure_time=True,
+        )
+        results.append(result)
+
+        if (ep + 1) % 20 == 0:
+            sr = sum(1 for r in results if r["success"]) / len(results) * 100
+            print(f"  [{label}] Ep {ep + 1}/{num_episodes}: SR={sr:.1f}%")
+
+    successes = [r for r in results if r["success"]]
+    success_rate = len(successes) / max(len(results), 1) * 100.0
+    avg_plr_values = [r["path_length_ratio"] for r in successes if math.isfinite(r["path_length_ratio"])]
+    avg_plr = float(np.mean(avg_plr_values)) if avg_plr_values else float("inf")
+    avg_latency = float(np.mean([r["inference_time_ms"] for r in results]))
+    avg_per_step = float(np.mean([r["per_step_time_ms"] for r in results]))
+
+    return {
+        "label": label,
+        "num_episodes": num_episodes,
+        "success_rate": success_rate,
+        "path_length_ratio": avg_plr,
+        "inference_latency_ms": avg_latency,
+        "per_step_latency_ms": avg_per_step,
         "results": results,
     }
 

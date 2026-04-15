@@ -30,6 +30,9 @@ class ManagerStageTrainer(DOMOTrainer):
         )
         self.mgr_max_grad_norm = 20.0
         self.manager.to(self.device).train()
+        for p in self.manager.parameters():
+            p.requires_grad_(True)  # [Fix] Worker Stage에서 Freeze된 상태가 넘어올 수 있으므로 명시적 해제
+            
         self.worker.to(self.device).eval()
         for p in self.worker.parameters():
             p.requires_grad_(False)
@@ -228,12 +231,13 @@ class ManagerStageTrainer(DOMOTrainer):
             self.mgr_opt.zero_grad()
             if loss.requires_grad:
                 loss.backward()
+                # [Fix] 확실한 그라디언트 추적을 위해 명시적으로 norm 계산
                 mgr_preclip_norm = float(
                     torch.nn.utils.clip_grad_norm_(self.manager.parameters(), max_norm=self.mgr_max_grad_norm)
                 )
                 self.mgr_opt.step()
             else:
-                mgr_preclip_norm = 0.0
+                mgr_preclip_norm = -1.0 # 0.0과 구별하기 위해 -1로 기록 (requires_grad=False 감지용)
             self.mgr_scheduler.step()
 
             quality_rate = (

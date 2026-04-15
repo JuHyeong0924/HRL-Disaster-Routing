@@ -61,14 +61,24 @@ def _find_max_batch_size(env, worker, device, max_try: int = 64) -> int:
             del h, c, scores, h_new, c_new, v, loss, opt
             torch.cuda.empty_cache()
             best = bs
-            print(f"  ✅ batch_size={bs} OK")
+            print(f"  ✅ batch_size={bs} OK (Tested Worker FW/BW)")
         except RuntimeError as e:
             if "out of memory" in str(e).lower() or "CUDA" in str(e):
                 torch.cuda.empty_cache()
-                print(f"  ❌ batch_size={bs} OOM → 이전 크기 {best} 사용")
+                print(f"  ❌ batch_size={bs} OOM → 탐색 중단")
                 break
             raise  # OOM이 아닌 다른 에러는 전파
-    return best
+
+    # VRAM 여유 공간 확보 (Manager의 Forward 연산(Transformer) 및 기타 오버헤드 대비 마진)
+    # 찾아낸 best에서 한 단계 아래의 후보를 선택합니다.
+    margin_best = best
+    if best in candidates:
+        idx = candidates.index(best)
+        if idx > 0:
+            margin_best = candidates[idx - 1]
+            print(f"  🛡️ VRAM 마진 확보: {best} → {margin_best} 로 하향 조정 (Manager 연산 대비)")
+
+    return margin_best
 
 
 class Config:
@@ -183,26 +193,28 @@ def _load_worker_checkpoint(path, worker, device, loaded_paths):
     return True
 
 
-def _build_config(args, loaded_checkpoint_paths):
+def _build_config(args, loaded_checkpoint_paths, stage_override=None):
+    # stage_override: phase1 순차 실행 시 각 단계별 stage 지정용
+    effective_stage = stage_override or args.stage
     # 타임스탬프 서브폴더 생성: logs/<stage>/<YYYY-MM-DD_HHMM>_<stage>_pomo<N>/
     timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
-    run_label = f"{timestamp}_{args.stage}_pomo{args.num_pomo}"
+    run_label = f"{timestamp}_{effective_stage}_pomo{args.num_pomo}"
     stage_base = {
         'manager': os.path.join('logs', 'rl_manager_stage'),
         'worker': os.path.join('logs', 'rl_worker_stage'),
         'joint': os.path.join('logs', 'rl_joint_stage'),
-        'phase1': os.path.join('logs', 'rl_phase1_apte'),
-    }.get(args.stage, os.path.join('logs', 'rl_finetune'))
+    }.get(effective_stage, os.path.join('logs', 'rl_finetune'))
     save_dir = os.path.join(stage_base, run_label)
     return Config(
         lr=args.lr,
         num_pomo=args.num_pomo,
         episodes=args.episodes,
-        save_dir=save_dir,  # 타임스탬프 서브폴더에 저장
-        stage=args.stage,  # [Refactor: Task 1] 커리큘럼 stage 전달
+        save_dir=save_dir,
+        stage=effective_stage,
         debug=args.debug,
         run_type="smoke" if args.episodes <= 5 else "train",
         parent_checkpoints=loaded_checkpoint_paths,
+        mgr_max_grad_norm=20.0,  # [Fix] Manager Stage(20.0)과 동일하게 맞춤 (기본값 5.0은 100% clip-hit 유발)
         max_steps=400,
         worker_temperature=1.0,
         target_segment_hops=6.0,
@@ -234,15 +246,8 @@ def _build_config(args, loaded_checkpoint_paths):
     )
 
 
-def train_rl(args):
-    if args.disaster:
-        raise ValueError(
-            "--disaster is legacy / unsupported in the APTE branch. "
-            "Use worker-only APTE phase1."
-        )
-    # [Refactor: Task 1] 멀티스테이지 지원 (manager/worker/joint/phase1)
-
-    print(f"🚀 Starting RL Training - Stage: {args.stage}")
+def _init_env_and_models(args):
+    """환경, 모델, 디바이스 초기화 (공용)."""
     print("Initializing Environment...")
     env = DisasterEnv(
         f"data/{args.map}_node.tntp",
@@ -258,12 +263,10 @@ def train_rl(args):
         print("⚠️ GPU NOT DETECTED! Training will be slow on CPU.")
     print(f"Active Device: {device}")
 
-    # APTE phase1 is worker-centric at runtime. The manager module is carried only
-    # as an unused compatibility shell so we can reuse the shared trainer helpers.
     manager = GraphTransformerManager(node_dim=4, hidden_dim=args.hidden_dim, dropout=0.2).to(device)
     worker = WorkerLSTM(node_dim=8, hidden_dim=args.hidden_dim).to(device)
 
-    # [Perf] 배치 크기 자동 탐색
+    # 배치 크기 자동 탐색
     if args.num_pomo == "auto":
         if device.type == "cuda":
             print("🔍 VRAM 한도 내 최대 배치 크기 탐색 중...")
@@ -275,51 +278,113 @@ def train_rl(args):
     else:
         args.num_pomo = int(args.num_pomo)
 
+    return env, manager, worker, device
+
+
+def _get_latest_ckpt(base_path: str, fallback_name: str) -> str:
+    """base_path 내 최신 서브디렉토리의 fallback_name 체크포인트 경로 반환."""
+    ckpt = os.path.join(base_path, fallback_name)
+    if os.path.exists(base_path):
+        subdirs = [os.path.join(base_path, d) for d in os.listdir(base_path)
+                   if os.path.isdir(os.path.join(base_path, d))]
+        if subdirs:
+            latest_subdir = max(subdirs, key=os.path.getmtime)
+            target_file = os.path.join(latest_subdir, fallback_name)
+            if os.path.exists(target_file):
+                ckpt = target_file
+            else:
+                # [Fix] best.pt가 없으면 final.pt라도 가져오도록 지원
+                alt_file = os.path.join(latest_subdir, "final.pt")
+                if os.path.exists(alt_file):
+                    ckpt = alt_file
+    return ckpt
+
+
+def _run_single_stage(args, env, manager, worker, device, stage: str,
+                      episodes: int) -> None:
+    """단일 stage 학습 실행."""
+    print(f"\n{'='*60}")
+    print(f"🚀 Stage [{stage.upper()}] 학습 시작 ({episodes} episodes)")
+    print(f"{'='*60}")
+
     loaded_checkpoint_paths = []
-
-    def _get_latest_ckpt(base_path, fallback_name):
-        ckpt = os.path.join(base_path, fallback_name)
-        if os.path.exists(base_path):
-            subdirs = [os.path.join(base_path, d) for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
-            if subdirs:
-                latest_subdir = max(subdirs, key=os.path.getmtime)
-                ckpt = os.path.join(latest_subdir, fallback_name)
-        return ckpt
-
-    # [Refactor: Task 1] Stage별 체크포인트 로드 전략
     sl_ckpt = _get_latest_ckpt(os.path.join("logs", "sl_pretrain"), "model_sl_final.pt")
     mgr_stage_ckpt = _get_latest_ckpt(os.path.join("logs", "rl_manager_stage"), "best.pt")
     wkr_stage_ckpt = _get_latest_ckpt(os.path.join("logs", "rl_worker_stage"), "best.pt")
 
-    if args.stage in ("manager", "worker", "phase1"):
-        # SL pretrained worker 로드
+    if stage == "worker":
+        # SL pretrained worker/manager 로드
         if not _load_worker_checkpoint(sl_ckpt, worker, device, loaded_checkpoint_paths):
             print("⚠️ SL worker checkpoint not found. Starting from scratch.")
-    elif args.stage == "joint":
-        # Worker stage best → fallback SL
+        if not _load_manager_checkpoint(sl_ckpt, manager, device, loaded_checkpoint_paths):
+            print("⚠️ SL manager checkpoint not found.")
+    elif stage == "manager":
+        # Worker: worker_stage best → fallback SL
         if not _load_worker_checkpoint(wkr_stage_ckpt, worker, device, loaded_checkpoint_paths):
             if not _load_worker_checkpoint(sl_ckpt, worker, device, loaded_checkpoint_paths):
-                print("⚠️ No worker checkpoint found for joint stage.")
-
-    if args.stage in ("worker", "joint"):
-        # Manager stage checkpoint → fallback SL (Manager가 랜덤이면 Plan이 엉망)
+                print("⚠️ No worker checkpoint for manager stage.")
+        # Manager: SL pretrained로 시작
+        if not _load_manager_checkpoint(sl_ckpt, manager, device, loaded_checkpoint_paths):
+            print("⚠️ SL manager checkpoint not found.")
+    elif stage == "joint":
+        # Worker: worker_stage best → fallback SL
+        if not _load_worker_checkpoint(wkr_stage_ckpt, worker, device, loaded_checkpoint_paths):
+            if not _load_worker_checkpoint(sl_ckpt, worker, device, loaded_checkpoint_paths):
+                print("⚠️ No worker checkpoint for joint stage.")
+        # Manager: manager_stage best → fallback SL
         if not _load_manager_checkpoint(mgr_stage_ckpt, manager, device, loaded_checkpoint_paths):
             if not _load_manager_checkpoint(sl_ckpt, manager, device, loaded_checkpoint_paths):
-                print("⚠️ Manager checkpoint not found. Manager starts from scratch.")
+                print("⚠️ No manager checkpoint for joint stage.")
 
-    config = _build_config(args, loaded_checkpoint_paths)
+    config = _build_config(args, loaded_checkpoint_paths, stage_override=stage)
 
-    # [Refactor: Task 1] Stage별 Trainer 분기
-    if args.stage == "manager":
+    # Stage별 Trainer 분기
+    if stage == "manager":
         trainer = ManagerStageTrainer(env, manager, worker, config)
-    elif args.stage == "worker":
-        trainer = WorkerStageTrainer(env, manager, worker, config)
-    elif args.stage == "joint":
+    elif stage == "worker":
+        # Phase1GuidedWorkerTrainer를 Worker stage의 기본 Trainer로 사용
+        trainer = Phase1GuidedWorkerTrainer(env, manager, worker, config)
+    elif stage == "joint":
         trainer = DOMOTrainer(env, manager, worker, config)
-    else:  # phase1
+    else:
         trainer = Phase1GuidedWorkerTrainer(env, manager, worker, config)
 
-    trainer.train(args.episodes)
+    trainer.train(episodes)
+    print(f"\n✅ Stage [{stage.upper()}] 학습 완료!")
+    print(f"   저장 위치: {config.save_dir}")
+
+
+def train_rl(args):
+    if args.disaster:
+        raise ValueError(
+            "--disaster is legacy / unsupported. "
+            "Use --stage phase1 for worker→manager→joint pipeline."
+        )
+
+    env, manager, worker, device = _init_env_and_models(args)
+
+    if args.stage == "phase1":
+        # Phase 1: worker → manager → joint 자동 순차 실행
+        # 각 단계별로 입력받은 episodes만큼 독립적으로 실행 (총 3 * episodes)
+        worker_eps = args.episodes
+        manager_eps = args.episodes
+        joint_eps = args.episodes
+
+        print(f"\n🎯 Phase 1 자동 순차 실행: 각 Stage별 {args.episodes} episodes (총 {args.episodes * 3} eps)")
+        print(f"   1. Worker:  {worker_eps} eps → logs/rl_worker_stage/")
+        print(f"   2. Manager: {manager_eps} eps → logs/rl_manager_stage/")
+        print(f"   3. Joint:   {joint_eps} eps → logs/rl_joint_stage/")
+
+        _run_single_stage(args, env, manager, worker, device, "worker", worker_eps)
+        _run_single_stage(args, env, manager, worker, device, "manager", manager_eps)
+        _run_single_stage(args, env, manager, worker, device, "joint", joint_eps)
+
+        print(f"\n{'='*60}")
+        print("🎉 Phase 1 전체 학습 완료!")
+        print(f"{'='*60}")
+    else:
+        # 단일 stage 실행
+        _run_single_stage(args, env, manager, worker, device, args.stage, args.episodes)
 
 
 if __name__ == "__main__":
@@ -338,7 +403,7 @@ if __name__ == "__main__":
     parser.add_argument("--wkr_lr_floor", type=float, default=1e-5,
                         help="Worker 최소 학습률 (기본 1e-5)")  # [Refactor: Task 5]
     parser.add_argument("--hidden_dim", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument(
         "--disaster",
         action="store_true",

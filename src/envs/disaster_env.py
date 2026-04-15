@@ -569,6 +569,8 @@ class DisasterEnv:
         """
         self.target_node = new_targets # Update internal state
         batch_indices = torch.arange(self.batch_size, device=self.device)
+        # [Fix] 매니저가 EOS 토큰(N) 또는 범위 외 인덱스를 생성할 수 있으므로 안전하게 클램핑
+        new_targets = new_targets.clamp(0, self.num_nodes - 1)
         
         # 1. Update is_target
         self.pyg_data.x[:, 3] = 0.0

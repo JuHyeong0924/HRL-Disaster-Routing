@@ -314,6 +314,7 @@ class Phase1GuidedWorkerTrainer(DOMOTrainer):
             "stage": self.stage,
             "checkpoint_format": "worker_centric",
             "worker_state": self.worker.state_dict(),
+            "manager_state": self.manager.state_dict(),  # Manager도 함께 저장
             "worker_optimizer_state": self.wkr_opt.state_dict() if self.wkr_opt is not None else None,
         }
         if self.wkr_scheduler is not None:
