@@ -153,15 +153,18 @@ def train_sl(args):
     mgr_val_loader = DataLoader(mgr_val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=hierarchical_collate, num_workers=0, pin_memory=True)
     wkr_val_loader = DataLoader(wkr_val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=hierarchical_collate, num_workers=0, pin_memory=True)
     
+    # Phase 1: edge_dim=1 (length만 사용. A*/APSP 학습 신호와 일치하는 유일한 엣지 피처)
     manager = GraphTransformerManager(
         node_dim=4, 
         hidden_dim=args.hidden_dim, 
-        dropout=0.2
+        dropout=0.2,
+        edge_dim=1
     ).to(device)
     
     worker = WorkerLSTM(
         node_dim=8,  # [x, y, is_current, is_target, net_dist, dir_x, dir_y, is_final_target_phase]
-        hidden_dim=args.hidden_dim
+        hidden_dim=args.hidden_dim,
+        edge_dim=1
     ).to(device)
     
     
@@ -190,6 +193,23 @@ def train_sl(args):
         'mgr_train_loss': [], 'mgr_val_loss': [],
         'wkr_train_loss': [], 'wkr_val_loss': [],
     }
+    
+    # === Early Stopping 설정 ===
+    # Worker: 과적합 감지 시 학습 중단 (best 가중치 복원)
+    # Manager: 장기간 개선 없으면 전체 학습 종료
+    WORKER_ES_PATIENCE = 5   # Worker val loss가 5회 연속 개선 안 되면 학습 중단
+    MANAGER_ES_PATIENCE = 7  # Manager val loss가 7회 연속 개선 안 되면 전체 종료
+    
+    best_wkr_val = float('inf')
+    best_mgr_val = float('inf')
+    wkr_es_counter = 0  # Worker early stopping 카운터
+    mgr_es_counter = 0  # Manager early stopping 카운터
+    wkr_frozen = False  # True이면 Worker 학습 건너뜀 (과적합 감지됨)
+    
+    # Best 가중치 저장 (메모리에 보관)
+    import copy
+    best_wkr_state = copy.deepcopy(worker.state_dict())
+    best_mgr_state = copy.deepcopy(manager.state_dict())
     
     # [Fix #1] APSP 행렬은 이미 GPU에 캐싱 완료 (apsp_device_global)
     
@@ -249,7 +269,9 @@ def train_sl(args):
             
             # Call Forward
             # target_seq_emb: [B, L, H]
-            pointer_logits = manager(batch.x, batch.edge_index, batch.batch, target_seq_emb=target_seq_emb, edge_attr=batch.edge_attr)
+            # edge_attr: Manager DataLoader에 edge_attr가 없을 수 있으므로 None-safe 처리
+            mgr_edge_attr = batch.edge_attr[:, 0:1] if batch.edge_attr is not None else None
+            pointer_logits = manager(batch.x, batch.edge_index, batch.batch, target_seq_emb=target_seq_emb, edge_attr=mgr_edge_attr)
             # logits: [B, L+1, N+1] (Time steps shifted by 1 due to SOS)
             
             # 3. Construct Final Targets [B, L+1]
@@ -339,7 +361,7 @@ def train_sl(args):
         tf_ratio = max(0.3, 1.0 - 1.5 * (epoch - 1) / args.epochs)
         window_size = 5 # 다중 스텝 언롤링(Multi-step Unrolling) 윈도우 크기
         
-        if WORKER_FREQ > 0 and epoch % WORKER_FREQ == 0:
+        if WORKER_FREQ > 0 and epoch % WORKER_FREQ == 0 and not wkr_frozen:
             worker.train()
             wkr_loss = 0
             wkr_batches = 0
@@ -382,7 +404,7 @@ def train_sl(args):
                 node_coords_per_graph = batch.x[:, :2].view(num_graphs, -1, 2)  # [B, N, 2]
                 num_nodes_per_graph = node_coords_per_graph.size(1)
                 base_edges = pyg_data.edge_index.to(device)  # [2, E_single]
-                base_edge_attr = pyg_data.edge_attr.to(device)  # [E_single, edge_dim]
+                base_edge_attr = pyg_data.edge_attr[:, 0:1].to(device)  # [E_single, 1] Phase 1: length만 사용
                 num_edges_per_graph = base_edges.size(1)
                 
                 # [Fix A] Pre-allocation: 초기 K=num_graphs에 대해 사전 계산
@@ -536,6 +558,8 @@ def train_sl(args):
                 pbar.set_postfix({'loss': f"{wkr_loss/max(1, wkr_batches):.4f}", 'acc': f"{wkr_acc:.1f}%"})
             
             print(f"Worker Train Loss: {wkr_loss/max(1, wkr_batches):.4f}, Acc: {wkr_acc:.1f}% (TF Ratio: {tf_ratio:.2f})", flush=True)
+        elif wkr_frozen:
+            print(f"Worker Train: ⛔ Frozen (Early Stopping at best Val={best_wkr_val:.4f})", flush=True)
         else:
             print(f"Worker Train: Skipped (Freq={WORKER_FREQ})", flush=True)
         
@@ -579,7 +603,8 @@ def train_sl(args):
                 target_seq_emb = target_seq_emb * is_valid.unsqueeze(-1).float()
                 
                 # 2. Forward Pass
-                pointer_logits = manager(batch.x, batch.edge_index, batch.batch, target_seq_emb=target_seq_emb, edge_attr=batch.edge_attr)
+                val_edge_attr = batch.edge_attr[:, 0:1] if batch.edge_attr is not None else None
+                pointer_logits = manager(batch.x, batch.edge_index, batch.batch, target_seq_emb=target_seq_emb, edge_attr=val_edge_attr)
                 
                 # 3. Construct Targets for Loss
                 seq_L = raw_targets.size(1)
@@ -654,7 +679,7 @@ def train_sl(args):
                     node_coords_per_graph = batch.x[:, :2].view(val_num_graphs, -1, 2)  # [B, N, 2]
                     num_nodes_per_graph = node_coords_per_graph.size(1)
                     base_edges = pyg_data.edge_index.to(device)
-                    base_edge_attr = pyg_data.edge_attr.to(device)
+                    base_edge_attr = pyg_data.edge_attr[:, 0:1].to(device)  # Phase 1: length만 사용
                     
                     # [Fix A] Pre-allocation (Validation) — edge_index/batch_vec만 캐싱
                     cached_K = val_num_graphs
@@ -740,16 +765,43 @@ def train_sl(args):
                 pass
         
         mgr_val = mgr_val_loss/max(1, mgr_val_batches)
-        if epoch % WORKER_FREQ == 0:
+        if epoch % WORKER_FREQ == 0 and not wkr_frozen:
             wkr_val = wkr_val_loss/max(1, wkr_val_batches)
             print(f"📊 Validation - Manager: {mgr_val:.4f}, Worker: {wkr_val:.4f}", flush=True)
             # wkr_val logging
             history['wkr_train_loss'].append(wkr_loss/max(1, wkr_batches))
             history['wkr_val_loss'].append(wkr_val)
+            
+            # === Worker Early Stopping 체크 ===
+            if wkr_val < best_wkr_val:
+                best_wkr_val = wkr_val
+                wkr_es_counter = 0
+                best_wkr_state = copy.deepcopy(worker.state_dict())
+                print(f"  ✅ Worker Best Val Loss 갱신: {best_wkr_val:.4f}")
+            else:
+                wkr_es_counter += 1
+                print(f"  ⚠️ Worker Val Loss 미개선 ({wkr_es_counter}/{WORKER_ES_PATIENCE})")
+                if wkr_es_counter >= WORKER_ES_PATIENCE:
+                    print(f"  ⛔ Worker Early Stopping! Best Val={best_wkr_val:.4f}에서 동결.")
+                    print(f"     → Worker 가중치를 Best 시점으로 복원합니다.")
+                    worker.load_state_dict(best_wkr_state)
+                    wkr_frozen = True
+        elif wkr_frozen:
+            print(f"📊 Validation - Manager: {mgr_val:.4f}, Worker: Frozen (Best={best_wkr_val:.4f})")
         else:
             print(f"📊 Validation - Manager: {mgr_val:.4f}, Worker: Skipped", flush=True)
             # Worker가 skip된 에폭에는 기록하지 않음 (learning curve에서 학습 에폭만 표시)
             pass
+        
+        # === Manager Early Stopping 체크 ===
+        if mgr_val < best_mgr_val:
+            best_mgr_val = mgr_val
+            mgr_es_counter = 0
+            best_mgr_state = copy.deepcopy(manager.state_dict())
+            print(f"  ✅ Manager Best Val Loss 갱신: {best_mgr_val:.4f}")
+        else:
+            mgr_es_counter += 1
+            print(f"  ⚠️ Manager Val Loss 미개선 ({mgr_es_counter}/{MANAGER_ES_PATIENCE})")
         
         # 학습 곡선 기록
         mgr_train = mgr_loss/max(1, mgr_batches)
@@ -758,20 +810,28 @@ def train_sl(args):
         history['mgr_val_loss'].append(mgr_val)
         
         manager.train()
-        worker.train()
+        if not wkr_frozen:
+            worker.train()
         
         # Step LR Schedulers
         mgr_scheduler.step(mgr_val) # ReduceLROnPlateau needs metric
-        if epoch % WORKER_FREQ == 0:
+        if epoch % WORKER_FREQ == 0 and not wkr_frozen:
             wkr_scheduler.step()
         
-        # Get LR safely (ReduceLROnPlateau does not have get_last_lr in old versions, use optimizer param_groups)
+        # Get LR safely
         current_lr_mgr = optimizer_mgr.param_groups[0]['lr']
         current_lr_wkr = wkr_opt.param_groups[0]['lr']
         print(f"Current LR - Manager: {current_lr_mgr:.6f}, Worker: {current_lr_wkr:.6f}", flush=True)
 
-        # [Fix #5] stale del try/except 제거 (logits, loss는 이 스코프에 존재하지 않음)
-        # torch.cuda.empty_cache() — 매 에폭 강제 삭제 방지 (VRAM 캐싱 풀 활용)
+        # === Manager Early Stopping: 전체 학습 종료 ===
+        if mgr_es_counter >= MANAGER_ES_PATIENCE:
+            print(f"\n⛔ Manager Early Stopping! Best Val={best_mgr_val:.4f}")
+            print(f"   → 에폭 {epoch}에서 학습 조기 종료.")
+            manager.load_state_dict(best_mgr_state)
+            if not wkr_frozen:
+                # Worker도 마지막 best로 복원
+                worker.load_state_dict(best_wkr_state)
+            break
     
     # === Accuracy Evaluation ===
     print("\n📊 Evaluating Model Accuracy...", flush=True)
@@ -803,7 +863,7 @@ def train_sl(args):
             
             # Manager 예측 (첫 번째 토큰만 비교)
             # target_seq_emb=None으로 주면 SOS만 사용하여 첫 토큰 예측
-            logits = manager(x_in.squeeze(0), edge_index, batch_vec, target_seq_emb=None, edge_attr=pyg_data.edge_attr.to(device))
+            logits = manager(x_in.squeeze(0), edge_index, batch_vec, target_seq_emb=None, edge_attr=pyg_data.edge_attr[:, 0:1].to(device))
             pred = logits[0, 0].argmax().item()
             target = y[0].item() if y.dim() > 0 else y.item()
             
@@ -859,10 +919,12 @@ def train_sl(args):
                 norm = direction.norm(dim=1, keepdim=True).clamp(min=1e-8)
                 direction = direction / norm
                 
-                worker_in = torch.cat([node_coords, flags, net_dist, direction], dim=1)
+                # is_final_target_phase: 1.0 if this step's subgoal is the final target
+                is_final = torch.full((num_nodes, 1), float(step == seq_len - 1), device=device)
+                worker_in = torch.cat([node_coords, flags, net_dist, direction, is_final], dim=1)
                 
-                # [Fix] Use pyg_data.edge_attr as edge_attr_device is not yet defined in this scope
-                scores, h, c, _ = worker.predict_next_hop(worker_in, edge_index, h, c, batch_vec, edge_attr=pyg_data.edge_attr.to(device))
+                # [Fix] Phase 1: length만 사용 (edge_dim=1)
+                scores, h, c, _ = worker.predict_next_hop(worker_in, edge_index, h, c, batch_vec, edge_attr=pyg_data.edge_attr[:, 0:1].to(device))
                 pred = scores.argmax().item()
                 
                 if pred == target_label:
@@ -917,7 +979,7 @@ def train_sl(args):
     pyg_x_device = pyg_data.x.to(device)
     node_coords_device = pyg_x_device[:, :2] # [N, 2]
     edge_index_device = pyg_data.edge_index.to(device)
-    edge_attr_device = pyg_data.edge_attr.to(device)  # [E, edge_dim] for models
+    edge_attr_device = pyg_data.edge_attr[:, 0:1].to(device)  # [E, 1] Phase 1: length만 사용
     batch_vec_sim = torch.zeros(num_nodes, dtype=torch.long, device=device)
     
     # [Fix] Wrap Simulation in no_grad to prevent VRAM leak
@@ -1094,37 +1156,71 @@ def train_sl(args):
     else:
         print("⚠️ Manager 계획 품질 부족. Manager 학습 추가 필요.")
     
-    # === 학습 곡선 그래프 생성 ===
+    # === 학습 곡선 그래프 생성 (논문용: 타이틀 제거, 폰트 확대, 개별 저장) ===
+    import matplotlib
+    matplotlib.rcParams.update({
+        'font.size': 16,
+        'axes.labelsize': 18,
+        'axes.titlesize': 18,
+        'xtick.labelsize': 14,
+        'ytick.labelsize': 14,
+        'legend.fontsize': 14,
+        'lines.linewidth': 2.5,
+    })
     
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     epochs_range = range(1, len(history['mgr_train_loss']) + 1)
     
-    # Manager Loss 곡선
-    axes[0].plot(epochs_range, history['mgr_train_loss'], 'b-', label='Train Loss', linewidth=2)
-    axes[0].plot(epochs_range, history['mgr_val_loss'], 'r--', label='Val Loss', linewidth=2)
-    axes[0].set_title('Manager Learning Curve', fontsize=14, fontweight='bold')
+    # --- Manager 단독 차트 ---
+    fig_mgr, ax_mgr = plt.subplots(figsize=(8, 6))
+    ax_mgr.plot(epochs_range, history['mgr_train_loss'], 'b-', label='Train Loss')
+    ax_mgr.plot(epochs_range, history['mgr_val_loss'], 'r--', label='Val Loss')
+    ax_mgr.set_xlabel('Epoch')
+    ax_mgr.set_ylabel('Loss')
+    ax_mgr.legend()
+    ax_mgr.grid(True, alpha=0.3)
+    fig_mgr.tight_layout()
+    mgr_path = os.path.join(save_dir, 'sl_curve_manager.png')
+    fig_mgr.savefig(mgr_path, dpi=300, bbox_inches='tight')
+    plt.close(fig_mgr)
+    print(f"📈 Manager learning curve saved to {mgr_path}")
+    
+    # --- Worker 단독 차트 ---
+    fig_wkr, ax_wkr = plt.subplots(figsize=(8, 6))
+    wkr_train_epochs = list(range(WORKER_FREQ, args.epochs + 1, WORKER_FREQ))
+    wkr_train_epochs = wkr_train_epochs[:len(history['wkr_train_loss'])]
+    if history['wkr_train_loss']:
+        ax_wkr.plot(wkr_train_epochs, history['wkr_train_loss'], 'b-o', label='Train Loss', markersize=6)
+        ax_wkr.plot(wkr_train_epochs, history['wkr_val_loss'], 'r--o', label='Val Loss', markersize=6)
+    ax_wkr.set_xlabel('Epoch')
+    ax_wkr.set_ylabel('Loss')
+    ax_wkr.legend()
+    ax_wkr.grid(True, alpha=0.3)
+    fig_wkr.tight_layout()
+    wkr_path = os.path.join(save_dir, 'sl_curve_worker.png')
+    fig_wkr.savefig(wkr_path, dpi=300, bbox_inches='tight')
+    plt.close(fig_wkr)
+    print(f"📈 Worker learning curve saved to {wkr_path}")
+    
+    # --- 합본 차트 (기존 호환) ---
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    axes[0].plot(epochs_range, history['mgr_train_loss'], 'b-', label='Train Loss')
+    axes[0].plot(epochs_range, history['mgr_val_loss'], 'r--', label='Val Loss')
     axes[0].set_xlabel('Epoch')
     axes[0].set_ylabel('Loss')
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
-    
-    # Worker Loss 곡선 — 학습한 에폭만 표시 (skip된 에폭 제외)
-    wkr_train_epochs = list(range(WORKER_FREQ, args.epochs + 1, WORKER_FREQ))
-    wkr_train_epochs = wkr_train_epochs[:len(history['wkr_train_loss'])]  # 안전 장치
     if history['wkr_train_loss']:
-        axes[1].plot(wkr_train_epochs, history['wkr_train_loss'], 'b-o', label='Train Loss', linewidth=2, markersize=6)
-        axes[1].plot(wkr_train_epochs, history['wkr_val_loss'], 'r--o', label='Val Loss', linewidth=2, markersize=6)
-    axes[1].set_title('Worker Learning Curve (CE+KL)', fontsize=14, fontweight='bold')
+        axes[1].plot(wkr_train_epochs, history['wkr_train_loss'], 'b-o', label='Train Loss', markersize=6)
+        axes[1].plot(wkr_train_epochs, history['wkr_val_loss'], 'r--o', label='Val Loss', markersize=6)
     axes[1].set_xlabel('Epoch')
-    axes[1].set_ylabel('Loss (0.7*CE + 0.3*KL)')
+    axes[1].set_ylabel('Loss')
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
-    
     plt.tight_layout()
     curve_path = os.path.join(save_dir, 'sl_learning_curve.png')
-    plt.savefig(curve_path, dpi=150, bbox_inches='tight')
+    plt.savefig(curve_path, dpi=300, bbox_inches='tight')
     plt.close('all')
-    print(f"📈 Learning curve saved to {curve_path}")
+    print(f"📈 Combined learning curve saved to {curve_path}")
     
     # [Memory Optimization] Aggressive Cleanup
     if torch.cuda.is_available():

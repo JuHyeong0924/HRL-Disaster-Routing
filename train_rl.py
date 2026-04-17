@@ -7,78 +7,10 @@ import torch
 from src.envs.disaster_env import DisasterEnv
 from src.models.manager import GraphTransformerManager
 from src.models.worker import WorkerLSTM
-from src.trainers.phase1_guided_worker_trainer import Phase1GuidedWorkerTrainer
+from src.trainers.worker_nav_trainer import WorkerNavTrainer
 from src.trainers.manager_stage_trainer import ManagerStageTrainer  # [Refactor: Task 1]
 from src.trainers.worker_stage_trainer import WorkerStageTrainer  # [Refactor: Task 1]
 from src.trainers.pomo_trainer import DOMOTrainer  # [Refactor: Task 1]
-
-
-def _find_max_batch_size(env, worker, device, max_try: int = 64) -> int:
-    """GPU VRAM 한도 내 최대 배치 크기를 자동 탐색.
-
-    [8, 12, 16, 24, 32, 48, 64] 순서로 시도하며,
-    OOM 발생 직전 크기를 반환합니다.
-    """
-    # 탐색 후보: 2의 거듭제곱 + 중간값
-    candidates = [bs for bs in [8, 12, 16, 24, 32, 48, 64] if bs <= max_try]
-    best = candidates[0]
-
-    for bs in candidates:
-        try:
-            torch.cuda.empty_cache()
-            env.reset(batch_size=bs, sync_problem=True)
-            h = torch.zeros(bs, worker.lstm.hidden_size, device=device)
-            c = torch.zeros(bs, worker.lstm.hidden_size, device=device)
-            # Worker는 node_dim=8을 기대 → Phase1의 _build_worker_input과 동일하게 구성
-            raw_x = env.pyg_data.x
-            if raw_x.size(1) < 9:
-                pad = torch.zeros(raw_x.size(0), 9 - raw_x.size(1), device=device)
-                raw_x = torch.cat([raw_x, pad], dim=1)
-            worker_input = torch.cat([raw_x[:, :4], raw_x[:, 5:9]], dim=1)  # [B*N, 8]
-            edge_index = env.pyg_data.edge_index
-            batch_vec = env.pyg_data.batch
-            # edge_attr도 Worker edge_dim=5에 맞게 필터링
-            ea = env.pyg_data.edge_attr
-            if ea is not None:
-                if ea.size(1) >= 9:
-                    ea = ea[:, [0, 1, 4, 6, 8]]
-                elif ea.size(1) >= 5:
-                    ea = ea[:, :5]
-            # 5스텝 forward+backward 시뮬레이션으로 VRAM 사용량 테스트
-            worker.train()
-            opt = torch.optim.SGD(worker.parameters(), lr=1e-5)
-            for _ in range(5):
-                scores, h_new, c_new, v = worker.predict_next_hop(
-                    worker_input, edge_index, h, c, batch_vec,
-                    detach_spatial=True, edge_attr=ea,
-                )
-                loss = scores.sum() + v.sum()
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                opt.step()
-                h = h_new.detach()
-                c = c_new.detach()
-            del h, c, scores, h_new, c_new, v, loss, opt
-            torch.cuda.empty_cache()
-            best = bs
-            print(f"  ✅ batch_size={bs} OK (Tested Worker FW/BW)")
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower() or "CUDA" in str(e):
-                torch.cuda.empty_cache()
-                print(f"  ❌ batch_size={bs} OOM → 탐색 중단")
-                break
-            raise  # OOM이 아닌 다른 에러는 전파
-
-    # VRAM 여유 공간 확보 (Manager의 Forward 연산(Transformer) 및 기타 오버헤드 대비 마진)
-    # 찾아낸 best에서 한 단계 아래의 후보를 선택합니다.
-    margin_best = best
-    if best in candidates:
-        idx = candidates.index(best)
-        if idx > 0:
-            margin_best = candidates[idx - 1]
-            print(f"  🛡️ VRAM 마진 확보: {best} → {margin_best} 로 하향 조정 (Manager 연산 대비)")
-
-    return margin_best
 
 
 class Config:
@@ -263,20 +195,13 @@ def _init_env_and_models(args):
         print("⚠️ GPU NOT DETECTED! Training will be slow on CPU.")
     print(f"Active Device: {device}")
 
-    manager = GraphTransformerManager(node_dim=4, hidden_dim=args.hidden_dim, dropout=0.2).to(device)
-    worker = WorkerLSTM(node_dim=8, hidden_dim=args.hidden_dim).to(device)
+    # Phase 1: edge_dim=1 (length만 사용. A*/APSP 학습 신호와 일치하는 유일한 엣지 피처)
+    manager = GraphTransformerManager(node_dim=4, hidden_dim=args.hidden_dim, dropout=0.2, edge_dim=1).to(device)
+    worker = WorkerLSTM(node_dim=8, hidden_dim=args.hidden_dim, edge_dim=1).to(device)
 
-    # 배치 크기 자동 탐색
-    if args.num_pomo == "auto":
-        if device.type == "cuda":
-            print("🔍 VRAM 한도 내 최대 배치 크기 탐색 중...")
-            args.num_pomo = _find_max_batch_size(env, worker, device)
-            print(f"📐 자동 탐색 결과: num_pomo = {args.num_pomo}")
-        else:
-            args.num_pomo = 8
-            print("ℹ️ CPU 모드: num_pomo=8 기본값 사용")
-    else:
-        args.num_pomo = int(args.num_pomo)
+    # 배치 크기 고정 적용 (VRAM 스케일러 제거됨)
+    args.num_pomo = int(args.num_pomo) if str(args.num_pomo).isdigit() else 32
+    print(f"📐 고정된 배치 크기(POMO): {args.num_pomo}")
 
     return env, manager, worker, device
 
@@ -342,12 +267,12 @@ def _run_single_stage(args, env, manager, worker, device, stage: str,
     if stage == "manager":
         trainer = ManagerStageTrainer(env, manager, worker, config)
     elif stage == "worker":
-        # Phase1GuidedWorkerTrainer를 Worker stage의 기본 Trainer로 사용
-        trainer = Phase1GuidedWorkerTrainer(env, manager, worker, config)
+        # WorkerNavTrainer를 Worker stage의 기본 Trainer로 사용
+        trainer = WorkerNavTrainer(env, manager, worker, config)
     elif stage == "joint":
         trainer = DOMOTrainer(env, manager, worker, config)
     else:
-        trainer = Phase1GuidedWorkerTrainer(env, manager, worker, config)
+        trainer = WorkerNavTrainer(env, manager, worker, config)
 
     trainer.train(episodes)
     print(f"\n✅ Stage [{stage.upper()}] 학습 완료!")

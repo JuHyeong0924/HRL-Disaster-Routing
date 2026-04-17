@@ -150,8 +150,8 @@ def load_checkpoint(
 
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    # Worker 로드
-    worker = WorkerLSTM(node_dim=8, hidden_dim=hidden_dim).to(device)
+    # Phase 1: edge_dim=1 (length만 사용)
+    worker = WorkerLSTM(node_dim=8, hidden_dim=hidden_dim, edge_dim=1).to(device)
     if isinstance(payload, dict) and "worker_state" in payload:
         load_worker_state_compat(worker, payload["worker_state"])
     else:
@@ -161,7 +161,7 @@ def load_checkpoint(
     # Manager 로드 (요청 시)
     manager = None
     if load_manager and isinstance(payload, dict) and "manager_state" in payload:
-        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim).to(device)
+        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, edge_dim=1).to(device)
         manager.load_state_dict(payload["manager_state"])
         manager.eval()
 
@@ -248,18 +248,13 @@ def configure_single_problem(
 
 
 def select_edge_attr(edge_attr: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    """Worker edge_dim=5에 맞게 edge_attr를 필터링한다."""
+    """Phase 1: length(인덱스 0)만 사용. A*/APSP 학습 신호와 일치하는 유일한 피처."""
     if edge_attr is None:
         return None
-    if edge_attr.size(1) >= 9:
-        return edge_attr[:, [0, 1, 4, 6, 8]]
-    if edge_attr.size(1) >= 5:
-        return edge_attr[:, :5]
-    pad = torch.zeros(
-        edge_attr.size(0), 5 - edge_attr.size(1),
-        device=edge_attr.device, dtype=edge_attr.dtype,
-    )
-    return torch.cat([edge_attr, pad], dim=1)
+    if edge_attr.size(1) == 0:
+        return None
+    # Phase 1: length만 사용 (edge_dim=1)
+    return edge_attr[:, 0:1]
 
 
 def build_worker_input(env_x: torch.Tensor) -> torch.Tensor:

@@ -163,7 +163,7 @@ class DOMOTrainer:
             
             temperature = max(0.5, 1.5 - curriculum_ratio)
             # edge_attr 슬라이싱: Env 9D → 모델 5D [length, damage, is_closed, is_danger, speed]
-            ea = self.env.pyg_data.edge_attr[:, [0, 1, 4, 6, 8]]
+            ea = self.env.pyg_data.edge_attr[:, 0:1]  # Phase 1: length만 사용
             # AMP: Manager generate는 autocast로 감싸 메모리 절감
             with autocast('cuda', enabled=self.use_amp):
                 sequences, _ = self.manager.generate(
@@ -2215,7 +2215,7 @@ class DOMOTrainer:
             wkr_in = torch.cat([env_x[:, :4], env_x[:, 5:]], dim=1) # [B*N, 8]
 
             # [Fix] 동적으로 edge_attr 5D 슬라이싱 (환경이 변할 수 있으므로 매 스텝 계산)
-            ea = self.env.pyg_data.edge_attr[:, [0, 1, 4, 6, 8]]
+            ea = self.env.pyg_data.edge_attr[:, 0:1]  # Phase 1: length만 사용
             
             # AMP: Worker forward pass를 autocast로 감싸 VRAM 절감 (LSTM BPTT 메모리 핵심)
             # RL에서는 spatial encoder를 고정해 매-step full-graph backward 비용을 줄인다.
@@ -2745,14 +2745,15 @@ class DOMOTrainer:
         axes[1][0].legend()
         axes[1][0].grid(True, alpha=0.3)
         
-        # 4. Success Rate EMA 곡선
-        axes[1][1].plot(episodes, history['success_rates'], 'purple', linewidth=2, label=success_label)
+        # 4. Success Rate EMA 곡선 (퍼센트 단위로 표시, Y축 자동 스케일)
+        success_pct = [v * 100.0 for v in history['success_rates']]
+        axes[1][1].plot(episodes, success_pct, 'purple', linewidth=2, label=success_label)
         if success_target is not None:
-            axes[1][1].axhline(y=success_target, color='orange', linestyle='--', alpha=0.7, label=success_target_label)
+            axes[1][1].axhline(y=success_target * 100, color='orange', linestyle='--', alpha=0.7, label=success_target_label)
         axes[1][1].set_title(success_title, fontsize=13, fontweight='bold')
         axes[1][1].set_xlabel('Episode')
-        axes[1][1].set_ylabel('Rate')
-        axes[1][1].set_ylim(0, 1.05)
+        axes[1][1].set_ylabel('Rate (%)')
+        axes[1][1].set_ylim(0, 100)
         axes[1][1].legend()
         axes[1][1].grid(True, alpha=0.3)
         

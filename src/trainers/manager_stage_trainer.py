@@ -139,7 +139,7 @@ class ManagerStageTrainer(DOMOTrainer):
             x_mgr_in = self.env.pyg_data.x[:, :4]
             edge_index = self.env.pyg_data.edge_index
             batch_vec = self.env.pyg_data.batch
-            ea = self.env.pyg_data.edge_attr[:, [0, 1, 4, 6, 8]]
+            ea = self.env.pyg_data.edge_attr[:, 0:1]  # Phase 1: length만 사용
 
             temperature = max(0.5, 1.5 - curriculum_ratio)
             sequences, _ = self.manager.generate(

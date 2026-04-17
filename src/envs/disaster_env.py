@@ -58,59 +58,82 @@ class DisasterEnv:
             self.adj_matrix[v_idx, u_idx] = True 
             
         # [New] All-Pairs Shortest Path (APSP) for Curriculum
-        # Use NetworkX for CPU calculation once (Fast enough for small maps like SiouxFalls/Anaheim)
-        if self.verbose: print("🌍 Pre-calculating Network Shortest Paths (APSP)...")
-        # Calc length based shortest path
-        length_apsp = dict(nx.all_pairs_dijkstra_path_length(self.map_core.graph, weight='length'))
-        self.apsp_matrix = torch.zeros((self.num_nodes, self.num_nodes), dtype=torch.float, device=self.device)
-        
-        for u_id, lengths in length_apsp.items():
-            u_idx = self.node_mapping[u_id]
-            for v_id, dist_val in lengths.items():
-                v_idx = self.node_mapping[v_id]
-                self.apsp_matrix[u_idx, v_idx] = dist_val
+        # Use caching to avoid recalculating on large maps like Golden Coast
+        import os
+        map_name = os.path.basename(node_file).replace('_node.tntp', '').replace('.tntp', '')
+        cache_dir = os.path.join(os.path.dirname(node_file), 'cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, f"{map_name}_apsp.pt")
 
-        # Manager의 후보 마스킹은 "3~10 hop" 기준으로 동작하므로
-        # 길이 기반 APSP와 별도로 unweighted hop-distance 행렬을 유지한다.
-        hop_apsp = dict(nx.all_pairs_shortest_path_length(self.map_core.graph))
-        self.hop_matrix = torch.full((self.num_nodes, self.num_nodes), float('inf'), dtype=torch.float, device=self.device)
-        for u_id, lengths in hop_apsp.items():
-            u_idx = self.node_mapping[u_id]
-            for v_id, hop_val in lengths.items():
-                v_idx = self.node_mapping[v_id]
-                self.hop_matrix[u_idx, v_idx] = float(hop_val)
+        if os.path.exists(cache_path):
+            if self.verbose: print(f"🌍 Loaded Pre-calculated Network Shortest Paths (APSP) from cache ({cache_path})...")
+            cache_data = torch.load(cache_path, map_location=self.device, weights_only=True)
+            self.apsp_matrix = cache_data['apsp_matrix']
+            self.hop_matrix = cache_data['hop_matrix']
+            self.hop_next_hop_matrix = cache_data['hop_next_hop_matrix']
+            self.weighted_next_hop_matrix = cache_data['weighted_next_hop_matrix']
+        else:
+            if self.verbose: print(f"🌍 Pre-calculating Network Shortest Paths (APSP) for map: {map_name}...")
+            # Calc length based shortest path
+            length_apsp = dict(nx.all_pairs_dijkstra_path_length(self.map_core.graph, weight='length'))
+            self.apsp_matrix = torch.zeros((self.num_nodes, self.num_nodes), dtype=torch.float, device=self.device)
+            
+            for u_id, lengths in length_apsp.items():
+                u_idx = self.node_mapping[u_id]
+                for v_id, dist_val in lengths.items():
+                    v_idx = self.node_mapping[v_id]
+                    self.apsp_matrix[u_idx, v_idx] = dist_val
 
-        hop_paths = dict(nx.all_pairs_shortest_path(self.map_core.graph))
-        self.hop_next_hop_matrix = torch.full(
-            (self.num_nodes, self.num_nodes),
-            -1,
-            dtype=torch.long,
-            device=self.device,
-        )
-        for src_id, paths in hop_paths.items():
-            src_idx = self.node_mapping[src_id]
-            for dst_id, path in paths.items():
-                dst_idx = self.node_mapping[dst_id]
-                if len(path) >= 2:
-                    self.hop_next_hop_matrix[src_idx, dst_idx] = self.node_mapping[path[1]]
-                else:
-                    self.hop_next_hop_matrix[src_idx, dst_idx] = src_idx
+            # Manager의 후보 마스킹은 "3~10 hop" 기준으로 동작하므로
+            # 길이 기반 APSP와 별도로 unweighted hop-distance 행렬을 유지한다.
+            hop_apsp = dict(nx.all_pairs_shortest_path_length(self.map_core.graph))
+            self.hop_matrix = torch.full((self.num_nodes, self.num_nodes), float('inf'), dtype=torch.float, device=self.device)
+            for u_id, lengths in hop_apsp.items():
+                u_idx = self.node_mapping[u_id]
+                for v_id, hop_val in lengths.items():
+                    v_idx = self.node_mapping[v_id]
+                    self.hop_matrix[u_idx, v_idx] = float(hop_val)
 
-        weighted_paths = dict(nx.all_pairs_dijkstra_path(self.map_core.graph, weight='weight'))
-        self.weighted_next_hop_matrix = torch.full(
-            (self.num_nodes, self.num_nodes),
-            -1,
-            dtype=torch.long,
-            device=self.device,
-        )
-        for src_id, paths in weighted_paths.items():
-            src_idx = self.node_mapping[src_id]
-            for dst_id, path in paths.items():
-                dst_idx = self.node_mapping[dst_id]
-                if len(path) >= 2:
-                    self.weighted_next_hop_matrix[src_idx, dst_idx] = self.node_mapping[path[1]]
-                else:
-                    self.weighted_next_hop_matrix[src_idx, dst_idx] = src_idx
+            hop_paths = dict(nx.all_pairs_shortest_path(self.map_core.graph))
+            self.hop_next_hop_matrix = torch.full(
+                (self.num_nodes, self.num_nodes),
+                -1,
+                dtype=torch.long,
+                device=self.device,
+            )
+            for src_id, paths in hop_paths.items():
+                src_idx = self.node_mapping[src_id]
+                for dst_id, path in paths.items():
+                    dst_idx = self.node_mapping[dst_id]
+                    if len(path) >= 2:
+                        self.hop_next_hop_matrix[src_idx, dst_idx] = self.node_mapping[path[1]]
+                    else:
+                        self.hop_next_hop_matrix[src_idx, dst_idx] = src_idx
+
+            weighted_paths = dict(nx.all_pairs_dijkstra_path(self.map_core.graph, weight='weight'))
+            self.weighted_next_hop_matrix = torch.full(
+                (self.num_nodes, self.num_nodes),
+                -1,
+                dtype=torch.long,
+                device=self.device,
+            )
+            for src_id, paths in weighted_paths.items():
+                src_idx = self.node_mapping[src_id]
+                for dst_id, path in paths.items():
+                    dst_idx = self.node_mapping[dst_id]
+                    if len(path) >= 2:
+                        self.weighted_next_hop_matrix[src_idx, dst_idx] = self.node_mapping[path[1]]
+                    else:
+                        self.weighted_next_hop_matrix[src_idx, dst_idx] = src_idx
+            
+            # Save to cache
+            torch.save({
+                'apsp_matrix': self.apsp_matrix,
+                'hop_matrix': self.hop_matrix,
+                'hop_next_hop_matrix': self.hop_next_hop_matrix,
+                'weighted_next_hop_matrix': self.weighted_next_hop_matrix
+            }, cache_path)
+            if self.verbose: print(f"💾 Saved APSP matrices to cache: {cache_path}")
         
         self.max_dist = self.apsp_matrix.max().item()
         if self.verbose: print(f"✅ APSP Matrix Ready. Max Network Distance: {self.max_dist:.2f} km")

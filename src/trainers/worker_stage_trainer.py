@@ -144,7 +144,7 @@ class WorkerStageTrainer(DOMOTrainer):
             x_mgr_in = self.env.pyg_data.x[:, :4]
             edge_index = self.env.pyg_data.edge_index
             batch_vec = self.env.pyg_data.batch
-            edge_attr = self.env.pyg_data.edge_attr[:, [0, 1, 4, 6, 8]]
+            edge_attr = self.env.pyg_data.edge_attr[:, 0:1]  # Phase 1: length만 사용
             train_sequences, plan_source = self._build_worker_training_plan(
                 ep,
                 episodes,

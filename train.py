@@ -38,17 +38,17 @@ def main():
     parser.add_argument('--skip_sl', action='store_true', help='Skip Supervised Learning Phase')
     parser.add_argument('--force_sl', action='store_true', help='Force SL Pretraining (Ignore logs)')
     parser.add_argument('--epochs_sl', type=int, default=50, help='Epochs for SL Phase (Default: 50)')
-    parser.add_argument('--batch_sl', type=int, default=64, help='Batch size for SL Phase')
+    parser.add_argument('--batch_sl', type=int, default=128, help='Batch size for SL Phase')
     parser.add_argument('--hidden_dim_sl', type=int, default=256, help='Hidden dim for SL Phase (Default: 256)')
     parser.add_argument('--lr_manager_sl', type=float, default=1e-4, help='Manager Learning rate (SL)')
     parser.add_argument('--lr_worker_sl', type=float, default=1e-4, help='Worker Learning rate (SL)')
     
     # RL Args
     parser.add_argument('--skip_rl', action='store_true', help='Skip Reinforcement Learning Phase')
-    parser.add_argument('--episodes_rl', type=int, default=5000, help='Episodes for RL Phase (Default: 5000)')
+    parser.add_argument('--episodes_rl', type=int, default=10000, help='Episodes for RL Phase (Default: 10000)')
     parser.add_argument('--hidden_dim_rl', type=int, default=256, help='Hidden dim for RL Phase (Default: 256)')
     parser.add_argument('--lr_rl', type=float, default=1e-4, help='Learning rate for RL Phase')
-    parser.add_argument('--batch_rl', type=int, default=16, help='Batch size (POMO) for RL Phase')
+    parser.add_argument('--batch_rl', type=int, default=32, help='Batch size (POMO) for RL Phase')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging for RL Phase')
     
     # Viz Args
@@ -82,7 +82,7 @@ def main():
             f'--episodes {args.episodes_rl} '
             f'--hidden_dim {args.hidden_dim_rl} '
             f'--lr {args.lr_rl} '
-            f'--batch_size {args.batch_rl}'
+            f'--num_pomo {args.batch_rl}'
         )
         if args.debug:
             cmd_rl += ' --debug'

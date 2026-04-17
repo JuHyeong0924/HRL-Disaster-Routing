@@ -1038,14 +1038,13 @@ def resolve_checkpoint_spec(
 
 
 def select_edge_attr(edge_attr: torch.Tensor | None) -> torch.Tensor | None:
+    """Phase 1: length(인덱스 0)만 사용. A*/APSP 학습 신호와 일치하는 유일한 피처."""
     if edge_attr is None:
         return None
-    if edge_attr.size(1) >= 9:
-        return edge_attr[:, [0, 1, 4, 6, 8]]
-    if edge_attr.size(1) >= 5:
-        return edge_attr[:, :5]
-    pad = torch.zeros(edge_attr.size(0), 5 - edge_attr.size(1), device=edge_attr.device, dtype=edge_attr.dtype)
-    return torch.cat([edge_attr, pad], dim=1)
+    if edge_attr.size(1) == 0:
+        return None
+    # Phase 1: length만 사용 (edge_dim=1)
+    return edge_attr[:, 0:1]
 
 
 def load_state_dict_flexible(path: Path, device: torch.device) -> dict[str, Any]:
@@ -1126,7 +1125,7 @@ def load_models_for_rollout(
         enable_disaster=disaster,
     )
 
-    worker = WorkerLSTM(node_dim=8, hidden_dim=hidden_dim).to(device)
+    worker = WorkerLSTM(node_dim=8, hidden_dim=hidden_dim, edge_dim=1).to(device)
 
     if checkpoint_info["source"] == "apte_phase1":
         manager = None
@@ -1141,13 +1140,13 @@ def load_models_for_rollout(
         else:
             load_worker_state_compat(worker, extract_worker_state(payload))
     elif checkpoint_info["source"] == "sl":
-        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, dropout=0.2).to(device)
+        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, dropout=0.2, edge_dim=1).to(device)
         payload = torch.load(checkpoint_info["sl_path"], map_location=device)
         manager.load_state_dict(payload["manager_state"])
         load_worker_state_compat(worker, payload["worker_state"])
     elif checkpoint_info["source"] == "joint":
         # Joint best.pt: manager_state + worker_state가 하나의 파일에 저장
-        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, dropout=0.2).to(device)
+        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, dropout=0.2, edge_dim=1).to(device)
         payload = torch.load(checkpoint_info["joint_path"], map_location=device)
         if isinstance(payload, dict) and "manager_state" in payload:
             manager.load_state_dict(payload["manager_state"])
@@ -1157,7 +1156,7 @@ def load_models_for_rollout(
             manager.load_state_dict(payload)
             print("⚠️ Joint checkpoint에서 worker_state를 찾을 수 없어 Manager만 로드했습니다.")
     else:
-        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, dropout=0.2).to(device)
+        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, dropout=0.2, edge_dim=1).to(device)
         manager.load_state_dict(load_state_dict_flexible(checkpoint_info["manager_path"], device))
         load_worker_state_compat(worker, load_state_dict_flexible(checkpoint_info["worker_path"], device))
 
@@ -2980,7 +2979,7 @@ def cmd_joint(args: argparse.Namespace) -> None:
     # 별도 Manager 체크포인트 처리
     if args.mgr_checkpoint and manager is None:
         from src.models.manager import GraphTransformerManager
-        manager = GraphTransformerManager(node_dim=4, hidden_dim=256).to(device)
+        manager = GraphTransformerManager(node_dim=4, hidden_dim=256, edge_dim=1).to(device)
         mgr_payload = torch.load(args.mgr_checkpoint, map_location=device, weights_only=False)
         if "manager_state" in mgr_payload:
             manager.load_state_dict(mgr_payload["manager_state"])
@@ -3360,7 +3359,7 @@ def cmd_paper(args: argparse.Namespace) -> None:
     if manager_hrl is None:
         mgr_ckpt = core.find_latest_checkpoint("logs/rl_manager_stage", "final.pt")
         from src.models.manager import GraphTransformerManager
-        manager_hrl = GraphTransformerManager(node_dim=4, hidden_dim=256).to(device)
+        manager_hrl = GraphTransformerManager(node_dim=4, hidden_dim=256, edge_dim=1).to(device)
 
         mgr_loaded = False
         # 1순위: manager_stage 체크포인트
