@@ -36,3 +36,9 @@ desktop.ini
 # === 기타 ===
 *.log
 *.tmp
+
+# Large data files
+data/*.pt
+logs/
+__pycache__/
+*.pyc
