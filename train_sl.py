@@ -1239,6 +1239,104 @@ def train_sl(args):
     torch.save(checkpoint_data, os.path.join(save_dir, "model_sl_final.pt"))
     print(f"Saved models and metadata to {save_dir}/model_sl_final.pt")
 
+    # === 학습 결과 Summary 자동 생성 ===
+    _generate_training_summary(
+        save_dir=save_dir,
+        args=args,
+        history=history,
+        best_mgr_val=best_mgr_val,
+        best_wkr_val=best_wkr_val,
+        wkr_frozen=wkr_frozen,
+        mgr_lr_final=optimizer_mgr.param_groups[0]['lr'],
+        wkr_lr_final=wkr_opt.param_groups[0]['lr'],
+        num_nodes=num_nodes,
+        max_dist=max_dist,
+    )
+
+
+def _generate_training_summary(
+    save_dir: str,
+    args,
+    history: dict,
+    best_mgr_val: float,
+    best_wkr_val: float,
+    wkr_frozen: bool,
+    mgr_lr_final: float,
+    wkr_lr_final: float,
+    num_nodes: int,
+    max_dist: float,
+) -> None:
+    """SL 학습 완료 후 주요 지표를 텍스트 파일로 저장하는 유틸리티 함수."""
+    from datetime import datetime as dt
+
+    # Manager 지표 계산
+    mgr_train = history.get('mgr_train_loss', [])
+    mgr_val = history.get('mgr_val_loss', [])
+    mgr_train_first = mgr_train[0] if mgr_train else float('nan')
+    mgr_train_last = mgr_train[-1] if mgr_train else float('nan')
+    mgr_val_first = mgr_val[0] if mgr_val else float('nan')
+    mgr_val_last = mgr_val[-1] if mgr_val else float('nan')
+    mgr_best_epoch = (mgr_val.index(min(mgr_val)) + 1) if mgr_val else 0
+
+    # Worker 지표 계산
+    wkr_train = history.get('wkr_train_loss', [])
+    wkr_val = history.get('wkr_val_loss', [])
+    wkr_train_first = wkr_train[0] if wkr_train else float('nan')
+    wkr_train_last = wkr_train[-1] if wkr_train else float('nan')
+    wkr_val_first = wkr_val[0] if wkr_val else float('nan')
+    wkr_val_last = wkr_val[-1] if wkr_val else float('nan')
+    wkr_epochs_trained = len(wkr_train)
+
+    # 과적합 판정: Train < Val 이고 차이가 일정 이상
+    mgr_overfit = (mgr_train_last < mgr_val_last * 0.7) if mgr_train else False
+    wkr_overfit = (wkr_train_last < wkr_val_last * 0.7) if wkr_train else False
+
+    lines = [
+        "=" * 72,
+        " SL Pre-training Summary Report",
+        f" Generated: {dt.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "=" * 72,
+        "",
+        "■ 실험 설정",
+        f"  Map:        {args.map} ({num_nodes} nodes)",
+        f"  Epochs:     {args.epochs}",
+        f"  Batch Size: {args.batch_size}",
+        f"  Hidden Dim: {args.hidden_dim}",
+        f"  Edge Dim:   1 (Phase 1: length only)",
+        f"  Max Dist:   {max_dist:.2f}",
+        f"  Manager LR: {args.lr_manager} → {mgr_lr_final:.6f} (final)",
+        f"  Worker LR:  {args.lr_worker} → {wkr_lr_final:.6f} (final)",
+        "",
+        "■ Manager 학습 결과",
+        f"  Train Loss:    {mgr_train_first:.4f} → {mgr_train_last:.4f}",
+        f"  Val Loss:      {mgr_val_first:.4f} → {mgr_val_last:.4f}",
+        f"  Best Val Loss: {best_mgr_val:.4f} (Epoch {mgr_best_epoch})",
+        f"  과적합 여부:   {'⚠️ 의심' if mgr_overfit else '✅ 정상'}",
+        "",
+        "■ Worker 학습 결과",
+        f"  Train Loss:    {wkr_train_first:.4f} → {wkr_train_last:.4f}" if wkr_train else "  Train Loss:    N/A",
+        f"  Val Loss:      {wkr_val_first:.4f} → {wkr_val_last:.4f}" if wkr_val else "  Val Loss:      N/A",
+        f"  Best Val Loss: {best_wkr_val:.4f}",
+        f"  학습 에포크:   {wkr_epochs_trained}",
+        f"  Early Stop:    {'⛔ 발동 (Frozen)' if wkr_frozen else '미발동'}",
+        f"  과적합 여부:   {'⚠️ 의심' if wkr_overfit else '✅ 정상'}",
+        "",
+        "■ 핵심 지표 요약",
+        f"  Manager Best Val:    {best_mgr_val:.4f}",
+        f"  Worker Best Val:     {best_wkr_val:.4f}",
+        f"  Manager Train/Val:   {mgr_train_last:.4f} / {mgr_val_last:.4f}  (gap: {abs(mgr_train_last - mgr_val_last):.4f})",
+        f"  Worker Frozen:       {wkr_frozen}",
+        f"  Manager LR 감소:     {'감소함' if mgr_lr_final < args.lr_manager * 0.99 else '미감소 (지속 개선)'}",
+        "",
+        "=" * 72,
+    ]
+
+    summary_path = os.path.join(save_dir, "training_summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"📋 Training summary saved to {summary_path}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--map', type=str, default='Anaheim', help='Map Name (e.g. Anaheim, SiouxFalls)')
