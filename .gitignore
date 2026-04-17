@@ -38,7 +38,7 @@ desktop.ini
 *.tmp
 
 # Large data files
-data/*.pt
+data/
 logs/
 __pycache__/
 *.pyc
