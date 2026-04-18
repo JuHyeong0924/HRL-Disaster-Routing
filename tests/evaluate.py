@@ -32,6 +32,9 @@ from src.envs.disaster_env import DisasterEnv
 from src.models.manager import GraphTransformerManager, compute_manager_decode_bias
 from src.models.worker import WorkerLSTM
 
+import tests.eval_core as core
+import tests.eval_viz as viz
+
 
 HEADER_RE = re.compile(
     r"\[Ep (?P<episode>\d+)\] Mgr LR: (?P<mgr_lr>[-+0-9.eE]+), "
@@ -161,8 +164,8 @@ def _metric_value(row: pd.Series | dict[str, Any], key: str, default: float = ma
     return default if pd.isna(value) else float(value)
 
 
-def _rolling(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window=window, min_periods=1).mean()
+# eval_viz 모듈로 이동됨
+_rolling = viz._rolling
 
 
 def format_percent(value: float) -> str:
@@ -315,44 +318,8 @@ def save_apte_summary_markdown(summary: dict[str, Any], path: Path) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def plot_apte_training_dashboard(df: pd.DataFrame, output_path: Path, rolling_window: int) -> None:
-    plt.style.use("seaborn-v0_8-whitegrid")
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9), constrained_layout=True)
-    fig.suptitle("APTE Phase1 Dashboard", fontsize=16, fontweight="bold")
-
-    episode = df["episode"]
-    axes[0, 0].plot(episode, _rolling(df["success_rate"], rolling_window), label="Success Rate", linewidth=2.0)
-    axes[0, 0].plot(episode, _rolling(df["success_ema"], rolling_window), label="Success EMA", linewidth=2.0)
-    axes[0, 0].set_title("Goal Success")
-    axes[0, 0].set_ylabel("Percent")
-    axes[0, 0].legend(frameon=False)
-    axes[0, 0].grid(alpha=0.25, linestyle="--")
-
-    axes[0, 1].plot(episode, _rolling(df["goal_dist_mean"], rolling_window), label="Goal Dist", linewidth=2.0)
-    axes[0, 1].plot(episode, _rolling(df["progress_mean"], rolling_window), label="Progress", linewidth=2.0)
-    axes[0, 1].set_title("Distance And Progress")
-    axes[0, 1].legend(frameon=False)
-    axes[0, 1].grid(alpha=0.25, linestyle="--")
-
-    axes[1, 0].plot(episode, _rolling(df["hidden_checkpoint_count_mean"], rolling_window), label="Hidden Count", linewidth=2.0)
-    axes[1, 0].plot(episode, _rolling(df["hidden_checkpoint_hit_rate"], rolling_window), label="Hidden Hit Rate", linewidth=2.0)
-    axes[1, 0].plot(episode, _rolling(df["ordered_checkpoint_completion_ratio"], rolling_window), label="Completion", linewidth=2.0)
-    axes[1, 0].set_title("Training-Only Guidance")
-    axes[1, 0].set_ylabel("Value / Percent")
-    axes[1, 0].legend(frameon=False)
-    axes[1, 0].grid(alpha=0.25, linestyle="--")
-
-    axes[1, 1].plot(episode, _rolling(df["worker_aux_ce_loss"], rolling_window), label="Aux CE", linewidth=2.0)
-    axes[1, 1].plot(episode, _rolling(df["worker_entropy"], rolling_window), label="Entropy", linewidth=2.0)
-    axes[1, 1].plot(episode, _rolling(df["critic_explained_variance"], rolling_window), label="ExplVar", linewidth=2.0)
-    axes[1, 1].set_title("Optimization Health")
-    axes[1, 1].legend(frameon=False)
-    axes[1, 1].grid(alpha=0.25, linestyle="--")
-
-    for ax in axes[-1, :]:
-        ax.set_xlabel("Episode")
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
+# eval_viz 모듈로 이동됨
+plot_apte_training_dashboard = viz.plot_apte_training_dashboard
 
 
 def print_apte_terminal_summary(summary: dict[str, Any]) -> None:
@@ -729,118 +696,11 @@ def print_terminal_summary(summary: dict[str, Any]) -> None:
         print(f"- {note}")
 
 
-def _plot_line(
-    ax: plt.Axes,
-    df: pd.DataFrame,
-    columns: list[tuple[str, str]],
-    title: str,
-    ylabel: str,
-    rolling_window: int,
-    percent: bool = False,
-) -> None:
-    has_data = False
-    for column, label in columns:
-        if column not in df.columns:
-            continue
-        series = df[column]
-        if series.notna().sum() == 0:
-            continue
-        has_data = True
-        ax.plot(df["episode"], series, alpha=0.25, linewidth=1.0)
-        ax.plot(df["episode"], _rolling(series, rolling_window), label=label, linewidth=2.2)
-    ax.set_title(title, fontsize=11, fontweight="bold")
-    ax.set_ylabel(ylabel)
-    ax.grid(alpha=0.25, linestyle="--")
-    if percent:
-        ax.set_ylim(bottom=0.0)
-    if has_data:
-        ax.legend(frameon=False, fontsize=8)
-    else:
-        ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
-
-
-def _plot_single_chart(
-    df: pd.DataFrame,
-    columns: list[tuple[str, str]],
-    title: str,
-    ylabel: str,
-    rolling_window: int,
-    output_path: Path,
-    percent: bool = False,
-) -> None:
-    """개별 차트를 단독 figure로 저장하는 헬퍼 함수."""
-    plt.style.use("seaborn-v0_8-whitegrid")
-    fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
-    _plot_line(ax, df, columns, title, ylabel, rolling_window, percent)
-    ax.set_xlabel("Episode")
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_training_dashboard(df: pd.DataFrame, output_path: Path, rolling_window: int) -> None:
-    # 개별 차트 정의 목록
-    chart_specs = [
-        ("01_success_trends", [("success_rate", "Success Rate"), ("success_ema", "Success EMA"), ("goal_hit_rate", "Goal Hit Rate")], "Success Trends", "Percent", True),
-        ("02_failure_signals", [("loop_fail_rate", "Loop Fail"), ("stagnation_fail_rate", "Stagnation Fail"), ("fail_shaping", "Fail Shaping")], "Failure Signals", "Value", False),
-        ("03_return_structure", [("total_final", "Total Final"), ("success_return", "Success Return"), ("fail_return", "Fail Return")], "Return Structure", "Reward", False),
-        ("04_plan_length_eos", [("plan_length_mean", "Plan Length"), ("eos_rate", "EOS Rate")], "Plan Length and EOS", "Value", False),
-        ("05_plan_density", [("plan_density_mean", "Density"), ("plan_density_gap", "Density Gap")], "Plan Density", "Value", False),
-        ("06_corridor_quality", [("corridor_mean", "Corridor"), ("corridor_success", "Succ Corridor"), ("corridor_fail", "Fail Corridor")], "Goal Corridor Quality", "Percent", True),
-        ("07_worker_following", [("plan_utilization", "Plan Utilization"), ("subgoal_reach_rate", "Subgoal Reach"), ("hit_at_3", "Hit@3")], "Worker Following Quality", "Percent", True),
-        ("08_goal_progress", [("goal_per100", "Goal per100"), ("subgoal_per100", "SG per100"), ("progress_mean", "Progress Mean")], "Goal Progress Signals", "Value", False),
-        ("09_execution_chars", [("worker_steps_mean", "Worker Steps"), ("worker_entropy", "Worker Entropy"), ("manager_entropy", "Manager Entropy")], "Execution Characteristics", "Value", False),
-        ("10_critic_health", [("explained_variance", "Explained Variance"), ("critic_mse", "Critic MSE"), ("td_abs_err", "TD |err|")], "Critic Health", "Value", False),
-        ("11_gradient_saturation", [("manager_grad_clip_hit", "Manager Clip-Hit"), ("worker_grad_clip_hit", "Worker Clip-Hit")], "Gradient Saturation", "Percent", True),
-        ("12_learning_rates", [("mgr_lr", "Manager LR"), ("wkr_lr", "Worker LR")], "Learning Rates", "LR", False),
-    ]
-
-    # 개별 차트 저장 (charts/ 서브디렉토리)
-    charts_dir = output_path.parent / "charts"
-    charts_dir.mkdir(parents=True, exist_ok=True)
-    for filename, columns, title, ylabel, percent in chart_specs:
-        _plot_single_chart(df, columns, title, ylabel, rolling_window, charts_dir / f"{filename}.png", percent)
-
-    # 합본 대시보드도 유지
-    plt.style.use("seaborn-v0_8-whitegrid")
-    fig, axes = plt.subplots(4, 3, figsize=(18, 18), constrained_layout=True)
-    fig.suptitle("RL Training Dashboard", fontsize=18, fontweight="bold")
-    for idx, (_, columns, title, ylabel, percent) in enumerate(chart_specs):
-        row, col = divmod(idx, 3)
-        _plot_line(axes[row, col], df, columns, title, ylabel, rolling_window, percent)
-    for ax in axes[-1, :]:
-        ax.set_xlabel("Episode")
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_relationships(df: pd.DataFrame, output_path: Path) -> None:
-    plt.style.use("seaborn-v0_8-whitegrid")
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10), constrained_layout=True)
-    fig.suptitle("Success Relationships", fontsize=16, fontweight="bold")
-    specs = [
-        ("plan_density_mean", "success_rate", "Plan Density vs Success Rate"),
-        ("corridor_mean", "success_rate", "Corridor vs Success Rate"),
-        ("plan_utilization", "success_rate", "Plan Utilization vs Success Rate"),
-        ("loop_fail_rate", "success_rate", "Loop Fail vs Success Rate"),
-    ]
-    for ax, (x_key, y_key, title) in zip(axes.flat, specs):
-        if x_key not in df.columns or y_key not in df.columns:
-            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
-            ax.set_title(title)
-            continue
-        valid = df[[x_key, y_key]].dropna()
-        if valid.empty:
-            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
-            ax.set_title(title)
-            continue
-        scatter = ax.scatter(valid[x_key], valid[y_key], c=df.loc[valid.index, "episode"], cmap="viridis", alpha=0.85, edgecolor="none")
-        ax.set_title(title, fontsize=11, fontweight="bold")
-        ax.set_xlabel(x_key.replace("_", " ").title())
-        ax.set_ylabel(y_key.replace("_", " ").title())
-        ax.grid(alpha=0.25, linestyle="--")
-        fig.colorbar(scatter, ax=ax, label="Episode")
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
+# eval_viz 모듈로 이동됨
+_plot_line = viz._plot_line
+_plot_single_chart = viz._plot_single_chart
+plot_training_dashboard = viz.plot_training_dashboard
+plot_relationships = viz.plot_relationships
 
 
 def plot_snapshot_comparison(df: pd.DataFrame, output_path: Path) -> None:
@@ -911,12 +771,8 @@ def infer_disaster(run_dir: Path) -> bool:
     return "phase2" in run_dir.name.lower()
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+# eval_core로 통합됨
+set_seed = core.set_seed
 
 
 def nearest_checkpoint(episodes: list[int], target: int) -> int:
@@ -1037,14 +893,8 @@ def resolve_checkpoint_spec(
     }
 
 
-def select_edge_attr(edge_attr: torch.Tensor | None) -> torch.Tensor | None:
-    """Phase 1: length(인덱스 0)만 사용. A*/APSP 학습 신호와 일치하는 유일한 피처."""
-    if edge_attr is None:
-        return None
-    if edge_attr.size(1) == 0:
-        return None
-    # Phase 1: length만 사용 (edge_dim=1)
-    return edge_attr[:, 0:1]
+# eval_core로 통합됨
+select_edge_attr = core.select_edge_attr
 
 
 def load_state_dict_flexible(path: Path, device: torch.device) -> dict[str, Any]:
@@ -1054,59 +904,13 @@ def load_state_dict_flexible(path: Path, device: torch.device) -> dict[str, Any]
     return payload
 
 
-def extract_worker_state(payload: dict[str, Any]) -> dict[str, Any]:
-    if isinstance(payload, dict) and "worker_state" in payload:
-        return payload["worker_state"]
-    if isinstance(payload, dict) and "state_dict" in payload:
-        return payload["state_dict"]
-    if isinstance(payload, dict) and payload and all(torch.is_tensor(v) for v in payload.values()):
-        return payload
-    raise KeyError("Could not resolve worker_state from checkpoint payload.")
+# eval_core로 통합됨
+extract_worker_state = core.extract_worker_state
 
 
 def load_worker_state_compat(worker: WorkerLSTM, state_dict: dict[str, Any]) -> None:
-    current_state = worker.state_dict()
-    compatible: dict[str, Any] = {}
-    adapted: list[str] = []
-    skipped: list[str] = []
-    adapt_keys = {
-        "convs.0.lin_l.weight",
-        "convs.0.lin_r.weight",
-        "input_proj.weight",
-    }
-    for key, value in state_dict.items():
-        if key not in current_state:
-            skipped.append(f"{key}(missing)")
-            continue
-        target = current_state[key]
-        if target.shape != value.shape:
-            if (
-                key in adapt_keys
-                and value.ndim == 2
-                and target.ndim == 2
-                and value.shape[0] == target.shape[0]
-                and value.shape[1] == 7
-                and target.shape[1] == 8
-            ):
-                padded = target.clone()
-                padded.zero_()
-                padded[:, :7] = value.to(device=target.device, dtype=target.dtype)
-                compatible[key] = padded
-                adapted.append(key)
-                continue
-            skipped.append(f"{key}(shape {tuple(value.shape)} -> {tuple(target.shape)})")
-            continue
-        compatible[key] = value.to(device=target.device, dtype=target.dtype)
-    worker.load_state_dict(compatible, strict=False)
-    if adapted:
-        print(
-            "Adapted legacy worker checkpoint from 7-dim input to 8-dim input "
-            f"for {len(adapted)} input-layer weights."
-        )
-    if skipped:
-        preview = ", ".join(skipped[:4])
-        suffix = "..." if len(skipped) > 4 else ""
-        print(f"Partial worker load during visualization: skipped {len(skipped)} keys [{preview}{suffix}]")
+    """eval_core의 호환 로드 래퍼 (verbose=True 기본)."""
+    core.load_worker_state_compat(worker, state_dict, verbose=True)
 
 
 def load_models_for_rollout(
@@ -1166,74 +970,13 @@ def load_models_for_rollout(
     return env, manager, worker
 
 
-def ensure_env_node_feature_layout(env: DisasterEnv) -> None:
-    x = env.pyg_data.x
-    # 환경 X는 9채널: [x, y, is_curr, is_tgt, visit, dist, dir_x, dir_y, is_final_target_phase]
-    if x.size(1) < 9:
-        pad = torch.zeros(x.size(0), 9 - x.size(1), device=x.device, dtype=x.dtype)
-        env.pyg_data.x = torch.cat([x, pad], dim=1)
+# eval_core로 통합됨 (이름 매핑)
+ensure_env_node_feature_layout = core.ensure_env_layout
+refresh_env_node_features = core.refresh_env_features
 
 
-def refresh_env_node_features(env: DisasterEnv) -> None:
-    ensure_env_node_feature_layout(env)
-    batch_indices = torch.arange(env.batch_size, device=env.device)
-    flat_current = batch_indices * env.num_nodes + env.current_node
-    flat_target = batch_indices * env.num_nodes + env.target_node
-
-    env.pyg_data.x[:, 2] = 0.0
-    env.pyg_data.x[:, 3] = 0.0
-    env.pyg_data.x[flat_current, 2] = 1.0
-    env.pyg_data.x[flat_target, 3] = 1.0
-
-    if not hasattr(env, "visit_count") or env.visit_count is None:
-        env.visit_count = torch.zeros((env.batch_size, env.num_nodes), dtype=torch.float32, device=env.device)
-        env.visit_count.scatter_(1, env.current_node.unsqueeze(1), 1.0)
-    env.pyg_data.x[:, 4] = env.visit_count.view(-1)
-
-    target_dists = env.apsp_matrix[env.target_node]
-    env.pyg_data.x[:, 5] = (target_dists / max(env.max_dist, 1.0)).view(-1)
-
-    target_pos = env.pos_tensor[env.target_node].unsqueeze(1)
-    node_pos = env.pos_tensor.unsqueeze(0)
-    direction = target_pos - node_pos
-    direction = direction / direction.norm(dim=2, keepdim=True).clamp(min=1e-8)
-    env.pyg_data.x[:, 6:8] = direction.view(-1, 2)
-
-
-def configure_single_problem(
-    env: DisasterEnv,
-    start_idx: int | None,
-    goal_idx: int | None,
-) -> tuple[int, int]:
-    env.reset(batch_size=1, sync_problem=True)
-    refresh_env_node_features(env)
-
-    if start_idx is None and goal_idx is None:
-        return int(env.current_node.item()), int(env.target_node.item())
-    if (start_idx is None) != (goal_idx is None):
-        raise ValueError("Please provide both --start-node and --goal-node together.")
-
-    start = int(start_idx)
-    goal = int(goal_idx)
-    if start == goal:
-        raise ValueError("start-node and goal-node must be different.")
-
-    env.current_node = torch.tensor([start], dtype=torch.long, device=env.device)
-    env.target_node = torch.tensor([goal], dtype=torch.long, device=env.device)
-    env.visited = torch.zeros((1, env.num_nodes), dtype=torch.bool, device=env.device)
-    env.visited[0, start] = True
-    env.visit_count = torch.zeros((1, env.num_nodes), dtype=torch.float32, device=env.device)
-    env.visit_count[0, start] = 1.0
-    env.history = [env.current_node.clone()]
-    env.step_count = 0
-
-    agent_data = env.converter.networkx_to_pyg(start, goal).to(env.device)
-    env.pyg_data = Batch.from_data_list([agent_data])
-    env.pyg_data.num_graphs = 1
-    if hasattr(env, "damage_states"):
-        env._update_edge_attributes(1, env.damage_states)
-    refresh_env_node_features(env)
-    return start, goal
+# eval_core로 통합됨
+configure_single_problem = core.configure_single_problem
 
 
 def truncate_plan(sequence: list[int], eos_index: int, num_nodes: int) -> list[int]:
@@ -1246,17 +989,8 @@ def truncate_plan(sequence: list[int], eos_index: int, num_nodes: int) -> list[i
     return plan
 
 
-def safe_softmax(scores: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-    finite = torch.isfinite(scores)
-    if not finite.any():
-        probs = torch.zeros_like(scores)
-        probs[-1] = 1.0
-        return probs
-    scores_safe = scores.clone()
-    scores_safe[~finite] = -1e9
-    if temperature > 1e-5:
-        scores_safe = scores_safe / temperature
-    return F.softmax(scores_safe, dim=-1)
+# eval_core로 통합됨
+safe_softmax = core.safe_softmax
 
 
 def categorical_entropy(probs: torch.Tensor) -> float:
@@ -2789,7 +2523,7 @@ def parse_args() -> argparse.Namespace:
     )
     subparsers = parser.add_subparsers(dest="command", help="서브커맨드")
 
-    # ── dashboard 서브커맨드 (기존 visualize_result.py) ──
+    # ── dashboard 서브커맨드 ──
     p_dash = subparsers.add_parser("dashboard", help="학습 로그 대시보드 + 롤아웃 진단")
     p_dash.add_argument("--run-dir", default="logs/rl_phase1_apte", help="학습 로그 디렉토리")
     p_dash.add_argument("--rolling-window", type=int, default=5, help="Rolling mean window")
@@ -2810,7 +2544,7 @@ def parse_args() -> argparse.Namespace:
     p_dash.add_argument("--save-step-plots", action="store_true", help="스텝별 플롯 저장")
     p_dash.add_argument("--max-worker-step-plots", type=int, default=30, help="Worker 스텝 플롯 최대 수")
 
-    # ── worker 서브커맨드 (기존 eval_worker_batch.py) ──
+    # ── worker 서브커맨드 ──
     p_wkr = subparsers.add_parser("worker", help="Worker 배치 성능 평가 (성공률 + PLR)")
     p_wkr.add_argument("--checkpoint", required=True, help="Worker 체크포인트 경로")
     p_wkr.add_argument("--trials", type=int, default=100, help="평가 문제 수")
@@ -2819,7 +2553,7 @@ def parse_args() -> argparse.Namespace:
     p_wkr.add_argument("--seed", type=int, default=42, help="시드")
     p_wkr.add_argument("--temperature", type=float, default=0.0, help="행동 선택 온도 (0=greedy)")
 
-    # ── joint 서브커맨드 (기존 eval_joint_rollout.py) ──
+    # ── joint 서브커맨드 ──
     p_jnt = subparsers.add_parser("joint", help="Manager + Worker 조인트 롤아웃")
     p_jnt.add_argument("--checkpoint", required=True, help="체크포인트 경로")
     p_jnt.add_argument("--mgr-checkpoint", default=None, help="Manager 별도 체크포인트")
@@ -2831,7 +2565,7 @@ def parse_args() -> argparse.Namespace:
     p_jnt.add_argument("--mgr-temperature", type=float, default=0.5, help="Manager 온도")
     p_jnt.add_argument("--output", default=None, help="출력 이미지 경로")
 
-    # ── compare 서브커맨드 (기존 compare_models.py) ──
+    # ── compare 서브커맨드 ──
     p_cmp = subparsers.add_parser("compare", help="SL vs RL 모델 비교 평가")
     p_cmp.add_argument("--sl", required=True, help="SL 체크포인트 경로")
     p_cmp.add_argument("--rl", required=True, help="RL 체크포인트 경로")
@@ -2839,24 +2573,41 @@ def parse_args() -> argparse.Namespace:
     p_cmp.add_argument("--map", default="Anaheim", help="맵 이름")
     p_cmp.add_argument("--seed", type=int, default=42, help="시드")
 
-    # ── memorization 서브커맨드 (기존 eval_worker_memorization.py) ──
+    # ── memorization 서브커맨드 ──
     p_mem = subparsers.add_parser("memorization", help="Worker 암기 vs 일반화 진단")
     p_mem.add_argument("--checkpoint", required=True, help="Worker 체크포인트 경로")
     p_mem.add_argument("--trials", type=int, default=100, help="평가 문제 수")
     p_mem.add_argument("--map", default="Anaheim", help="맵 이름")
     p_mem.add_argument("--seed", type=int, default=42, help="시드")
 
-    # ── physics 서브커맨드 (기존 visualize_physics.py) ──
+    # ── physics 서브커맨드 ──
     p_phy = subparsers.add_parser("physics", help="재난 물리 시뮬레이션 시각화")
     p_phy.add_argument("--map", default="Anaheim", help="맵 이름")
 
-    # ── paper 서브커맨드 (기존 generate_paper_figures.py) ──
-    p_pap = subparsers.add_parser("paper", help="논문용 Figure/Table 자동 생성")
+    # ── paper 서브커맨드 ──
+    p_pap = subparsers.add_parser("paper", help="논문용 Figure/Table 자동 생성 (Table 1)")
     p_pap.add_argument("--map", default="Anaheim", help="맵 이름")
     p_pap.add_argument("--eval-episodes", type=int, default=500, help="Table 1 평가 에피소드 수")
     p_pap.add_argument("--output-dir", default="tests/paper_figures", help="출력 디렉토리")
     p_pap.add_argument("--skip-eval", action="store_true", help="Table 1 평가 건너뛰기")
     p_pap.add_argument("--seed", type=int, default=42, help="시드")
+
+    # ── paper_full 서브커맨드 ──
+    p_papf = subparsers.add_parser("paper_full", help="논문용 벤치마크 평가, 궤적, 지연시간 등 전체 맵 종합 산출물 생성")
+    p_papf.add_argument("--joint-ckpt", required=True, help="Joint RL 체크포인트 경로")
+    p_papf.add_argument("--worker-ckpt", required=True, help="Worker-Only RL 체크포인트 경로")
+    p_papf.add_argument("--episodes", type=int, default=500, help="배치 평가 에피소드 수")
+    p_papf.add_argument("--num-samples", type=int, default=16, help="Multi-Sampling 번호")
+    p_papf.add_argument("--seed", type=int, default=42, help="시드")
+
+    # ── regen 서브커맨드 ──
+    p_reg = subparsers.add_parser("regen", help="긴 OD 쌍에 대한 HRL vs Flat RL 최적 궤적 재시각화")
+    p_reg.add_argument("--joint-ckpt", required=True, help="Joint RL 체크포인트 경로")
+    p_reg.add_argument("--worker-ckpt", required=True, help="Worker-Only RL 체크포인트 경로")
+    p_reg.add_argument("--map", default="Goldcoast", help="대상 맵 이름")
+    p_reg.add_argument("--candidates", type=int, default=10, help="탐색할 후보의 수")
+    p_reg.add_argument("--num-samples", type=int, default=16, help="HRL 롤아웃 시 샘플링 수")
+    p_reg.add_argument("--seed", type=int, default=42, help="시드")
 
     return parser.parse_args()
 
@@ -3944,6 +3695,308 @@ def _paper_fig_trajectory_comparison(
 
 
 # ============================================================
+# 논문용 배치 평가 및 궤적 시각화 (paper_full, regen) 추가 로직
+# ============================================================
+
+def generate_trajectory_figures(
+    env: DisasterEnv,
+    flat_worker: WorkerLSTM,
+    joint_worker: WorkerLSTM,
+    manager: GraphTransformerManager,
+    start_idx: int,
+    goal_idx: int,
+    output_dir: Path,
+    num_samples: int = core.DEFAULT_NUM_SAMPLES,
+) -> dict[str, Any]:
+    positions = env.pos_tensor.detach().cpu().numpy()
+    astar_path = core.reconstruct_astar_path(env, start_idx, goal_idx)
+    optimal_dist = float(env.apsp_matrix[start_idx, goal_idx].item())
+    optimal_hops = float(env.hop_matrix[start_idx, goal_idx].item())
+
+    flat_result = core.run_worker_rollout(flat_worker, env, start_idx, goal_idx, temperature=0.0)
+    hrl_result = core.run_joint_rollout_multisampling(
+        joint_worker, manager, env, start_idx, goal_idx, num_samples=num_samples, temperature=core.DEFAULT_SAMPLE_TEMP
+    )
+    hrl_path = hrl_result["path"]
+    hrl_subgoals = hrl_result.get("plan_subgoals", [])
+
+    print(f"\n📍 OD: start={start_idx}, goal={goal_idx}")
+    print(f"   Optimal: {optimal_hops:.0f} hops, {optimal_dist:.1f} km")
+    print(f"   Flat RL: {'✅' if flat_result['success'] else '❌'}, steps={flat_result['actual_steps']}, PLR={flat_result['path_length_ratio']:.3f}")
+    print(f"   HRL(N={num_samples}): {'✅' if hrl_result['success'] else '❌'}, steps={hrl_result['actual_steps']}, PLR={hrl_result['path_length_ratio']:.3f}, sr={hrl_result.get('sampling_success_rate', 0):.1f}%")
+
+    # (a) Flat RL
+    fig_a, ax_a = plt.subplots(figsize=(14, 11), constrained_layout=True)
+    viz.draw_map_background(ax_a, env, positions)
+    viz.draw_astar_path(ax_a, positions, astar_path)
+    sm = viz.draw_path_gradient(ax_a, positions, flat_result["path_nodes"], cmap_name="autumn")
+    if sm:
+        cbar = fig_a.colorbar(sm, ax=ax_a, orientation='horizontal', fraction=0.046, pad=0.06)
+        cbar.set_label('Trajectory Progress (Steps)', fontsize=16, fontweight='bold')
+        cbar.ax.tick_params(labelsize=14)
+    viz.draw_endpoints(ax_a, positions, start_idx, goal_idx)
+    ax_a.legend(fontsize=17, loc="upper right")
+    fig_a.savefig(output_dir / "flat_rl_trajectory.png", dpi=300, bbox_inches="tight")
+    plt.close(fig_a)
+
+    # (b) HRL + Subgoals
+    fig_b, ax_b = plt.subplots(figsize=(14, 11), constrained_layout=True)
+    viz.draw_map_background(ax_b, env, positions)
+    viz.draw_astar_path(ax_b, positions, astar_path)
+    sm_h = viz.draw_path_gradient(ax_b, positions, hrl_path, cmap_name="cool")
+    if hrl_subgoals:
+        sg_valid = [sg for sg in hrl_subgoals if sg < env.num_nodes]
+        if sg_valid:
+            sg_arr = np.array(sg_valid)
+            ax_b.scatter(positions[sg_arr, 0], positions[sg_arr, 1], marker="*", s=600, facecolors="#fbbf24", edgecolors="#92400e", linewidths=1.5, zorder=8, label="Subgoals")
+            for idx, sg in enumerate(sg_arr):
+                ax_b.text(positions[sg, 0] + 0.001, positions[sg, 1] + 0.001, f"$S_{{{idx+1}}}$", fontsize=16, fontweight="bold", bbox=dict(facecolor="white", edgecolor="#fbbf24", boxstyle="round,pad=0.2", alpha=0.9))
+    if sm_h:
+        cbar_h = fig_b.colorbar(sm_h, ax=ax_b, orientation='horizontal', fraction=0.046, pad=0.06)
+        cbar_h.set_label('Trajectory Progress (Steps)', fontsize=16, fontweight='bold')
+        cbar_h.ax.tick_params(labelsize=14)
+    viz.draw_endpoints(ax_b, positions, start_idx, goal_idx)
+    ax_b.legend(fontsize=17, loc="upper right")
+    fig_b.savefig(output_dir / "hrl_trajectory_with_subgoals.png", dpi=300, bbox_inches="tight")
+    plt.close(fig_b)
+
+    # (c) HRL Clean
+    fig_c, ax_c = plt.subplots(figsize=(14, 11), constrained_layout=True)
+    viz.draw_map_background(ax_c, env, positions)
+    viz.draw_astar_path(ax_c, positions, astar_path)
+    sm_c = viz.draw_path_gradient(ax_c, positions, hrl_path, cmap_name="cool")
+    if sm_c:
+        cbar_c = fig_c.colorbar(sm_c, ax=ax_c, orientation='horizontal', fraction=0.046, pad=0.06)
+        cbar_c.set_label('Trajectory Progress (Steps)', fontsize=16, fontweight='bold')
+        cbar_c.ax.tick_params(labelsize=14)
+    viz.draw_endpoints(ax_c, positions, start_idx, goal_idx)
+    ax_c.legend(fontsize=17, loc="upper right")
+    fig_c.savefig(output_dir / "hrl_trajectory_clean.png", dpi=300, bbox_inches="tight")
+    plt.close(fig_c)
+
+    astar_dist = core.compute_path_distance(env, astar_path) if astar_path else optimal_dist
+
+    return {
+        "start": start_idx,
+        "goal": goal_idx,
+        "optimal_hops": optimal_hops,
+        "optimal_dist": optimal_dist,
+        "astar_path": astar_path,
+        "astar_steps": len(astar_path) - 1 if astar_path else optimal_hops,
+        "astar_dist": astar_dist,
+        "flat_result": flat_result,
+        "hrl_result": hrl_result,
+    }
+
+
+def generate_trajectory_metrics_txt(traj_info: dict[str, Any], output_dir: Path, env: DisasterEnv) -> None:
+    flat = traj_info["flat_result"]
+    hrl = traj_info["hrl_result"]
+    opt_dist = traj_info["optimal_dist"]
+    opt_hops = traj_info["optimal_hops"]
+    flat_dist = flat.get("path_distance", 0.0)
+    hrl_dist = hrl.get("path_distance", 0.0)
+
+    summary = (
+        f"================================================================\n"
+        f"Trajectory Comparison on {env.name} ({env.num_nodes} nodes)\n"
+        f"================================================================\n\n"
+        f"[Problem Setting]\n  Map: {env.name}\n  Start Node: {traj_info['start']}\n  Goal Node: {traj_info['goal']}\n"
+        f"  Optimal Hops: {opt_hops:.0f}\n  Optimal Distance: {opt_dist:.1f} km\n\n[Results]\n"
+        f"  {'Metric':<30s} {'A*':>12s} {'Flat RL':>12s} {'HRL(N=16)':>12s}\n  {'-'*66}\n"
+        f"  {'Success':<30s} {'Yes':>12s} {'Yes' if flat['success'] else 'No':>12s} {'Yes' if hrl['success'] else 'No':>12s}\n"
+        f"  {'Actual Steps':<30s} {traj_info['astar_steps']:>12.0f} {flat['actual_steps']:>12d} {hrl['actual_steps']:>12d}\n"
+        f"  {'Path Distance (km)':<30s} {traj_info['astar_dist']:>12.1f} {flat_dist:>12.1f} {hrl_dist:>12.1f}\n"
+        f"  {'PLR (Distance Ratio)':<30s} {'1.000':>12s} {flat['path_length_ratio']:>12.3f} {hrl['path_length_ratio']:>12.3f}\n"
+        f"  {'Subgoals':<30s} {'N/A':>12s} {'N/A':>12s} {len(hrl.get('plan_subgoals', [])):>12d}\n"
+        f"  {'Sampling Success Rate':<30s} {'N/A':>12s} {'N/A':>12s} {hrl.get('sampling_success_rate', 0):>11.1f}%\n\n"
+        f"[Improvement (HRL vs Flat RL)]\n"
+    )
+
+    if flat["success"] and hrl["success"]:
+        plr_red = (flat["path_length_ratio"] - hrl["path_length_ratio"]) / flat["path_length_ratio"] * 100
+        step_red = (flat["actual_steps"] - hrl["actual_steps"]) / flat["actual_steps"] * 100
+        dist_red = (flat_dist - hrl_dist) / flat_dist * 100 if flat_dist > 0 else 0
+        summary += (f"  PLR Reduction: {flat['path_length_ratio']:.3f} -> {hrl['path_length_ratio']:.3f} ({plr_red:.1f}%)\n"
+                    f"  Step Reduction: {flat['actual_steps']} -> {hrl['actual_steps']} ({step_red:.1f}%)\n"
+                    f"  Distance Reduction: {flat_dist:.1f} -> {hrl_dist:.1f} km ({dist_red:.1f}%)\n")
+    else:
+        summary += "  (비교 불가: 하나 이상의 방식이 실패)\n"
+    summary += f"================================================================\n"
+    
+    (output_dir / "trajectory_metrics.txt").write_text(summary, encoding="utf-8")
+
+
+def evaluate_all_methods(flat_worker, joint_worker, manager, env, num_episodes: int, num_samples: int, seed: int) -> dict:
+    pairs = core.generate_od_pairs(env, num_episodes, min_hops=2, seed=seed)
+    results = {}
+
+    print(f"\n  🔷 A* 벤치마크 평가 중...")
+    astar_results, astar_times = [], []
+    for s, g in pairs:
+        t0 = time.perf_counter()
+        try:
+            raw_s = [k for k, v in env.node_mapping.items() if v == s][0]
+            raw_g = [k for k, v in env.node_mapping.items() if v == g][0]
+            nx_path = nx.dijkstra_path(env.map_core.graph, raw_s, raw_g, weight="length")
+            mapped_path = [env.node_mapping[n] for n in nx_path]
+            success = True
+        except Exception:
+            mapped_path = [s]
+            success = False
+        t1 = time.perf_counter()
+        astar_times.append((t1 - t0) * 1000.0)
+        dist = core.compute_path_distance(env, mapped_path)
+        opt_dist = float(env.apsp_matrix[s, g].item())
+        plr = dist / max(opt_dist, 1e-6) if success and opt_dist > 0 else float("inf")
+        astar_results.append({"success": success, "path_length_ratio": plr})
+    
+    astar_sr = sum(1 for r in astar_results if r["success"]) / len(astar_results) * 100
+    astar_plrs = [r["path_length_ratio"] for r in astar_results if r["success"] and math.isfinite(r["path_length_ratio"])]
+    results["A*"] = {"success_rate": astar_sr, "path_length_ratio": float(np.mean(astar_plrs)) if astar_plrs else float("inf"), "inference_latency_ms": float(np.mean(astar_times))}
+
+    print(f"\n  🔶 Flat RL 평가 중...")
+    flat_eval = core.evaluate_worker_batch(flat_worker, env, len(pairs), temperature=0.0, label="Flat RL", seed=seed, min_hops=2)
+    results["Flat RL"] = {"success_rate": flat_eval["success_rate"], "path_length_ratio": flat_eval["path_length_ratio"], "inference_latency_ms": flat_eval["inference_latency_ms"]}
+
+    print(f"\n  🟢 HRL (Greedy) 평가 중...")
+    hrl_greedy_eval = core.evaluate_joint_batch(joint_worker, manager, env, len(pairs), temperature=0.0, mgr_temperature=0.0, label="HRL Greedy", seed=seed, min_hops=2)
+    results["HRL (Greedy)"] = {"success_rate": hrl_greedy_eval["success_rate"], "path_length_ratio": hrl_greedy_eval["path_length_ratio"], "inference_latency_ms": hrl_greedy_eval["inference_latency_ms"]}
+
+    print(f"\n  🔴 HRL (Multi-Sampling) 평가 중...")
+    ms_successes = 0
+    ms_plrs, ms_times = [], []
+    for ep, (s, g) in enumerate(pairs):
+        ms_result = core.run_joint_rollout_multisampling(joint_worker, manager, env, s, g, num_samples=num_samples, temperature=core.DEFAULT_SAMPLE_TEMP, measure_time=True)
+        if ms_result["success"]:
+            ms_successes += 1
+            if math.isfinite(ms_result["path_length_ratio"]):
+                ms_plrs.append(ms_result["path_length_ratio"])
+        ms_times.append(ms_result.get("total_sampling_time_ms", 0.0))
+        if (ep + 1) % 50 == 0:
+            print(f"     [{ep+1}/{len(pairs)}] SR={(ms_successes / (ep + 1) * 100):.1f}%")
+    
+    ms_sr = ms_successes / len(pairs) * 100
+    results["HRL (Sampling)"] = {"success_rate": ms_sr, "path_length_ratio": float(np.mean(ms_plrs)) if ms_plrs else float("inf"), "inference_latency_ms": float(np.mean(ms_times))}
+
+    return results
+
+
+def save_all_maps_eval_txt(all_results: dict[str, dict[str, dict[str, Any]]], num_episodes: int, output_dir: Path) -> None:
+    lines = [f"================================================================", f"Batch Evaluation Results — All Maps", f"Episodes per map: {num_episodes}", f"================================================================"]
+    for map_name, results in all_results.items():
+        lines.extend(["", f"  📍 {map_name}", f"  {'Method':<25s} {'SR (%)':>10s} {'PLR':>10s} {'Latency (ms)':>15s}", f"  {'-'*60}"])
+        for method, data in results.items():
+            sr = f"{data['success_rate']:.1f}"
+            plr = f"{data['path_length_ratio']:.3f}" if math.isfinite(data['path_length_ratio']) else "inf"
+            lat = f"{data['inference_latency_ms']:.2f}"
+            lines.append(f"  {method:<25s} {sr:>10s} {plr:>10s} {lat:>15s}")
+    lines.append(f"================================================================")
+    (output_dir / "batch_eval_results.txt").write_text("\n".join(lines), encoding="utf-8")
+
+
+def generate_learning_curves(output_dir: Path) -> None:
+    worker_csv = Path("logs/rl_worker_stage/2026-04-13_1923_worker_pomo32/debug_metrics.csv")
+    joint_csv = Path("logs/rl_joint_stage/2026-04-14_2020_joint_pomo16/debug_metrics.csv")
+    if not worker_csv.exists() or not joint_csv.exists():
+        print("  ⚠️ 학습 곡선 CSV를 찾을 수 없어 건너뜁니다.")
+        return
+    dw = pd.read_csv(worker_csv)
+    dj = pd.read_csv(joint_csv)
+    
+    def smooth(series: pd.Series, frac: float = 0.05) -> pd.Series:
+        win = max(int(len(series) * frac), 1)
+        return series.rolling(win, min_periods=1).mean()
+
+    fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
+    j_sr = dj["success_ema"] * 100
+    ax.plot(dw["episode"], dw["success_ema"], color=viz.COLORS["Worker Only"], alpha=0.12)
+    ax.plot(dw["episode"], smooth(dw["success_ema"]), color=viz.COLORS["Worker Only"], linewidth=2.5, label="Worker Only")
+    ax.plot(dj["ep"], j_sr, color=viz.COLORS["Proposed HRL"], alpha=0.12)
+    ax.plot(dj["ep"], smooth(j_sr), color=viz.COLORS["Proposed HRL"], linewidth=2.5, label="Proposed HRL")
+    ax.set_ylabel("Success Rate (EMA, %)", fontsize=18, fontweight="bold")
+    ax.set_xlabel("Episode", fontsize=18)
+    ax.legend(fontsize=13, framealpha=0.9)
+    fig.savefig(output_dir / "success_rate.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
+    ax.plot(dw["episode"], dw["loss"], color=viz.COLORS["Worker Only"], alpha=0.12)
+    ax.plot(dw["episode"], smooth(dw["loss"]), color=viz.COLORS["Worker Only"], linewidth=2.5, label="Worker Only")
+    ax.plot(dj["ep"], dj["loss_mean"], color=viz.COLORS["Proposed HRL"], alpha=0.12)
+    ax.plot(dj["ep"], smooth(dj["loss_mean"]), color=viz.COLORS["Proposed HRL"], linewidth=2.5, label="Proposed HRL")
+    ax.set_ylabel("Policy Loss", fontsize=18, fontweight="bold")
+    ax.set_xlabel("Episode", fontsize=18)
+    ax.legend(fontsize=13, framealpha=0.9)
+    fig.savefig(output_dir / "loss.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print("  ✅ Saved: learning curves")
+
+
+def cmd_paper_full(args: argparse.Namespace) -> None:
+    device = core.get_device()
+    core.set_seed(args.seed)
+    output_dir = Path("tests/paper_figures")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("\n📦 모델 로드 중...")
+    joint_worker, manager, _ = core.load_checkpoint(args.joint_ckpt, device=device, load_manager=True)
+    flat_worker, _, _ = core.load_checkpoint(args.worker_ckpt, device=device, load_manager=False)
+    
+    maps_to_eval = [
+        {"name": "SiouxFalls", "nodes": 24},
+        {"name": "Anaheim", "nodes": 416},
+        {"name": "ChicagoSketch", "nodes": 933},
+        {"name": "Goldcoast", "nodes": 4807},
+    ]
+
+    all_map_results = {}
+    for map_cfg in maps_to_eval:
+        map_name = map_cfg["name"]
+        print(f"\n{'='*60}\n🔬 배치 평가: {map_name}\n{'='*60}")
+        env_map = core.setup_env(map_name, device)
+        map_results = evaluate_all_methods(flat_worker, joint_worker, manager, env_map, args.episodes, args.num_samples, args.seed)
+        all_map_results[map_name] = map_results
+
+        if map_name == "Goldcoast":
+            print(f"\n🎨 궤적 시각화 (Goldcoast)")
+            start_idx, goal_idx = core.find_long_od_pair(env_map, min_hops=50, seed=args.seed)
+            traj_info = generate_trajectory_figures(env_map, flat_worker, joint_worker, manager, start_idx, goal_idx, output_dir, args.num_samples)
+            generate_trajectory_metrics_txt(traj_info, output_dir, env_map)
+
+    save_all_maps_eval_txt(all_map_results, args.episodes, output_dir)
+    
+    if "Anaheim" in all_map_results:
+        viz.generate_latency_chart(all_map_results["Anaheim"], output_dir)
+    generate_learning_curves(output_dir)
+    print(f"\n✅ 완료! 출력: {output_dir.resolve()}")
+
+
+def cmd_regen(args: argparse.Namespace) -> None:
+    device = core.get_device()
+    core.set_seed(args.seed)
+    output_dir = Path("tests/paper_figures")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("\n📦 모델 로드 중...")
+    joint_worker, manager, _ = core.load_checkpoint(args.joint_ckpt, device=device, load_manager=True)
+    flat_worker, _, _ = core.load_checkpoint(args.worker_ckpt, device=device, load_manager=False)
+    
+    print(f"\n🗺️ {args.map} 환경 로드 중...")
+    env = core.setup_env(args.map, device)
+    
+    start_idx, goal_idx, _, _ = core.find_best_od_pair(
+        env, flat_worker, joint_worker, manager, min_hops=50, num_candidates=args.candidates, num_samples=args.num_samples
+    )
+    print(f"\n🎨 최적 궤적 시각화 재성성 중...")
+    traj_info = generate_trajectory_figures(
+        env, flat_worker, joint_worker, manager, start_idx, goal_idx, output_dir, args.num_samples
+    )
+    generate_trajectory_metrics_txt(traj_info, output_dir, env)
+    print(f"\n✅ 완료! 출력: {output_dir.resolve()}")
+
+
+# ============================================================
 # main 엔트리포인트
 # ============================================================
 
@@ -3951,7 +4004,7 @@ def main() -> None:
     args = parse_args()
 
     if args.command is None:
-        print("서브커맨드를 지정해주세요. 사용 가능: dashboard, worker, joint, compare, memorization, physics, paper")
+        print("서브커맨드를 지정해주세요. 사용 가능: dashboard, worker, joint, compare, memorization, physics, paper, paper_full, regen")
         print("예시: python tests/evaluate.py dashboard --run-dir logs/rl_phase1_apte")
         return
 
@@ -3963,6 +4016,8 @@ def main() -> None:
         "memorization": cmd_memorization,
         "physics": cmd_physics,
         "paper": cmd_paper,
+        "paper_full": cmd_paper_full,
+        "regen": cmd_regen,
     }
     cmd_map[args.command](args)
 
