@@ -28,7 +28,9 @@ class ManagerStageTrainer(DOMOTrainer):
                 'PLAN_ADJUST_MAX': 4.0,
             }
         )
-        self.mgr_max_grad_norm = 20.0
+        # [Fix 2026-04-18] SL 지식 보호를 위해 gradient clipping 강화 (20→5)
+        # Why: 이전 실행에서 pre-clip norm이 100~800까지 폭등하여 가중치 파괴됨
+        self.mgr_max_grad_norm = 5.0
         self.manager.to(self.device).train()
         for p in self.manager.parameters():
             p.requires_grad_(True)  # [Fix] Worker Stage에서 Freeze된 상태가 넘어올 수 있으므로 명시적 해제
@@ -38,13 +40,18 @@ class ManagerStageTrainer(DOMOTrainer):
             p.requires_grad_(False)
         self.mgr_opt = optim.Adam(self.manager.parameters(), lr=self.config.lr)
         self.wkr_opt = None
-        self.sparse_warmstart_ratio = 0.20  # [Refactor: Task 1] 초반 20%% A* Anchor CE 웜스타트
+        # [Fix 2026-04-18] A* 모방 웜스타트 구간 확대 (20%→40%)
+        # Why: RL 신호가 불안정한 초기에 A* 교사 신호로 더 오래 안내해야 SL 지식 보존됨
+        self.sparse_warmstart_ratio = 0.40
 
     def _compute_manager_plan_score(self, plan_diag):
+        # [Fix 2026-04-18] Under 페널티를 유지하되, 정상 생성 보너스 추가
+        # Why: Under만 벌하면 Manager가 '무조건 많이 생성' 편향 → 적정 범위 진입 시 보너스로 유인
         plan_lengths = plan_diag['plan_lengths']
         under_count = torch.clamp(plan_diag['plan_len_min'] - plan_lengths, min=0.0)
         over_count = torch.clamp(plan_lengths - plan_diag['plan_len_max'], min=0.0)
-        r_count = -1.20 * under_count - 0.15 * over_count
+        in_range = (plan_lengths >= plan_diag['plan_len_min']) & (plan_lengths <= plan_diag['plan_len_max'])
+        r_count = -1.20 * under_count - 0.15 * over_count + 0.50 * in_range.float()
 
         r_anchor = -0.40 * plan_diag['anchor_hop_error_mean'] + 0.95 * plan_diag['anchor_near_ratio']
         r_spacing = -1.20 * plan_diag['spacing_error_mean']
@@ -61,9 +68,11 @@ class ManagerStageTrainer(DOMOTrainer):
         r_first = -0.80 * torch.clamp(plan_diag['first_segment_budget_err'] - 1.0, min=0.0) - 0.40 * first_hop_excess
         corridor_deficit = torch.clamp(0.80 - plan_diag['corridor_ratio'], min=0.0)
         r_corr = -0.20 * corridor_deficit
+        # [Fix 2026-04-18] Empty plan 페널티 강화 (-2→-5)
+        # Why: EOS 즉시 출력 전략이 너무 저렴하여 Manager가 겁쟁이 편향을 학습함
         r_empty = torch.where(
             plan_lengths == 0,
-            torch.full_like(plan_lengths, -2.0),
+            torch.full_like(plan_lengths, -5.0),
             torch.zeros_like(plan_lengths),
         )
         plan_score = r_count + r_anchor + r_spacing + r_mono + r_budget + r_front + r_first + r_corr + r_empty
@@ -115,11 +124,13 @@ class ManagerStageTrainer(DOMOTrainer):
             with open(self._debug_log_path, 'w', encoding='utf-8') as f:
                 f.write(f"=== Manager Stage Debug Log (LR={self.config.lr}, POMO={self.num_pomo}) ===\n\n")
 
+        # [Fix 2026-04-18] LR hold 기간 단축 (0.7→0.4) 및 최종 LR 축소 (0.3→0.1)
+        # Why: 높은 LR을 70% 동안 유지하면 gradient 폭발과 결합되어 가중치 파괴 가속
         self.mgr_scheduler = self._build_hold_then_cosine_scheduler(
             self.mgr_opt,
             episodes,
-            hold_ratio=0.7,
-            min_factor=0.3,
+            hold_ratio=0.4,
+            min_factor=0.1,
         )
 
         history = {'rewards': [], 'losses': [], 'path_lengths': [], 'success_rates': []}
@@ -212,18 +223,20 @@ class ManagerStageTrainer(DOMOTrainer):
             mgr_entropy = -(mgr_probs * torch.log(mgr_probs + 1e-8)).sum(dim=-1)
             progress = float(ep) / float(max(episodes - 1, 1))
             warmstart_active = ep < warmstart_episodes
+            # [Fix 2026-04-18] RL 비중을 보수적으로 조정하여 SL 지식 보존
+            # Why: 이전 실행에서 RL 비중이 0.7까지 올라가자 Plan Score가 -10까지 역행
             if progress < self.sparse_warmstart_ratio:
                 rl_weight = 0.0
                 aux_weight = 1.0
-            elif progress < 0.55:
-                rl_weight = 0.30
-                aux_weight = 0.70
+            elif progress < 0.60:
+                rl_weight = 0.20
+                aux_weight = 0.80
             elif progress < 0.80:
+                rl_weight = 0.35
+                aux_weight = 0.65
+            else:
                 rl_weight = 0.50
                 aux_weight = 0.50
-            else:
-                rl_weight = 0.70
-                aux_weight = 0.30
             policy_loss = -(normalized_plan_score.detach() * mgr_log_probs).mean()
             entropy_bonus = -0.02 * (mgr_entropy * valid_mask).mean()
             loss = rl_weight * policy_loss + aux_weight * aux_ce_loss + entropy_bonus

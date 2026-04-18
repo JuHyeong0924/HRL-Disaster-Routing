@@ -200,7 +200,7 @@ def _init_env_and_models(args):
     worker = WorkerLSTM(node_dim=8, hidden_dim=args.hidden_dim, edge_dim=1).to(device)
 
     # 배치 크기 고정 적용 (VRAM 스케일러 제거됨)
-    args.num_pomo = int(args.num_pomo) if str(args.num_pomo).isdigit() else 32
+    args.num_pomo = int(args.num_pomo) if str(args.num_pomo).isdigit() else 48
     print(f"📐 고정된 배치 크기(POMO): {args.num_pomo}")
 
     return env, manager, worker, device
