@@ -864,7 +864,8 @@ class WorkerNavTrainer(DOMOTrainer):
             rl_history["rewards"].append(reward_mean)
             rl_history["losses"].append(float(total_loss.item()))
             rl_history["path_lengths"].append(diag["path_length_mean"])
-            rl_history["success_rates"].append(success_ema)
+            # _plot_rl_curves는 0~1 범위를 가정하므로 % → 비율로 변환 저장
+            rl_history["success_rates"].append(success_ema / 100.0)
 
             if self._collect_debug_this_episode:
                 row = {

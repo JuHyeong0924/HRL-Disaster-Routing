@@ -3426,17 +3426,25 @@ def cmd_paper(args: argparse.Namespace) -> None:
             label=f"RL-{mname}", seed=args.seed,
         )
 
-        # Proposed HRL (Worker + Manager) 평가
-        m_hrl_eval = core.evaluate_joint_batch(
+        # Proposed HRL (Worker + Manager) 평가 - Greedy
+        m_hrl_eval_greedy = core.evaluate_joint_batch(
             worker_hrl, manager_hrl, m_env, args.eval_episodes,
-            label=f"HRL-{mname}", seed=args.seed,
+            label=f"HRL(Greedy)-{mname}", seed=args.seed,
+            num_manager_samples=1,
+        )
+
+        # Proposed HRL (Worker + Manager) 평가 - POMO
+        m_hrl_eval_pomo = core.evaluate_joint_batch(
+            worker_hrl, manager_hrl, m_env, args.eval_episodes,
+            label=f"HRL(POMO)-{mname}", seed=args.seed,
+            num_manager_samples=32,
         )
 
         # Figure 4 데이터 수집
         maps_config.append({
             "name": mname, "nodes": m_env.num_nodes,
             "astar_ms": m_astar["mean_ms"],
-            "hrl_ms": m_hrl_eval["inference_latency_ms"],
+            "hrl_ms": m_hrl_eval_greedy["inference_latency_ms"],
         })
 
         # Table 1 데이터 수집
@@ -3447,10 +3455,14 @@ def cmd_paper(args: argparse.Namespace) -> None:
             "worker_plr": m_worker_eval["path_length_ratio"],
             "worker_lat": m_worker_eval["inference_latency_ms"],
             "worker_per_step": m_worker_eval["per_step_latency_ms"],
-            "hrl_sr": m_hrl_eval["success_rate"],
-            "hrl_plr": m_hrl_eval["path_length_ratio"],
-            "hrl_lat": m_hrl_eval["inference_latency_ms"],
-            "hrl_per_step": m_hrl_eval["per_step_latency_ms"],
+            "hrl_greedy_sr": m_hrl_eval_greedy["success_rate"],
+            "hrl_greedy_plr": m_hrl_eval_greedy["path_length_ratio"],
+            "hrl_greedy_lat": m_hrl_eval_greedy["inference_latency_ms"],
+            "hrl_greedy_per_step": m_hrl_eval_greedy["per_step_latency_ms"],
+            "hrl_pomo_sr": m_hrl_eval_pomo["success_rate"],
+            "hrl_pomo_plr": m_hrl_eval_pomo["path_length_ratio"],
+            "hrl_pomo_lat": m_hrl_eval_pomo["inference_latency_ms"],
+            "hrl_pomo_per_step": m_hrl_eval_pomo["per_step_latency_ms"],
         })
 
     # Figure 4 생성
@@ -3602,13 +3614,16 @@ def _paper_table1_multimap(rows: list, output_path: Path) -> None:
         map_label = f"{row['map']}"
         nodes_str = f"{row['nodes']}"
         # A* Expert: per-decision = total (단일 호출로 전체 경로 산출)
-        lines.append(f"    \\multirow{{3}}{{*}}{{{map_label}}} & \\multirow{{3}}{{*}}{{{nodes_str}}} & A* Expert & 100.0 & 1.000 & {row['astar_lat']:.2f} & {row['astar_lat']:.2f} \\\\")
+        lines.append(f"    \\multirow{{4}}{{*}}{{{map_label}}} & \\multirow{{4}}{{*}}{{{nodes_str}}} & A* Expert & 100.0 & 1.000 & {row['astar_lat']:.2f} & {row['astar_lat']:.2f} \\\\")
         # RL (Worker Only): per-decision = 1스텝 평균, total = 전체 경로 합계
         w_plr = f"{row['worker_plr']:.3f}" if math.isfinite(row['worker_plr']) else "N/A"
         lines.append(f"    & & RL (Worker Only) & {row['worker_sr']:.1f} & {w_plr} & {row['worker_per_step']:.2f} & {row['worker_lat']:.2f} \\\\")
-        # HRL (Worker+Manager): per-decision = Worker 1스텝 평균, total = Manager+Worker 합계
-        h_plr = f"{row['hrl_plr']:.3f}" if math.isfinite(row['hrl_plr']) else "N/A"
-        lines.append(f"    & & \\textbf{{Proposed HRL}} & {row['hrl_sr']:.1f} & {h_plr} & {row['hrl_per_step']:.2f} & {row['hrl_lat']:.2f} \\\\")
+        # HRL (Greedy):
+        hg_plr = f"{row['hrl_greedy_plr']:.3f}" if math.isfinite(row['hrl_greedy_plr']) else "N/A"
+        lines.append(f"    & & \\textbf{{Proposed HRL (Greedy)}} & {row['hrl_greedy_sr']:.1f} & {hg_plr} & {row['hrl_greedy_per_step']:.2f} & {row['hrl_greedy_lat']:.2f} \\\\")
+        # HRL (POMO):
+        hp_plr = f"{row['hrl_pomo_plr']:.3f}" if math.isfinite(row['hrl_pomo_plr']) else "N/A"
+        lines.append(f"    & & \\textbf{{Proposed HRL (POMO)}} & {row['hrl_pomo_sr']:.1f} & {hp_plr} & {row['hrl_pomo_per_step']:.2f} & {row['hrl_pomo_lat']:.2f} \\\\")
         if i < len(rows) - 1:
             lines.append(r"    \midrule")
     lines.extend([r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"])

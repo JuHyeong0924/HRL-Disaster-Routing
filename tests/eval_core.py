@@ -662,6 +662,7 @@ def evaluate_joint_batch(
     label: str = "HRL Model",
     seed: int = 42,
     min_hops: int = 2,
+    num_manager_samples: int = 1,
 ) -> Dict[str, Any]:
     """Worker + Manager 모델을 N회 rollout 후 통계 반환."""
     results: List[Dict[str, Any]] = []
@@ -681,11 +682,32 @@ def evaluate_joint_batch(
              while g == s:
                  g = rng.randint(0, env.num_nodes - 1)
 
-        result = run_joint_rollout(
-            worker, manager, env, s, g,
-            temperature=temperature, mgr_temperature=mgr_temperature,
-            measure_time=True,
-        )
+        if num_manager_samples <= 1:
+            result = run_joint_rollout(
+                worker, manager, env, s, g,
+                temperature=temperature, mgr_temperature=mgr_temperature,
+                measure_time=True,
+            )
+        else:
+            best_result = None
+            best_dist = float("inf")
+            for _ in range(num_manager_samples):
+                p_mgr_temp = max(mgr_temperature, 1.0)
+                res = run_joint_rollout(
+                    worker, manager, env, s, g,
+                    temperature=temperature, mgr_temperature=p_mgr_temp,
+                    measure_time=True,
+                )
+                dist = res['path_distance']
+                if res['success']:
+                    if best_result is None or not best_result['success'] or dist < best_dist:
+                        best_result = res
+                        best_dist = dist
+                else:
+                    if best_result is None:  # keep the first failure if all fail
+                        best_result = res
+            result = best_result
+
         results.append(result)
 
         if (ep + 1) % 20 == 0:
