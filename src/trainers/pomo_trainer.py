@@ -102,15 +102,24 @@ class DOMOTrainer:
         self.manager.to(self.device).train()
         self.worker.to(self.device).train()
         
-        # Manager와 Worker에 별도 LR 적용 (Manager는 SL에서 이미 수렴 → 낮은 LR로 미세 조정)
+        # [Fix: Adaptive Fine-tuning] Worker 초기엔 완전히 동결하여 Manager 폼 교정에 집중
+        for p in self.worker.parameters():
+            p.requires_grad_(False)
+        
+        # Manager에만 초기부터 별도 LR 적용
         self.mgr_opt = optim.Adam(self.manager.parameters(), lr=config.lr * self.mgr_lr_scale)
-        self.wkr_opt = optim.Adam(self.worker.parameters(), lr=config.lr)
+        self.wkr_opt = None  # 추후 특정 진척도에서 언프리즈 후 할당
         
         self.num_pomo = config.num_pomo # Batch Size for Parallel Simulation
         
         # LR Schedulers will be initialized in train() with total episodes
         self.mgr_scheduler = None
         self.wkr_scheduler = None
+        
+        # [Fix: Adaptive DAgger]
+        self.manager_entropy_ema = 0.0
+        self.manager_clip_hit_ema = 0.0
+        self.dagger_cooldown = 0
 
     def _should_collect_debug(self, ep, episodes):
         if not self.debug_mode:
@@ -128,11 +137,11 @@ class DOMOTrainer:
         self.mgr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.mgr_opt, T_max=episodes, eta_min=self.config.lr * self.mgr_eta_min_scale
         )
-        self.wkr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.wkr_opt, T_max=episodes, eta_min=self.config.lr * 0.01
-        )
+        self.wkr_scheduler = None  # 언프리즈 시점에 설정
         
         avg_reward = 0
+        wkr_unfreeze_progress = 0.75  # 전체 에피소드의 75% 시점에서 동결 해제
+        wkr_unfreeze_ep = int(episodes * wkr_unfreeze_progress)
         pbar = tqdm(range(episodes), desc="RL", ncols=100)
         
         # 학습 곡선 기록용
@@ -143,6 +152,16 @@ class DOMOTrainer:
         success_ema = 0  # Exponential Moving Average
         
         for ep in pbar:
+            # [Fix: Micro Fine-Tuning] 진척도 75% 시점에 Worker 잠금 해제
+            if ep == wkr_unfreeze_ep:
+                for p in self.worker.parameters():
+                    p.requires_grad_(True)
+                wkr_lr_ft = 1e-5  # 마이크로 파인튜닝 학습률
+                self.wkr_opt = optim.Adam(self.worker.parameters(), lr=wkr_lr_ft)
+                self.wkr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    self.wkr_opt, T_max=max(episodes - ep, 1), eta_min=wkr_lr_ft * 0.1
+                )
+                
             self._collect_debug_this_episode = self._should_collect_debug(ep, episodes)
             self._last_debug_tensors = None
 
@@ -287,7 +306,19 @@ class DOMOTrainer:
             aux_valid_mask = (aux_target_seq != self.manager.PAD_TOKEN).float()
             aux_valid_counts = aux_valid_mask.sum(dim=1).clamp(min=1.0)
             mgr_aux_ce_loss = ((aux_nll * aux_valid_mask).sum(dim=1) / aux_valid_counts).mean()
-            mgr_aux_weight = self._manager_aux_weight(ep, episodes)
+            
+            # [Fix: Adaptive DAgger] EMA 기반으로 망각 징조가 보이면 강제로 과외 스케줄 당김
+            if self.dagger_cooldown == 0 and (self.manager_clip_hit_ema > 0.8 or self.manager_entropy_ema > 2.5) and ep > 100:
+                self.dagger_cooldown = max(10, int(episodes * 0.05))  # 전체 에피소드의 5% 쿨다운
+                
+            base_mgr_aux = self._manager_aux_weight(ep, episodes)
+            if self.dagger_cooldown > 0:
+                cooldown_ratio = self.dagger_cooldown / max(1.0, float(int(episodes * 0.05)))
+                mgr_aux_weight = (0.90 * cooldown_ratio) + (base_mgr_aux * (1.0 - cooldown_ratio))
+                self.dagger_cooldown -= 1
+            else:
+                mgr_aux_weight = base_mgr_aux
+                
             wkr_aux_weight = self._worker_aux_weight(ep, episodes)
             
             # Worker trajectory는 길수록 log-prob가 커지므로 sqrt(step)로만 완만하게 정규화
@@ -325,7 +356,9 @@ class DOMOTrainer:
             )
             
             self.mgr_opt.zero_grad()
-            self.wkr_opt.zero_grad()
+            if self.wkr_opt is not None:
+                self.wkr_opt.zero_grad()
+                
             if loss.requires_grad:
                 # AMP: GradScaler로 loss를 스케일링하여 backward 수행
                 self.grad_scaler.scale(loss).backward()
@@ -333,7 +366,7 @@ class DOMOTrainer:
                 # 각 optimizer에 실제 gradient가 존재하는지 확인
                 # (loss 연산 그래프에 참여하지 않은 optimizer는 inf 체크가 등록되지 않아 step() 시 AssertionError 발생)
                 mgr_has_grad = any(p.grad is not None for p in self.manager.parameters())
-                wkr_has_grad = any(p.grad is not None for p in self.worker.parameters())
+                wkr_has_grad = getattr(self, 'wkr_opt', None) is not None and any(p.grad is not None for p in self.worker.parameters())
                 
                 # AMP: unscale 후 gradient clipping (스케일링된 상태에서 clip하면 안 됨)
                 if mgr_has_grad:
@@ -361,7 +394,16 @@ class DOMOTrainer:
             
             # Step LR Schedulers
             self.mgr_scheduler.step()
-            self.wkr_scheduler.step()
+            if self.wkr_scheduler is not None:
+                self.wkr_scheduler.step()
+            
+            # [Update DAgger EMA]
+            is_clip_hit = 1.0 if mgr_preclip_norm >= self.mgr_max_grad_norm else 0.0
+            self.manager_clip_hit_ema = self.manager_clip_hit_ema * 0.90 + is_clip_hit * 0.10
+            current_entropy = 0.0
+            if valid_mask.sum().item() > 0:
+                current_entropy = float((mgr_entropy * valid_mask).sum().item() / valid_mask.sum().item())
+            self.manager_entropy_ema = self.manager_entropy_ema * 0.90 + current_entropy * 0.10
             
             avg_reward = (avg_reward * 0.95) + (rewards.mean().item() * 0.05)
 
@@ -419,7 +461,7 @@ class DOMOTrainer:
                     mgr_preclip_norm=mgr_preclip_norm,
                     wkr_preclip_norm=wkr_preclip_norm,
                     mgr_lr=self.mgr_scheduler.get_last_lr()[0],
-                    wkr_lr=self.wkr_scheduler.get_last_lr()[0],
+                    wkr_lr=self.wkr_scheduler.get_last_lr()[0] if self.wkr_scheduler is not None else 0.0,
                 )
                 self._last_diag = diag
                 self._record_debug_episode(diag, sample_payload)
@@ -429,7 +471,8 @@ class DOMOTrainer:
                 torch.cuda.empty_cache()
             
             if ep % self.debug_interval == 0:
-                pbar.write(f"[Ep {ep}] Mgr LR: {self.mgr_scheduler.get_last_lr()[0]:.6f}, Wkr LR: {self.wkr_scheduler.get_last_lr()[0]:.6f}, SuccessEMA: {success_ema*100:.1f}%, Loss: {loss.item():.2f}")
+                wkr_lr_val = self.wkr_scheduler.get_last_lr()[0] if self.wkr_scheduler is not None else 0.0
+                pbar.write(f"[Ep {ep}] Mgr LR: {self.mgr_scheduler.get_last_lr()[0]:.6f}, Wkr LR: {wkr_lr_val:.6f}, SuccessEMA: {success_ema*100:.1f}%, Loss: {loss.item():.2f}")
                 
                 # [Diagnostic] 디버그 모드에서 상세 진단 로그 출력 + 파일 저장
                 if self.debug_mode and self._debug_window:
@@ -2297,13 +2340,15 @@ class DOMOTrainer:
             log_p = dist.log_prob(actions)
             entropy = dist.entropy()
             
-            log_probs_sum = torch.where(active_mask, log_probs_sum + log_p, log_probs_sum)
-            entropy_sum = torch.where(active_mask, entropy_sum + entropy, entropy_sum)
+            # [Fix] active_before_step 사용: 이 스텝에서 실제 행동한 Worker만 log_prob/entropy 누적
+            log_probs_sum = torch.where(active_before_step, log_probs_sum + log_p, log_probs_sum)
+            entropy_sum = torch.where(active_before_step, entropy_sum + entropy, entropy_sum)
             if active_before_step.any():
                 traj_values.append(v_sq)
                 traj_value_masks.append(active_before_step.float())
             
-            # Env Step
+            # Env Step (비활성 Worker는 현재 위치에 고정)
+            actions = torch.where(active_before_step, actions, self.env.current_node)
             self.env.step(actions)
             path_history.append(self.env.current_node.clone())
 
@@ -2369,7 +2414,7 @@ class DOMOTrainer:
             time_ratio = t / max(MAX_TOTAL_STEPS, 1)
             step_p = BASE_STEP_PENALTY * (1.0 + TIME_PRESSURE_SCALE * time_ratio)
             step_penalty_sum = torch.where(
-                active_mask, step_penalty_sum + step_p, step_penalty_sum
+                active_before_step, step_penalty_sum + step_p, step_penalty_sum
             )
             
             # P2: 루프 페널티 (방문횟수에 비례하여 점진 증가)
@@ -2382,7 +2427,7 @@ class DOMOTrainer:
                 revisit_penalty,
             )
             loop_penalty_sum = torch.where(
-                active_mask, loop_penalty_sum - revisit_penalty, loop_penalty_sum
+                active_before_step, loop_penalty_sum - revisit_penalty, loop_penalty_sum
             )
             
             # [Refactor: Task 4] Goal Regression 페널티 (Handoff 후 3.0x 스케일)
@@ -2394,11 +2439,11 @@ class DOMOTrainer:
             )
             goal_regression_penalty = goal_regressed.float() * regression_scale
             loop_penalty_sum = torch.where(
-                active_mask, loop_penalty_sum - goal_regression_penalty, loop_penalty_sum
+                active_before_step, loop_penalty_sum - goal_regression_penalty, loop_penalty_sum
             )
             
             # E: 탐색 보너스 (처음 방문하는 노드에 소액 보상)
-            is_first_visit = (curr_visit_count <= 1.0) & active_mask
+            is_first_visit = (curr_visit_count <= 1.0) & active_before_step
             exploration_sum = torch.where(
                 is_first_visit, exploration_sum + EXPLORATION_BONUS, exploration_sum
             )
@@ -2437,15 +2482,15 @@ class DOMOTrainer:
             # D: 마일스톤 보상 (25/50/75% 지점 통과 시 일회성 보너스)
             progress = 1.0 - self.env.apsp_matrix[curr_nodes_flat, goal_idx] / max(optimal_dist, 1.0)
             
-            hit_25 = (progress >= 0.25) & (~milestone_25_reached) & active_mask
+            hit_25 = (progress >= 0.25) & (~milestone_25_reached) & active_before_step
             milestone_sum = torch.where(hit_25, milestone_sum + MILESTONE_25, milestone_sum)
             milestone_25_reached = milestone_25_reached | hit_25
             
-            hit_50 = (progress >= 0.50) & (~milestone_50_reached) & active_mask
+            hit_50 = (progress >= 0.50) & (~milestone_50_reached) & active_before_step
             milestone_sum = torch.where(hit_50, milestone_sum + MILESTONE_50, milestone_sum)
             milestone_50_reached = milestone_50_reached | hit_50
             
-            hit_75 = (progress >= 0.75) & (~milestone_75_reached) & active_mask
+            hit_75 = (progress >= 0.75) & (~milestone_75_reached) & active_before_step
             milestone_sum = torch.where(hit_75, milestone_sum + MILESTONE_75, milestone_sum)
             milestone_75_reached = milestone_75_reached | hit_75
 

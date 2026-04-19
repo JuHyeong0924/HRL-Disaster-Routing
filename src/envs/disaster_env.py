@@ -743,8 +743,6 @@ class DisasterEnv:
         self.history.append(next_node_idx)
         
         return self._get_mask(self.current_node)
-        
-        return self._get_mask(self.current_node)
 
     def get_mask(self):
         return self._get_mask(self.current_node)
