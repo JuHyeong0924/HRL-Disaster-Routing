@@ -234,25 +234,7 @@ class DisasterEnv:
         # ... (Constants kept same)
         MAX_BATTERY_J = 10.0 * 3.6e6 # 36 MJ
         
-        if batch_size == 1:
-             # (Keep existing batch=1 logic exactly as is, just wrapped)
-             # ... 
-             pass  # Actually I should allow replace_file_content to keep the batch=1 block if I match carefully.
-             # The tool works by replacing lines. I need to be careful not to delete the batch=1 block.
-             # But I am replacing the method signature line 100.
-             # I need to re-write the batch=1 block or just the start.
-             
-             # Wait, replace_file_content replaces a chunk.
-             # I should target lines 100 to 110 first to change signature.
-             pass
 
-        # Let's apply change to Signature first.
-        # Actually I can replace the Start/Target generation block (Lines 290-316) based on sync_problem.
-        
-        # STEP 1: Update Signature
-        # STEP 2: Update S/G Logic
-
-        
         if batch_size == 1:
             # [Seismic Sequence Generation]
             # Unified "Shock" Model (No distinction between Main/After)

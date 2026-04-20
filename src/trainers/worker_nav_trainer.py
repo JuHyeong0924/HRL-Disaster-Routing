@@ -436,13 +436,17 @@ class WorkerNavTrainer(DOMOTrainer):
             current_nodes = self.env.current_node.clone()
             worker_input = self._build_worker_input()
             edge_attr = self._select_edge_attr(self.env.pyg_data.edge_attr)
+            # [Memory/Perf] Worker 단독 학습(stage='worker') 시에는 VRAM이 충분하므로 GATv2까지 포함한 End-to-End BPTT 학습을 진행.
+            # 하지만 Manager/Worker가 동시 학습되는 Joint(stage='joint') 단계에서는 VRAM이 매우 부족하므로 공간 인코더(GATv2)의 그래디언트를 차단하여 메모리 방어.
+            is_joint_stage = getattr(self.config, "stage", "worker") == "joint"
+            
             scores, h_next, c_next, value_pred = self.worker.predict_next_hop(
                 worker_input,
                 self.env.pyg_data.edge_index,
                 h,
                 c,
                 self.env.pyg_data.batch,
-                detach_spatial=True,  # [Perf] GATv2 gradient 차단 → BPTT 제거, 속도 3x↑
+                detach_spatial=is_joint_stage, 
                 edge_attr=edge_attr,
             )
             # inactive 에이전트의 LSTM 상태는 detach하여 불필요한 연산 그래프 VRAM 누적 방지
@@ -770,6 +774,7 @@ class WorkerNavTrainer(DOMOTrainer):
             "teacher_path_hops_mean": float(optimal_hops.mean().item()),
             "teacher_hidden_checkpoint_count_actual": float(teacher_hidden_checkpoint_count_actual.mean().item()),
             "worker_aux_ce_loss": float(worker_aux_ce.item()),
+            "worker_critic_loss": float(critic_loss.item()) if 'critic_loss' in locals() else 0.0,
             "worker_entropy": float(flat_entropies.mean().item()) if flat_entropies.numel() > 0 else 0.0,
             "critic_explained_variance": self._explained_variance(flat_norm_returns, flat_values.detach()),
             "hidden_checkpoint_count_mean": float(checkpoint_counts.mean().item()),
@@ -834,7 +839,8 @@ class WorkerNavTrainer(DOMOTrainer):
         }
         success_ema = 0.0
 
-        pbar = tqdm(range(episodes), desc="Worker", dynamic_ncols=True)
+        tqdm_disabled = getattr(self.config, 'disable_tqdm', False)
+        pbar = tqdm(range(episodes), desc="Worker", dynamic_ncols=True, disable=tqdm_disabled)
         for ep in pbar:
             self._collect_debug_this_episode = self._should_collect_debug(ep, episodes)
 
@@ -869,6 +875,31 @@ class WorkerNavTrainer(DOMOTrainer):
             rl_history["rewards"].append(reward_mean)
             rl_history["losses"].append(float(total_loss.item()))
             rl_history["path_lengths"].append(diag["path_length_mean"])
+
+            if getattr(self.config, 'disable_tqdm', False):
+                import sys
+                info_str = f"Loss={total_loss.item():.2f}, Succ={diag['success_rate']:.1f}%, EMA={success_ema:.1f}%, Rw={reward_mean:.2f}, Len={diag['path_length_mean']:.1f}"
+                sys.stderr.write(f"PROGRESS_UPDATE|{ep + 1}|{info_str}\n")
+                
+                # [주기적 디버그 로그 설정] 200 에피소드마다 자세한 지표 IPC 전송
+                if (ep + 1) % 200 == 0:
+                    ent = diag.get("worker_entropy", 0.0)
+                    v_loss = diag.get("worker_critic_loss", 0.0)
+                    expl_var = diag.get("critic_explained_variance", 0.0)
+                    hop_dist = diag.get("teacher_path_hops_mean", 0.0)  # 시작점 기준 목표까지의 평균 홉
+                    prog = diag.get("progress_mean", 0.0)
+                    grad = diag.get("worker_grad_pre", 0.0)
+                    
+                    debug_str = (
+                        f"📊 [EP {ep+1:5d}] W_Ent: {ent:.3f} | V_Loss: {v_loss:.3f} | Grad: {grad:.2f} | ExplVar: {expl_var:.2f} | "
+                        f"Hop_Dist: {hop_dist:.1f} | Prog: {prog:.1f}% | EMA: {success_ema:.1f}%"
+                    )
+                    sys.stderr.write(f"DEBUG_UPDATE|{debug_str}\n")
+                
+                sys.stderr.flush()
+            else:
+                pbar.set_postfix_str(f"Loss={total_loss.item():.2f}, Succ={diag['success_rate']:.1f}%, EMA={success_ema:.1f}%, Rw={reward_mean:.2f}, Len={diag['path_length_mean']:.1f}")
+
             # _plot_rl_curves는 0~1 범위를 가정하므로 % → 비율로 변환 저장
             rl_history["success_rates"].append(success_ema / 100.0)
 
@@ -949,7 +980,7 @@ class WorkerNavTrainer(DOMOTrainer):
                     f"(clip {row['worker_grad_clip_hit']:.1f}%)",
                     f"  HiddenBonus/AuxWeight: {row['hidden_bonus_weight']:.3f} / {row['aux_weight']:.3f}",
                 ]
-                pbar.write("\n".join(lines))
+                # pbar.write("\n".join(lines)) # Disabled to prevent console scrolling in parallel mode
                 with open(self._debug_log_path, "a", encoding="utf-8") as f:
                     for line in lines:
                         f.write(line + "\n")

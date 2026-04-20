@@ -196,7 +196,8 @@ class ManagerStageTrainer(DOMOTrainer):
         history = {'rewards': [], 'losses': [], 'path_lengths': [], 'success_rates': []}
         quality_ema = 0.0
         best_metric = float('-inf')
-        pbar = tqdm(range(episodes), desc="MgrStage", ncols=100)
+        tqdm_disabled = getattr(self.config, 'disable_tqdm', False)
+        pbar = tqdm(range(episodes), desc="MgrStage", ncols=100, disable=tqdm_disabled)
         warmstart_episodes = max(1, int(round(episodes * self.sparse_warmstart_ratio)))
 
         for ep in pbar:
@@ -407,16 +408,38 @@ class ManagerStageTrainer(DOMOTrainer):
 
             plan_score_mean = plan_score.mean().item()
             plan_len_mean = plan_diag['plan_lengths'].mean().item()
-            pbar.set_postfix({
-                'QualEMA': f"{quality_ema*100:.1f}%",
-                'Score': f"{plan_score_mean:.2f}",
-                'Plan': f"{plan_len_mean:.1f}",
-            })
 
             history['rewards'].append(plan_score_mean)
             history['losses'].append(loss.item())
             history['path_lengths'].append(plan_len_mean)
             history['success_rates'].append(float(plan_diag['anchor_near_ratio'].mean().item()))
+
+            if getattr(self.config, 'disable_tqdm', False):
+                import sys
+                info_str = f"Loss={loss.item():.2f}, Score={plan_score_mean:.2f}, QualEMA={quality_ema*100:.1f}%, Plan={plan_len_mean:.1f}"
+                sys.stderr.write(f"PROGRESS_UPDATE|{ep + 1}|{info_str}\n")
+                
+                # [주기적 디버그 로그 설정] 200 에피소드마다 자세한 지표 IPC 전송
+                if (ep + 1) % 200 == 0:
+                    ent = ((mgr_entropy * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)).item()
+                    hop_dist = plan_diag.get('first_subgoal_hops', torch.tensor([0.0])).mean().item()
+                    spacing = plan_diag.get('spacing_error_mean', torch.tensor([0.0])).mean().item()
+                    anchor = plan_diag.get('anchor_near_ratio', torch.tensor([0.0])).mean().item() * 100.0
+                    
+                    debug_str = (
+                        f"📊 [EP {ep+1:5d}] M_Ent: {ent:.3f} | Score: {plan_score_mean:.2f} | "
+                        f"1st_Hop: {hop_dist:.1f} | SpacingErr: {spacing:.2f} | AnchorHit: {anchor:.1f}%"
+                    )
+                    sys.stderr.write(f"DEBUG_UPDATE|{debug_str}\n")
+                    
+                sys.stderr.flush()
+            else:
+                pbar.set_postfix({
+                    'Loss': f"{loss.item():.2f}",
+                    'QualEMA': f"{quality_ema*100:.1f}%",
+                    'Score': f"{plan_score_mean:.2f}",
+                    'Plan': f"{plan_len_mean:.1f}",
+                })
 
             hard_mask = plan_diag['plan_len_ref'] >= 4.0
             if hard_mask.any():
@@ -533,7 +556,7 @@ class ManagerStageTrainer(DOMOTrainer):
                     f"Corr={row['corridor_ratio_mean']*100:.0f}% | "
                     f"AnchorNear={row['anchor_near_rate']*100:.0f}%"
                 )
-                pbar.write(compact)
+                # pbar.write(compact) # Disabled to prevent console scrolling in parallel mode
                 with open(self._debug_log_path, 'a', encoding='utf-8') as f:
                     for line in lines:
                         f.write(line + "\n")

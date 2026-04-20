@@ -146,6 +146,7 @@ def _build_config(args, loaded_checkpoint_paths, stage_override=None):
         save_dir=save_dir,
         stage=effective_stage,
         debug=args.debug,
+        disable_tqdm=getattr(args, 'disable_tqdm', False),
         run_type="smoke" if args.episodes <= 5 else "train",
         parent_checkpoints=loaded_checkpoint_paths,
         mgr_max_grad_norm=20.0,  # [Fix] Manager Stage(20.0)과 동일하게 맞춤 (기본값 5.0은 100% clip-hit 유발)
@@ -313,6 +314,7 @@ def _run_parallel_phase1(args) -> None:
     base_args = [
         sys.executable, "train_rl.py",
         "--map", args.map,
+        "--data", args.data,
         "--hidden_dim", str(args.hidden_dim),
         "--lr", str(args.lr),
         "--num_pomo", str(args.num_pomo),
@@ -324,6 +326,7 @@ def _run_parallel_phase1(args) -> None:
     worker_cmd = base_args + [
         "--stage", "worker",
         "--episodes", str(worker_eps),
+        "--disable_tqdm",
     ]
     worker_env = {**os.environ, "CUDA_VISIBLE_DEVICES": "0"}
 
@@ -331,31 +334,86 @@ def _run_parallel_phase1(args) -> None:
     manager_cmd = base_args + [
         "--stage", "manager",
         "--episodes", str(manager_eps),
+        "--disable_tqdm",
     ]
     manager_env = {**os.environ, "CUDA_VISIBLE_DEVICES": "1"}
 
     print(f"🚀 Worker  시작 (GPU 0, {worker_eps:,} eps)...")
     print(f"🚀 Manager 시작 (GPU 1, {manager_eps:,} eps)...")
-    print()
+    print("\n" * 2) # reserve lines for tqdm
 
-    # 두 프로세스 동시 실행
+    os.makedirs("logs", exist_ok=True)
+
+    # 두 프로세스 동시 실행. stdout은 터미널/파일 오염을 막기 위해 폐기하고, stderr은 파이프로 연결하여 단위 진행상태 수신
     worker_proc = subprocess.Popen(
         worker_cmd, env=worker_env,
         cwd=os.getcwd(),
-        stdout=sys.stdout, stderr=sys.stderr,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, bufsize=1
     )
     manager_proc = subprocess.Popen(
         manager_cmd, env=manager_env,
         cwd=os.getcwd(),
-        stdout=sys.stdout, stderr=sys.stderr,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, bufsize=1
     )
+
+    import threading
+    from tqdm.auto import tqdm
+
+    def monitor_progress(task_name, total_steps, pos_id, proc):
+        # dynamic_ncols=True는 터미널 리사이즈 시 깨짐을 방지하지만, 
+        # 다중 스레드에서는 ncols를 고정하는 것이 화면 깨짐 방지에 더 안정적일 수 있습니다.
+        pbar = tqdm(total=total_steps, desc=task_name, position=pos_id, leave=True, ncols=130)
+        
+        for line in iter(proc.stderr.readline, ''):
+            if not line:
+                break
+                
+            clean_line = line.strip()
+            
+            # 2. 약속된 프로토콜만 UI 업데이트에 반영
+            if clean_line.startswith("PROGRESS_UPDATE|"):
+                try:
+                    parts = clean_line.split('|')
+                    ep = int(parts[1])
+                    postfix_str = parts[2] if len(parts) > 2 else ""
+                    
+                    # 상태 업데이트 단일화: 직접 할당 후 단 1회 갱신
+                    pbar.n = ep
+                    pbar.set_postfix_str(postfix_str)
+                    pbar.refresh()
+                except Exception:
+                    pass
+            elif clean_line.startswith("DEBUG_UPDATE|"):
+                try:
+                    # DEBUG_UPDATE|로그내용
+                    parts = clean_line.split('|', 1)
+                    if len(parts) > 1:
+                        # tqdm.write를 사용하면 진행 표시줄 위로 깔끔하게 로그가 출력됩니다.
+                        pbar.write(f"[{task_name}] {parts[1]}")
+                except Exception:
+                    pass
+            else:
+                # 3. pbar.write() 제거 (터미널 렌더링 보호)
+                # 서브프로세스의 기타 에러/경고는 UI를 깨지 않도록 파일에만 기록합니다.
+                pass 
+                
+        pbar.close()
+
+    t1 = threading.Thread(target=monitor_progress, args=("Worker", worker_eps, 0, worker_proc))
+    t2 = threading.Thread(target=monitor_progress, args=("Manager", manager_eps, 1, manager_proc))
+
+    t1.start()
+    t2.start()
 
     # 두 프로세스 완료 대기
     worker_rc = worker_proc.wait()
-    print(f"\n✅ Worker  완료 (exit code: {worker_rc})")
-
     manager_rc = manager_proc.wait()
-    print(f"✅ Manager 완료 (exit code: {manager_rc})")
+
+    t1.join()
+    t2.join()
+
+    print(f"\n✅ Worker  완료 (exit code: {worker_rc})")
+    print(f"\n✅ Manager 완료 (exit code: {manager_rc})")
 
     if worker_rc != 0 or manager_rc != 0:
         print("❌ Worker 또는 Manager 학습이 실패했습니다. Joint를 건너뜁니다.")
@@ -447,6 +505,7 @@ if __name__ == "__main__":
         action="store_true",
         help="디버그 모드: 주기적으로 단계별 지표를 상세 로그로 출력",
     )
+    parser.add_argument("--disable_tqdm", action="store_true", help="내부 tqdm 비활성화 및 stdin 보고")
     parser.add_argument(
         "--force_joint",
         action="store_true",

@@ -233,7 +233,8 @@ def train_sl(args):
             # 1. Project Features & Dense Batching
             # [Refactor] Teacher Forcing Logic:
             # We calculate embeddings EXTERNALLY and pass them to Manager.
-            node_emb_all = manager.topology_enc(batch.x, batch.edge_index) # [B*N, Hidden]
+            mgr_edge_attr = batch.edge_attr[:, 0:1] if batch.edge_attr is not None else None
+            node_emb_all = manager.topology_enc(batch.x, batch.edge_index, edge_attr=mgr_edge_attr) # [B*N, Hidden]
             
             # [Fix #6] import는 파일 상단으로 이동 완료
             node_emb_dense, mask_dense = to_dense_batch(node_emb_all, batch.batch) # [B, N_max, H]
@@ -302,7 +303,9 @@ def train_sl(args):
             real_node_mask = (targets_flat < N_max) & (targets_flat >= 0)
             
             if real_node_mask.sum() > 0:
-                log_probs = F.log_softmax(pointer_logits, dim=-1) # [B, L+1, N+1]
+                # [Fix 5] EOS 토큰을 제외한 순수 공간 노드에 대해서만 log_softmax 적용
+                logits_nodes = pointer_logits[..., :-1] # [B, L+1, N_max]
+                log_probs_nodes = F.log_softmax(logits_nodes, dim=-1) 
                 
                 # Get Network Distances for Soft Label
                 # We use the pre-computed APSP matrix for topologically accurate distances.
@@ -316,10 +319,6 @@ def train_sl(args):
                 temperature = 1.0 
                 soft_probs = F.softmax(-dists / temperature, dim=-1) # [B, L+1, N_max]
                 del dists  # [Fix #2] Soft Label 중간 텐서 즉시 해제 (~50MB/batch 회수)
-                
-                # Exclude EOS token from logic (it has no coordinates)
-                # Compare only node distributions (N_max classes)
-                log_probs_nodes = log_probs[..., :-1] # [B, L+1, N_max]
                 
                 kl_loss_raw = F.kl_div(log_probs_nodes, soft_probs, reduction='none', log_target=False) # [B, L+1, N_max]
                 
@@ -446,7 +445,10 @@ def train_sl(args):
                     tgt_nodes_k = t_seqs_pad[active_idx, act_step]
                     
                     # [DAgger] 정답 재계산: 모델 예측 위치에 있을 때 APSP 기반 올바른 행동
-                    # Teacher Forcing이 아닌 경우 → 현재 위치에서 서브골까지의 최단경로 다음 노드
+                    # Teacher Forcing이 아닌 경우 → 현재 위치에서 서브골까지의 
+                    # [Fix 4] Subset 우회
+                    ds = wkr_loader.dataset.dataset if hasattr(wkr_loader.dataset, 'dataset') else wkr_loader.dataset
+                    
                     original_labels = n_seqs_pad[active_idx, act_step]  # 원래 정답
                     dagger_labels = apsp_next_hop_device[curr_nodes_k, tgt_nodes_k]  # APSP 재계산 정답
                     
@@ -470,10 +472,12 @@ def train_sl(args):
                     worker_in[cached_offsets + tgt_nodes_k, 3] = 1.0   # is_target
                     
                     # APSP 거리 피처
-                    if hasattr(wkr_loader.dataset, 'apsp_matrix'):
-                        max_dst = wkr_loader.dataset.max_dist
+                    if hasattr(ds, 'apsp_matrix'):
+                        max_dst = ds.max_dist
                         active_dists = apsp_device_global[tgt_nodes_k] / max_dst  # [K, N]
                         worker_in[:, 4] = active_dists.reshape(-1)
+                    else:
+                        worker_in[:, 4] = 0.0
                     
                     # 방향 벡터 피처
                     tgt_coords = compact_coords[cached_offsets + tgt_nodes_k]  # [K, 2]
@@ -485,9 +489,15 @@ def train_sl(args):
                     worker_in[:, 7] = is_final_target.repeat_interleave(num_nodes_per_graph)
 
                     # [Track 1] hop_dist 피처 (col 8): 서브골까지의 정규화된 홉 거리
-                    hop_dists = hop_apsp_device[tgt_nodes_k]  # [K, N]
-                    max_h = float(hop_apsp_device[hop_apsp_device < float('inf')].max().item()) if (hop_apsp_device < float('inf')).any() else 50.0
-                    worker_in[:, 8] = torch.clamp(hop_dists.float() / max_h, 0.0, 1.0).reshape(-1)
+                    if hasattr(ds, 'hop_matrix'):
+                        hop_matrix_device = ds.hop_matrix.to(device)
+                        hop_dists_k = hop_matrix_device[curr_nodes_k, tgt_nodes_k]
+                        hop_dists = hop_dists_k.clone()
+                        finite_hops = hop_matrix_device[hop_matrix_device < float('inf')]
+                        max_h = float(finite_hops.max().item()) if finite_hops.numel() > 0 else 50.0
+                        worker_in[:, 8] = torch.clamp(hop_dists.float() / max_h, 0.0, 1.0).reshape(-1)
+                    else:
+                        worker_in[:, 8] = 0.0
                     
                     # === 4. 활성 은닉 상태 슬라이싱 & Forward ===
                     h_active = h[active_idx]  # [K, H]
@@ -583,7 +593,8 @@ def train_sl(args):
                 
                 # [Robustness] Dynamic Token Definition
                 # [Refactor] Validation Embedding Gathering
-                node_emb_all = manager.topology_enc(batch.x, batch.edge_index)
+                mgr_edge_attr = batch.edge_attr[:, 0:1] if batch.edge_attr is not None else None
+                node_emb_all = manager.topology_enc(batch.x, batch.edge_index, edge_attr=mgr_edge_attr)
                 
                 # [Fix #6] import는 파일 상단으로 이동 완료
                 node_emb_dense, mask_dense = to_dense_batch(node_emb_all, batch.batch) # [B, N_max, H]
@@ -634,7 +645,9 @@ def train_sl(args):
                 # Soft Label Logic
                 real_node_mask = (targets_flat < N_max) & (targets_flat >= 0)
                 if real_node_mask.sum() > 0:
-                    log_probs = F.log_softmax(pointer_logits, dim=-1)
+                    # [Fix 5] EOS 토큰을 제외한 순수 공간 노드에 대해서만 log_softmax 적용
+                    logits_nodes = pointer_logits[..., :-1]
+                    log_probs_nodes = F.log_softmax(logits_nodes, dim=-1)
                     
                     real_mask_2d = (final_targets < N_max) & (final_targets >= 0)
                     safe_targets_2d = final_targets.clone()
@@ -645,8 +658,6 @@ def train_sl(args):
                     temperature = 1.0
                     soft_probs = F.softmax(-dists / temperature, dim=-1)
                     del dists  # [Fix #2] Validation Soft Label 중간 텐서 즉시 해제
-                    
-                    log_probs_nodes = log_probs[..., :-1]
                     kl_loss_raw = F.kl_div(log_probs_nodes, soft_probs, reduction='none', log_target=False)
                     kl_loss = (kl_loss_raw.sum(dim=-1) * real_mask_2d.float()).sum() / (real_mask_2d.sum() + 1e-6)
                 else:
@@ -694,6 +705,9 @@ def train_sl(args):
                     cached_edge_attr = base_edge_attr.repeat(val_num_graphs, 1)
                     cached_batch_vec = torch.arange(val_num_graphs, device=device).repeat_interleave(num_nodes_per_graph)
                     
+                    # [Fix 4] Subset 우회
+                    val_ds = wkr_val_loader.dataset.dataset if hasattr(wkr_val_loader.dataset, 'dataset') else wkr_val_loader.dataset
+                    
                     for step in range(max_seq_len):
                         # === 1. 활성 그래프 인덱스 도출 ===
                         active_mask = step < seq_lens
@@ -727,10 +741,13 @@ def train_sl(args):
                         worker_in[cached_offsets + tgt_nodes_k, 3] = 1.0
                         
                         # APSP 거리 피처
-                        if hasattr(wkr_val_loader.dataset, 'apsp_matrix'):
-                            max_dst = wkr_val_loader.dataset.max_dist
+                        val_ds = wkr_val_loader.dataset.dataset if hasattr(wkr_val_loader.dataset, 'dataset') else wkr_val_loader.dataset
+                        if hasattr(val_ds, 'apsp_matrix'):
+                            max_dst = val_ds.max_dist
                             active_dists = apsp_device_global[tgt_nodes_k] / max_dst
                             worker_in[:, 4] = active_dists.reshape(-1)
+                        else:
+                            worker_in[:, 4] = 0.0
                         
                         # 방향 벡터 피처
                         tgt_coords = compact_coords[cached_offsets + tgt_nodes_k]
@@ -742,9 +759,15 @@ def train_sl(args):
                         worker_in[:, 7] = is_final_target.repeat_interleave(num_nodes_per_graph)
 
                         # [Track 1] hop_dist 피처 (col 8)
-                        hop_dists = hop_apsp_device[tgt_nodes_k]  # [K, N]
-                        max_h = float(hop_apsp_device[hop_apsp_device < float('inf')].max().item()) if (hop_apsp_device < float('inf')).any() else 50.0
-                        worker_in[:, 8] = torch.clamp(hop_dists.float() / max_h, 0.0, 1.0).reshape(-1)
+                        if hasattr(val_ds, 'hop_matrix'):
+                            hop_matrix_device = val_ds.hop_matrix.to(device)
+                            hop_dists_k = hop_matrix_device[curr_nodes_k, tgt_nodes_k]
+                            hop_dists = hop_dists_k.clone()
+                            finite_hops = hop_matrix_device[hop_matrix_device < float('inf')]
+                            max_h = float(finite_hops.max().item()) if finite_hops.numel() > 0 else 50.0
+                            worker_in[:, 8] = torch.clamp(hop_dists.float() / max_h, 0.0, 1.0).reshape(-1)
+                        else:
+                            worker_in[:, 8] = 0.0
                         
                         # === 4. Forward ===
                         h_active = h[active_idx]
@@ -931,7 +954,18 @@ def train_sl(args):
                 
                 # is_final_target_phase: 1.0 if this step's subgoal is the final target
                 is_final = torch.full((num_nodes, 1), float(step == seq_len - 1), device=device)
-                worker_in = torch.cat([node_coords, flags, net_dist, direction, is_final], dim=1)
+                
+                # hop_dist
+                if hasattr(wkr_dataset, 'hop_matrix'):
+                    hop_apsp_device = wkr_dataset.hop_matrix.to(device)
+                    hop_dists = hop_apsp_device[tgt_node_idx]
+                    finite_hops = hop_apsp_device[hop_apsp_device < float('inf')]
+                    max_h = float(finite_hops.max().item()) if finite_hops.numel() > 0 else 50.0
+                    hop_dist_feat = torch.clamp(hop_dists.float() / max_h, 0.0, 1.0).unsqueeze(1)
+                else:
+                    hop_dist_feat = torch.zeros(num_nodes, 1, device=device)
+                    
+                worker_in = torch.cat([node_coords, flags, net_dist, direction, is_final, hop_dist_feat], dim=1)
                 
                 # [Fix] Phase 1: length만 사용 (edge_dim=1)
                 scores, h, c, _ = worker.predict_next_hop(worker_in, edge_index, h, c, batch_vec, edge_attr=pyg_data.edge_attr[:, 0:1].to(device))
@@ -1030,7 +1064,7 @@ def train_sl(args):
             cell = torch.zeros(1, args.hidden_dim, device=device)
             
             # [Fix C] 시뮬레이션 입력 텐서 사전 할당 (torch.cat 제거)
-            worker_in_sim = torch.zeros((num_nodes, 8), device=device)
+            worker_in_sim = torch.zeros((num_nodes, 9), device=device)
             worker_in_sim[:, :2] = node_coords_device  # 좌표는 변하지 않음
             
             for step in range(max_steps):
@@ -1070,6 +1104,14 @@ def train_sl(args):
                 diff = target_pos - node_coords_device
                 dist_euc = torch.norm(diff, dim=1, keepdim=True) + 1e-6
                 worker_in_sim[:, 5:7] = diff / dist_euc
+                
+                # hop_dist
+                if hasattr(env, 'hop_matrix'):
+                    hop_matrix_device = env.hop_matrix.to(device)
+                    hop_dists_sim = hop_matrix_device[subgoal]
+                    finite_hops = hop_matrix_device[hop_matrix_device < float('inf')]
+                    max_h_sim = float(finite_hops.max().item()) if finite_hops.numel() > 0 else 50.0
+                    worker_in_sim[:, 8] = torch.clamp(hop_dists_sim.float() / max_h_sim, 0.0, 1.0)
                 
                 # Worker 예측 (predict_next_hop API 사용)
                 scores, hid, cell, _ = worker.predict_next_hop(worker_in_sim, edge_index_device, hid, cell, batch_vec_sim, edge_attr=edge_attr_device)
