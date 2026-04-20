@@ -140,7 +140,7 @@ class DOMOTrainer:
         self.wkr_scheduler = None  # 언프리즈 시점에 설정
         
         avg_reward = 0
-        wkr_unfreeze_progress = 0.75  # 전체 에피소드의 75% 시점에서 동결 해제
+        wkr_unfreeze_progress = 0.50  # 전체 에피소드의 50% 시점에서 동결 해제
         wkr_unfreeze_ep = int(episodes * wkr_unfreeze_progress)
         pbar = tqdm(range(episodes), desc="RL", ncols=100)
         
@@ -152,8 +152,25 @@ class DOMOTrainer:
         success_ema = 0  # Exponential Moving Average
         
         for ep in pbar:
-            # [Fix: Micro Fine-Tuning] 진척도 75% 시점에 Worker 잠금 해제
+            # [Fix: Micro Fine-Tuning] 진척도 50% 시점에 Worker 잠금 해제
             if ep == wkr_unfreeze_ep:
+                # [Fix 2026-04-20] OOM 방지: Worker Unfreeze 전 메모리 확보
+                # Why: Worker의 LSTM/Scorer/Critic 역전파에 필요한 activations이
+                #      매 스텝마다 누적되어 기존 48 POMO로는 24GB GPU 메모리를 초과함.
+                self._save_unified_checkpoint(
+                    "pre_unfreeze.pt", ep,
+                    metric=success_ema, metric_name="success_ema",
+                )
+                torch.cuda.empty_cache()
+                # [Fix 2026-04-20] POMO 16으로 축소: 32에서도 OOM 발생
+                # Why: Worker LSTM (최대 170스텝) activations + Manager Aux CE가
+                #      32 POMO에서도 24GB를 초과함. 16이면 충분한 여유 확보.
+                prev_pomo = self.num_pomo
+                self.num_pomo = 24
+                pbar.write(
+                    f"[Ep {ep}] Worker Unfreeze: num_pomo {prev_pomo} → {self.num_pomo}, "
+                    f"CUDA cache cleared, checkpoint saved."
+                )
                 for p in self.worker.parameters():
                     p.requires_grad_(True)
                 wkr_lr_ft = 1e-5  # 마이크로 파인튜닝 학습률

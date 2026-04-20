@@ -28,9 +28,10 @@ class ManagerStageTrainer(DOMOTrainer):
                 'PLAN_ADJUST_MAX': 4.0,
             }
         )
-        # [Fix 2026-04-18] SL 지식 보호를 위해 gradient clipping 강화 (20→5)
-        # Why: 이전 실행에서 pre-clip norm이 100~800까지 폭등하여 가중치 파괴됨
-        self.mgr_max_grad_norm = 5.0
+        # [Fix 2026-04-20] Advantage 클리핑 도입으로 폭발 근본 완화 → grad clip 상한선 완화 (5→10)
+        # Why: clamp(plan_score, min=-2) + clamp(adv, -3, 3)이 이상치를 선제 차단하므로
+        #      grad norm이 자연스럽게 안정화됨. 5.0은 정상 RL 신호까지 차단할 위험 있음.
+        self.mgr_max_grad_norm = 10.0
         self.manager.to(self.device).train()
         for p in self.manager.parameters():
             p.requires_grad_(True)  # [Fix] Worker Stage에서 Freeze된 상태가 넘어올 수 있으므로 명시적 해제
@@ -44,10 +45,18 @@ class ManagerStageTrainer(DOMOTrainer):
         # Why: RL 신호가 불안정한 초기에 A* 교사 신호로 더 오래 안내해야 SL 지식 보존됨
         self.sparse_warmstart_ratio = 0.40
 
-    def _compute_manager_plan_score(self, plan_diag):
-        # [Fix 2026-04-18] Under 페널티를 유지하되, 정상 생성 보너스 추가
-        # Why: Under만 벌하면 Manager가 '무조건 많이 생성' 편향 → 적정 범위 진입 시 보너스로 유인
+    def _compute_manager_plan_score(
+        self,
+        plan_diag: dict,
+        goal_idx: int = None,
+        sequences: torch.Tensor = None,
+    ) -> dict:
+        """매니저 플랜 품질을 11개 보상 항목으로 채점한다.
+
+        기존 9개(r_count~r_empty) + 2개(r_feasibility, r_goal_reached) 추가.
+        """
         plan_lengths = plan_diag['plan_lengths']
+        valid_mask = plan_diag['valid_mask']
         under_count = torch.clamp(plan_diag['plan_len_min'] - plan_lengths, min=0.0)
         over_count = torch.clamp(plan_lengths - plan_diag['plan_len_max'], min=0.0)
         in_range = (plan_lengths >= plan_diag['plan_len_min']) & (plan_lengths <= plan_diag['plan_len_max'])
@@ -68,14 +77,53 @@ class ManagerStageTrainer(DOMOTrainer):
         r_first = -0.80 * torch.clamp(plan_diag['first_segment_budget_err'] - 1.0, min=0.0) - 0.40 * first_hop_excess
         corridor_deficit = torch.clamp(0.80 - plan_diag['corridor_ratio'], min=0.0)
         r_corr = -0.20 * corridor_deficit
-        # [Fix 2026-04-18] Empty plan 페널티 강화 (-2→-5)
-        # Why: EOS 즉시 출력 전략이 너무 저렴하여 Manager가 겁쟁이 편향을 학습함
         r_empty = torch.where(
             plan_lengths == 0,
             torch.full_like(plan_lengths, -5.0),
             torch.zeros_like(plan_lengths),
         )
-        plan_score = r_count + r_anchor + r_spacing + r_mono + r_budget + r_front + r_first + r_corr + r_empty
+
+        # =====================================================================
+        # [Step 2-a] 워커 실현 가능성 프록시 — 비활성화 (2026-04-20)
+        # Why: 이차 페널티(-0.1, -0.03 모두)가 "서브골을 줄여 페널티를 회피"하는
+        #      Under-Plan 부작용을 유발함 (Under 72.9%). 워커 실현 가능성 판단은
+        #      Joint Stage의 실제 워커 피드백에 위임하기로 결정.
+        #      Self-Teaching Quality Gate 호환을 위해 텐서는 zeros로 유지.
+        # =====================================================================
+        r_feasibility = torch.zeros_like(plan_lengths)
+
+        # =====================================================================
+        # [Step 2-b] 목적지 도달 양수 보너스 (Goal Proximity Reward)
+        # Why: 보상 체계가 페널티 위주(9개 중 7개 음수)여서 매니저가 소극적으로 수렴함.
+        #      마지막 서브골이 목적지에 근접할 때 강한 양수 보상을 주어 적극적 탐색 유도.
+        # =====================================================================
+        last_sg_goal_hops = torch.full_like(plan_lengths, float('inf'))
+        r_goal_reached = torch.zeros_like(plan_lengths)
+        if goal_idx is not None and sequences is not None:
+            safe_plan = sequences.clamp(min=0, max=max(self.env.num_nodes - 1, 0))
+            last_valid_indices = (plan_lengths - 1).clamp(min=0).long()
+            batch_indices = torch.arange(safe_plan.size(0), device=self.device)
+            last_valid_nodes = safe_plan[batch_indices, last_valid_indices]
+            last_sg_goal_hops = self.env.hop_matrix[
+                last_valid_nodes, int(goal_idx)
+            ].float()
+            # [Tuning 2026-04-20] 조건 완화: 홉≤1→+5는 너무 어려움.
+            #   홉≤3 → +5.0, 홉≤5 → +2.0으로 달성 가능성을 높여 양수 보상 빈도 증가.
+            r_goal_reached = torch.where(
+                (plan_lengths > 0) & (last_sg_goal_hops <= 3.0),
+                torch.full_like(plan_lengths, 5.0),
+                torch.where(
+                    (plan_lengths > 0) & (last_sg_goal_hops <= 5.0),
+                    torch.full_like(plan_lengths, 2.0),
+                    torch.zeros_like(plan_lengths),
+                ),
+            )
+
+        plan_score = (
+            r_count + r_anchor + r_spacing + r_mono + r_budget
+            + r_front + r_first + r_corr + r_empty
+            + r_feasibility + r_goal_reached
+        )
         return {
             'plan_score': plan_score,
             'r_count': r_count,
@@ -87,6 +135,9 @@ class ManagerStageTrainer(DOMOTrainer):
             'r_first': r_first,
             'r_corr': r_corr,
             'r_empty': r_empty,
+            'r_feasibility': r_feasibility,
+            'r_goal_reached': r_goal_reached,
+            'last_sg_goal_hops': last_sg_goal_hops,
         }
 
     def _append_manager_sample(self, ep, sequences, plan_diag, score_bundle, summary):
@@ -164,9 +215,14 @@ class ManagerStageTrainer(DOMOTrainer):
                 edge_attr=ea,
             )
             plan_diag = self._compute_plan_reward_adjustment(s0, g0, sequences)
-            score_bundle = self._compute_manager_plan_score(plan_diag)
+            score_bundle = self._compute_manager_plan_score(
+                plan_diag, goal_idx=g0, sequences=sequences,
+            )
             plan_score = score_bundle['plan_score']
-            normalized_plan_score = (plan_score - plan_score.mean()) / (plan_score.std(unbiased=False) + 1e-8)
+            # [Step 1] 이상치 클리핑 후 정규화 (r_empty=-5.0 등이 정규화를 오염하지 않도록)
+            clipped_score = torch.clamp(plan_score, min=-2.0)
+            adv_raw = (clipped_score - clipped_score.mean()) / (clipped_score.std(unbiased=False) + 1e-8)
+            normalized_plan_score = torch.clamp(adv_raw, -3.0, 3.0)
 
             max_len = sequences.size(1)
             target_seq = sequences.to(self.device)
@@ -204,6 +260,32 @@ class ManagerStageTrainer(DOMOTrainer):
                 aux_target_seq[:, :ref_token_count] = reference_anchor_nodes.unsqueeze(0).expand(self.num_pomo, -1)
             if ref_token_count < aux_seq_len:
                 aux_target_seq[:, ref_token_count] = num_nodes
+            # =================================================================
+            # [Step 3-a] POMO Best-of-N 자기 교사 (Dynamic Self-Teaching)
+            # Why: A* 고정 앵커에 과적합하면 워커에게 유리한 대안 경로를 탐색하지 못함.
+            #      Quality Gate를 통과한 최고 플랜을 일부 POMO 샘플의 교사로 주입.
+            # =================================================================
+            _progress = float(ep) / float(max(episodes - 1, 1))
+            if _progress >= 0.5:
+                best_idx = int(plan_score.argmax().item())
+                best_r_feas = float(score_bundle['r_feasibility'][best_idx].item())
+                best_dist = float(score_bundle['last_sg_goal_hops'][best_idx].item())
+                # Quality Gate: 워커 실현 가능 AND 목적지 3홉 이내
+                if best_r_feas > -0.5 and best_dist <= 3.0:
+                    self_teacher_ratio = min(0.5, (_progress - 0.5) * 1.0)
+                    num_replace = max(1, int(self.num_pomo * self_teacher_ratio))
+                    replace_indices = torch.randperm(self.num_pomo)[:num_replace]
+                    best_seq = sequences[best_idx].clone()
+                    best_valid = (best_seq >= 0) & (best_seq < self.env.num_nodes)
+                    best_len = int(best_valid.sum().item())
+                    for idx in replace_indices:
+                        aux_target_seq[idx, :] = self.manager.PAD_TOKEN
+                        if best_len > 0:
+                            copy_len = min(best_len, aux_seq_len - 1)
+                            aux_target_seq[idx, :copy_len] = best_seq[:copy_len]
+                        eos_pos = min(best_len, aux_seq_len - 1)
+                        aux_target_seq[idx, eos_pos] = num_nodes  # EOS
+
 
             aux_target_seq_emb = self._gather_manager_teacher_embeddings(full_ref_embs, aux_target_seq, num_nodes)
             aux_logits = self.manager(x_mgr_in, edge_index, batch_vec, aux_target_seq_emb, edge_attr=ea)
@@ -223,30 +305,67 @@ class ManagerStageTrainer(DOMOTrainer):
             mgr_entropy = -(mgr_probs * torch.log(mgr_probs + 1e-8)).sum(dim=-1)
             progress = float(ep) / float(max(episodes - 1, 1))
             warmstart_active = ep < warmstart_episodes
-            # [Fix 2026-04-18] RL 비중을 보수적으로 조정하여 SL 지식 보존
-            # Why: 이전 실행에서 RL 비중이 0.7까지 올라가자 Plan Score가 -10까지 역행
-            if progress < self.sparse_warmstart_ratio:
-                rl_weight = 0.0
-                aux_weight = 1.0
+            # =================================================================
+            # [Step 3-c] SL 가중치 동적 스케줄링 (Adaptive RL Transition)
+            # Why: 고정 40% 웜스타트는 A* 과적합(Exposure Bias)의 주범.
+            #      SL Loss가 충분히 낮아지면 조기에 RL 신호를 투입하여 자율성 확보.
+            # =================================================================
+            current_sl_loss = float(aux_ce_loss.item())
+            if progress > 0.15 and current_sl_loss < 0.5:
+                # SL이 빠르게 수렴했으면 RL 조기 투입 (최소 15% 웜스타트 보장)
+                if progress < 0.50:
+                    rl_weight, aux_weight = 0.35, 0.65
+                else:
+                    rl_weight, aux_weight = 0.50, 0.50
+            elif progress < self.sparse_warmstart_ratio:
+                rl_weight, aux_weight = 0.0, 1.0
             elif progress < 0.60:
-                rl_weight = 0.20
-                aux_weight = 0.80
+                rl_weight, aux_weight = 0.20, 0.80
             elif progress < 0.80:
-                rl_weight = 0.35
-                aux_weight = 0.65
+                rl_weight, aux_weight = 0.35, 0.65
             else:
-                rl_weight = 0.50
-                aux_weight = 0.50
-            policy_loss = -(normalized_plan_score.detach() * mgr_log_probs).mean()
-            entropy_bonus = -0.02 * (mgr_entropy * valid_mask).mean()
+                rl_weight, aux_weight = 0.50, 0.50
+
+            # =================================================================
+            # [Step 1] 안정적 REINFORCE + Entropy 보너스
+            # =================================================================
+            reinforce_loss = -(normalized_plan_score.detach() * mgr_log_probs).mean()
+
+            # =================================================================
+            # [Step 3-b] Contrastive Ranking Loss (50% 이후 활성화)
+            # Why: REINFORCE의 고분산 문제를 상위/하위 비교로 완화.
+            #      절대 점수가 아닌 상대 순서 학습으로 보상 스케일에 덜 민감.
+            # =================================================================
+            ranking_loss = torch.tensor(0.0, device=self.device)
+            ranking_weight = 0.0
+            if progress >= 0.5 and rl_weight > 0.0:
+                k = max(1, self.num_pomo // 4)  # 상/하위 25%
+                sorted_idx = plan_score.argsort(descending=True)
+                pos_lp = mgr_log_probs[sorted_idx[:k]].mean()
+                neg_lp = mgr_log_probs[sorted_idx[-k:]].mean()
+                ranking_loss = -F.logsigmoid(pos_lp - neg_lp)
+                # [Tuning 2026-04-20] 상한 0.3→0.15: Ranking이 SL 지식을 퇴화시킴
+                ranking_weight = min(0.15, 0.05 + (progress - 0.5) * 0.2)
+
+            # REINFORCE + Ranking 병합
+            policy_loss = (
+                (1.0 - ranking_weight) * reinforce_loss
+                + ranking_weight * ranking_loss
+            )
+
+            # [Step 1] Entropy 보너스: 초반 탐색 강화, 후반 수렴 유도
+            entropy_bonus = -0.05 * max(0.0, 1.0 - progress) * (mgr_entropy * valid_mask).mean()
+
             loss = rl_weight * policy_loss + aux_weight * aux_ce_loss + entropy_bonus
 
             self.mgr_opt.zero_grad()
             if loss.requires_grad:
                 loss.backward()
-                # [Fix] 확실한 그라디언트 추적을 위해 명시적으로 norm 계산
+                # [Fix 2026-04-20] 웜스타트(SL only)에서는 5.0, RL 투입 후에는 10.0
+                # Why: Advantage 클리핑이 없는 순수 SL에서 10.0은 SL 가중치를 파괴함
+                effective_grad_norm = 10.0 if rl_weight > 0.0 else 5.0
                 mgr_preclip_norm = float(
-                    torch.nn.utils.clip_grad_norm_(self.manager.parameters(), max_norm=self.mgr_max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(self.manager.parameters(), max_norm=effective_grad_norm)
                 )
                 self.mgr_opt.step()
             else:
