@@ -28,6 +28,7 @@ class WorkerLSTM(nn.Module):
         self.dropout = dropout
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.node_dim = node_dim
         
         # 1. Spatial Encoder (GATv2 + Residual)
         self.convs = nn.ModuleList()
@@ -83,6 +84,10 @@ class WorkerLSTM(nn.Module):
             detach_spatial: True이면 GATv2 출력을 detach (RL 학습 시 VRAM 절약)
             edge_attr: ③ 엣지 피처 [E, edge_dim] (None이면 edge feature 미사용)
         """
+        if x.size(1) < self.node_dim:
+            pad = torch.zeros(x.size(0), self.node_dim - x.size(1), device=x.device, dtype=x.dtype)
+            x = torch.cat([x, pad], dim=1)
+
         # === Spatial Encoding (GATv2 + Residual) ===
         if detach_spatial:
             # RL 학습: GATv2는 no_grad로 실행 → VRAM 절약
