@@ -6,7 +6,7 @@ from torch_geometric.nn import GATv2Conv
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 class WorkerLSTM(nn.Module):
-    def __init__(self, node_dim: int = 8, hidden_dim: int = 256, num_layers: int = 3, 
+    def __init__(self, node_dim: int = 9, hidden_dim: int = 256, num_layers: int = 3, 
                  dropout: float = 0.2, edge_dim: int = 5, num_scorer_heads: int = 4):
         """
         Worker: Local Navigation with Memory.
@@ -17,7 +17,7 @@ class WorkerLSTM(nn.Module):
         
         Args:
             node_dim: 노드 피처 차원
-                (8: [x, y, is_curr, is_tgt, net_dist, dir_x, dir_y, is_final_target_phase])
+                (9: [x, y, is_curr, is_tgt, net_dist, dir_x, dir_y, is_final_target_phase, hop_dist])
             hidden_dim: 은닉층 차원
             num_layers: GATv2 레이어 수
             dropout: Dropout 비율

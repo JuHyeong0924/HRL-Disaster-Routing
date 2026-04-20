@@ -162,7 +162,7 @@ def train_sl(args):
     ).to(device)
     
     worker = WorkerLSTM(
-        node_dim=8,  # [x, y, is_current, is_target, net_dist, dir_x, dir_y, is_final_target_phase]
+        node_dim=9,  # [x, y, is_current, is_target, net_dist, dir_x, dir_y, is_final_target_phase, hop_dist]
         hidden_dim=args.hidden_dim,
         edge_dim=1
     ).to(device)
@@ -464,7 +464,7 @@ def train_sl(args):
                     # in-place 수정 대신 매 스텝 새 텐서 생성 (CUDA 캐싱 풀이 크기 동일 시 즉시 재할당)
                     compact_coords = node_coords_per_graph[active_idx].reshape(K * num_nodes_per_graph, 2)
                     
-                    worker_in = torch.zeros((K * num_nodes_per_graph, 8), device=device)
+                    worker_in = torch.zeros((K * num_nodes_per_graph, 9), device=device)
                     worker_in[:, :2] = compact_coords
                     worker_in[cached_offsets + curr_nodes_k, 2] = 1.0  # is_current
                     worker_in[cached_offsets + tgt_nodes_k, 3] = 1.0   # is_target
@@ -483,6 +483,11 @@ def train_sl(args):
                     worker_in[:, 5:7] = diff / norm_val
                     is_final_target = (act_step == (seq_lens[active_idx] - 1)).float()
                     worker_in[:, 7] = is_final_target.repeat_interleave(num_nodes_per_graph)
+
+                    # [Track 1] hop_dist 피처 (col 8): 서브골까지의 정규화된 홉 거리
+                    hop_dists = hop_apsp_device[tgt_nodes_k]  # [K, N]
+                    max_h = float(hop_apsp_device[hop_apsp_device < float('inf')].max().item()) if (hop_apsp_device < float('inf')).any() else 50.0
+                    worker_in[:, 8] = torch.clamp(hop_dists.float() / max_h, 0.0, 1.0).reshape(-1)
                     
                     # === 4. 활성 은닉 상태 슬라이싱 & Forward ===
                     h_active = h[active_idx]  # [K, H]
@@ -716,7 +721,7 @@ def train_sl(args):
                         # === 3. 컴팩트 GNN 입력 (새 텐서 생성) ===
                         compact_coords = node_coords_per_graph[active_idx].reshape(K * num_nodes_per_graph, 2)
                         
-                        worker_in = torch.zeros((K * num_nodes_per_graph, 8), device=device)
+                        worker_in = torch.zeros((K * num_nodes_per_graph, 9), device=device)
                         worker_in[:, :2] = compact_coords
                         worker_in[cached_offsets + curr_nodes_k, 2] = 1.0
                         worker_in[cached_offsets + tgt_nodes_k, 3] = 1.0
@@ -735,6 +740,11 @@ def train_sl(args):
                         worker_in[:, 5:7] = diff / norm_val
                         is_final_target = (act_step == (seq_lens[active_idx] - 1)).float()
                         worker_in[:, 7] = is_final_target.repeat_interleave(num_nodes_per_graph)
+
+                        # [Track 1] hop_dist 피처 (col 8)
+                        hop_dists = hop_apsp_device[tgt_nodes_k]  # [K, N]
+                        max_h = float(hop_apsp_device[hop_apsp_device < float('inf')].max().item()) if (hop_apsp_device < float('inf')).any() else 50.0
+                        worker_in[:, 8] = torch.clamp(hop_dists.float() / max_h, 0.0, 1.0).reshape(-1)
                         
                         # === 4. Forward ===
                         h_active = h[active_idx]

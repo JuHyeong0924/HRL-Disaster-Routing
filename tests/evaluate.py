@@ -929,7 +929,7 @@ def load_models_for_rollout(
         enable_disaster=disaster,
     )
 
-    worker = WorkerLSTM(node_dim=8, hidden_dim=hidden_dim, edge_dim=1).to(device)
+    worker = WorkerLSTM(node_dim=9, hidden_dim=hidden_dim, edge_dim=1).to(device)
 
     if checkpoint_info["source"] == "apte_phase1":
         manager = None

@@ -136,7 +136,10 @@ class DisasterEnv:
             if self.verbose: print(f"💾 Saved APSP matrices to cache: {cache_path}")
         
         self.max_dist = self.apsp_matrix.max().item()
-        if self.verbose: print(f"✅ APSP Matrix Ready. Max Network Distance: {self.max_dist:.2f} km")
+        # [Track 1] 최대 홉 수 캐싱 (hop_dist 정규화용)
+        finite_hops = self.hop_matrix[self.hop_matrix < float('inf')]
+        self.max_hops = float(finite_hops.max().item()) if finite_hops.numel() > 0 else 50.0
+        if self.verbose: print(f"✅ APSP Matrix Ready. Max Network Distance: {self.max_dist:.2f} km, Max Hops: {self.max_hops:.0f}")
 
         # 위치 정보 텐서화 (NumNodes, 2)
         self.pos_tensor = torch.zeros((self.num_nodes, 2), dtype=torch.float, device=self.device)
@@ -217,7 +220,9 @@ class DisasterEnv:
         self.curriculum_ratio = max(0.0, min(1.0, ratio))
     
 
-    def reset(self, batch_size=1, sync_problem=False):
+    def reset(self, batch_size=1, sync_problem=False,
+             forced_start=None, forced_target=None):
+        # forced_start/forced_target: [Track 2] Hard Mining용 OD 강제 지정 (num_problems,) 텐서
         """
         Hybrid Reset with RoboCue-X Physics & Curriculum
         sync_problem: If True, all batch items share the SAME Start/Goal (For POMO).
@@ -452,8 +457,13 @@ class DisasterEnv:
             # 4. Start/Target & Curriculum Learning (POMO Optimized)
             num_problems = 1 if sync_problem else batch_size
             
-            start_nodes = torch.randint(0, self.num_nodes, (num_problems,), device=self.device)
-            target_nodes = torch.randint(0, self.num_nodes, (num_problems,), device=self.device)
+            # [Track 2] Hard Mining: forced OD 쌍이 주어지면 사용, 아니면 랜덤
+            if forced_start is not None and forced_target is not None:
+                start_nodes = forced_start.to(self.device)[:num_problems]
+                target_nodes = forced_target.to(self.device)[:num_problems]
+            else:
+                start_nodes = torch.randint(0, self.num_nodes, (num_problems,), device=self.device)
+                target_nodes = torch.randint(0, self.num_nodes, (num_problems,), device=self.device)
             
             # [Curriculum]
             min_dist_limit = self.max_dist * 0.8 * self.curriculum_ratio
@@ -538,8 +548,13 @@ class DisasterEnv:
             
             f_final_target = torch.ones((batch_size * self.num_nodes, 1), device=self.device)
 
-            # Concat: [x, y, is_cur, is_tgt, visit, dist, dir_x, dir_y, is_final_target_phase] -> 9 Channels
-            x_feat = torch.cat([x_base, f_robot, f_target, f_visit, f_dist, f_dir, f_final_target], dim=1)
+            # [Track 1] hop_dist 피처: 서브골(target)까지의 정규화된 홉 거리
+            hop_dists = self.hop_matrix[target_nodes]  # [Batch, N]
+            hop_dists_norm = torch.clamp(hop_dists.float() / self.max_hops, 0.0, 1.0)
+            f_hop_dist = hop_dists_norm.view(-1, 1)
+
+            # Concat: [x, y, is_cur, is_tgt, visit, dist, dir_x, dir_y, is_final_target_phase, hop_dist] -> 10 Channels
+            x_feat = torch.cat([x_base, f_robot, f_target, f_visit, f_dist, f_dir, f_final_target, f_hop_dist], dim=1)
             
             offsets = (torch.arange(batch_size, device=self.device) * self.num_nodes).view(batch_size, 1, 1)
             batch_edge_index = (self.base_edge_index.unsqueeze(0) + offsets).view(2, -1)
@@ -624,6 +639,11 @@ class DisasterEnv:
             is_final_target_phase = torch.ones(self.batch_size, device=self.device)
         final_target_feat = is_final_target_phase.float().unsqueeze(1).expand(-1, self.num_nodes).reshape(-1, 1)
         self.pyg_data.x[:, 8:9] = final_target_feat
+
+        # [Track 1] hop_dist 업데이트 (col 9)
+        hop_dists = self.hop_matrix[new_targets]  # [Batch, N]
+        hop_dists_norm = torch.clamp(hop_dists.float() / self.max_hops, 0.0, 1.0)
+        self.pyg_data.x[:, 9] = hop_dists_norm.view(-1)
 
     def step(self, next_node_idx):
         # 1. Update Energy (SOC)
@@ -811,6 +831,16 @@ class DisasterEnv:
         # Scale: 0.1 per km
         dist_improvement = (prev_net_dist - curr_net_dist) * 0.1
         step_rewards[active_mask] += dist_improvement[active_mask]
+
+        # [Track 1] Hop-based Dense Reward (Potential-based Shaping)
+        # Why: km 거리보다 홉 거리가 워커의 행동 단위와 직접 대응하여 더 효과적
+        # 가까워지면 +0.1, 멀어지면 -0.1 (누적 상쇄 → Reward Hacking 원천 차단)
+        curr_hops = self.hop_matrix[curr_nodes, self.target_node.unsqueeze(1)]  # [Batch, Seq]
+        prev_hops = torch.cat([curr_hops[:, 0:1] + 1.0, curr_hops[:, :-1]], dim=1)
+        hop_improvement = (prev_hops - curr_hops) * 0.1
+        # inf 값 방어 (target에 도달 불가능한 경우)
+        hop_improvement = torch.where(torch.isinf(hop_improvement), torch.zeros_like(hop_improvement), hop_improvement)
+        step_rewards[active_mask] += hop_improvement[active_mask]
         
         # 7. Loop Penalty (Progressive)
         # [Vectorized Optimization]

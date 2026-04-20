@@ -41,14 +41,16 @@ def _load_state_compat(module, state_dict, module_name):
                 and value.ndim == 2
                 and target_value.ndim == 2
                 and value.shape[0] == target_value.shape[0]
-                and value.shape[1] == 7
-                and target_value.shape[1] == 8
+                and value.shape[1] < target_value.shape[1]
             ):
+                # 레거시 체크포인트 적응 (7dim→8dim→9dim)
+                old_dim = value.shape[1]
+                new_dim = target_value.shape[1]
                 padded = target_value.clone()
                 padded.zero_()
-                padded[:, :7] = value.to(device=target_value.device, dtype=target_value.dtype)
+                padded[:, :old_dim] = value.to(device=target_value.device, dtype=target_value.dtype)
                 compatible[key] = padded
-                adapted.append(key)
+                adapted.append(f"{key}({old_dim}→{new_dim})")
                 continue
             skipped.append(
                 f"{key}(shape {tuple(value.shape)} -> {tuple(target_value.shape)})"
@@ -58,8 +60,8 @@ def _load_state_compat(module, state_dict, module_name):
     module.load_state_dict(compatible, strict=False)
     if adapted:
         print(
-            "🔁 Adapted legacy worker checkpoint from 7-dim input to 8-dim input "
-            f"for {len(adapted)} input-layer weights."
+            f"🔁 Adapted legacy worker checkpoint input dims "
+            f"for {len(adapted)} weights: {', '.join(adapted[:3])}"
         )
     # [Refactor: Task 2] Critic 2-Layer MLP 변경 시 키 불일치 명시적 감지
     critic_skipped = [k for k in skipped if "critic" in k.split("(")[0]]
@@ -197,7 +199,7 @@ def _init_env_and_models(args):
 
     # Phase 1: edge_dim=1 (length만 사용. A*/APSP 학습 신호와 일치하는 유일한 엣지 피처)
     manager = GraphTransformerManager(node_dim=4, hidden_dim=args.hidden_dim, dropout=0.2, edge_dim=1).to(device)
-    worker = WorkerLSTM(node_dim=8, hidden_dim=args.hidden_dim, edge_dim=1).to(device)
+    worker = WorkerLSTM(node_dim=9, hidden_dim=args.hidden_dim, edge_dim=1).to(device)
 
     # 배치 크기 고정 적용 (VRAM 스케일러 제거됨)
     args.num_pomo = int(args.num_pomo) if str(args.num_pomo).isdigit() else 48
@@ -279,6 +281,109 @@ def _run_single_stage(args, env, manager, worker, device, stage: str,
     print(f"   저장 위치: {config.save_dir}")
 
 
+def _run_parallel_phase1(args) -> None:
+    """Worker(GPU 0) + Manager(GPU 1) 병렬 → Joint 순차 실행.
+
+    Why: Worker와 Manager는 완전 독립이므로 각 GPU에서 동시 학습 가능.
+         Manager는 학습 난이도가 높으므로 에피소드를 2배로 설정.
+    """
+    import subprocess
+    import sys
+
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if num_gpus < 2:
+        print("⚠️ GPU가 2개 미만입니다. phase1(순차)로 대체합니다.")
+        args.stage = "phase1"
+        train_rl(args)
+        return
+
+    worker_eps = args.episodes
+    manager_eps = args.episodes * 2  # Manager는 2배 에피소드
+    joint_eps = args.episodes
+
+    print(f"\n{'='*60}")
+    print("🔀 Phase 1 Parallel: Worker(GPU 0) ∥ Manager(GPU 1) → Joint")
+    print(f"{'='*60}")
+    print(f"  Worker:  {worker_eps:,} eps on GPU 0")
+    print(f"  Manager: {manager_eps:,} eps on GPU 1")
+    print(f"  Joint:   {joint_eps:,} eps (완료 후)")
+    print()
+
+    # 공통 인자 구성
+    base_args = [
+        sys.executable, "train_rl.py",
+        "--map", args.map,
+        "--hidden_dim", str(args.hidden_dim),
+        "--lr", str(args.lr),
+        "--num_pomo", str(args.num_pomo),
+    ]
+    if args.debug:
+        base_args.append("--debug")
+
+    # Worker subprocess (GPU 0)
+    worker_cmd = base_args + [
+        "--stage", "worker",
+        "--episodes", str(worker_eps),
+    ]
+    worker_env = {**os.environ, "CUDA_VISIBLE_DEVICES": "0"}
+
+    # Manager subprocess (GPU 1)
+    manager_cmd = base_args + [
+        "--stage", "manager",
+        "--episodes", str(manager_eps),
+    ]
+    manager_env = {**os.environ, "CUDA_VISIBLE_DEVICES": "1"}
+
+    print(f"🚀 Worker  시작 (GPU 0, {worker_eps:,} eps)...")
+    print(f"🚀 Manager 시작 (GPU 1, {manager_eps:,} eps)...")
+    print()
+
+    # 두 프로세스 동시 실행
+    worker_proc = subprocess.Popen(
+        worker_cmd, env=worker_env,
+        cwd=os.getcwd(),
+        stdout=sys.stdout, stderr=sys.stderr,
+    )
+    manager_proc = subprocess.Popen(
+        manager_cmd, env=manager_env,
+        cwd=os.getcwd(),
+        stdout=sys.stdout, stderr=sys.stderr,
+    )
+
+    # 두 프로세스 완료 대기
+    worker_rc = worker_proc.wait()
+    print(f"\n✅ Worker  완료 (exit code: {worker_rc})")
+
+    manager_rc = manager_proc.wait()
+    print(f"✅ Manager 완료 (exit code: {manager_rc})")
+
+    if worker_rc != 0 or manager_rc != 0:
+        print("❌ Worker 또는 Manager 학습이 실패했습니다. Joint를 건너뜁니다.")
+        return
+
+    # Joint 실행 (GPU 0)
+    print(f"\n{'='*60}")
+    print(f"🔗 Joint Stage 시작 ({joint_eps:,} eps on GPU 0)")
+    print(f"{'='*60}\n")
+
+    joint_cmd = base_args + [
+        "--stage", "joint",
+        "--episodes", str(joint_eps),
+    ]
+    joint_env = {**os.environ, "CUDA_VISIBLE_DEVICES": "0"}
+    joint_rc = subprocess.call(
+        joint_cmd, env=joint_env,
+        cwd=os.getcwd(),
+    )
+
+    if joint_rc == 0:
+        print(f"\n{'='*60}")
+        print("🎉 Phase 1 Parallel 전체 학습 완료!")
+        print(f"{'='*60}")
+    else:
+        print(f"\n❌ Joint 학습 실패 (exit code: {joint_rc})")
+
+
 def train_rl(args):
     if args.disaster:
         raise ValueError(
@@ -286,11 +391,14 @@ def train_rl(args):
             "Use --stage phase1 for worker→manager→joint pipeline."
         )
 
+    if args.stage == "phase1_parallel":
+        _run_parallel_phase1(args)
+        return
+
     env, manager, worker, device = _init_env_and_models(args)
 
     if args.stage == "phase1":
         # Phase 1: worker → manager → joint 자동 순차 실행
-        # 각 단계별로 입력받은 episodes만큼 독립적으로 실행 (총 3 * episodes)
         worker_eps = args.episodes
         manager_eps = args.episodes
         joint_eps = args.episodes
@@ -322,8 +430,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stage",
         default="phase1",
-        choices=["manager", "worker", "joint", "phase1"],
-        help="학습 단계: manager→worker→joint 커리큘럼 또는 phase1(APTE)",
+        choices=["manager", "worker", "joint", "phase1", "phase1_parallel"],
+        help="학습 단계: phase1(순차), phase1_parallel(Worker∥Manager→Joint)",
     )
     parser.add_argument("--wkr_lr_floor", type=float, default=1e-5,
                         help="Worker 최소 학습률 (기본 1e-5)")  # [Refactor: Task 5]
@@ -337,7 +445,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="디버그 모드: 주기적으로 APTE phase1 지표를 상세 로그로 출력",
+        help="디버그 모드: 주기적으로 단계별 지표를 상세 로그로 출력",
     )
     parser.add_argument(
         "--force_joint",

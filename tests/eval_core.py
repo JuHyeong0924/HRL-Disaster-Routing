@@ -129,14 +129,15 @@ def load_worker_state_compat(
             continue
         target = current[key]
         if target.shape != val.shape:
-            # 7-dim → 8-dim 입력 레이어 적응
+            # 레거시 체크포인트 적응 (7dim→8dim→9dim)
             if (key in adapt_keys and val.ndim == 2 and target.ndim == 2
                     and val.shape[0] == target.shape[0]
-                    and val.shape[1] == 7 and target.shape[1] == 8):
+                    and val.shape[1] < target.shape[1]):
+                old_dim = val.shape[1]
                 padded = target.clone().zero_()
-                padded[:, :7] = val.to(device=target.device, dtype=target.dtype)
+                padded[:, :old_dim] = val.to(device=target.device, dtype=target.dtype)
                 compatible[key] = padded
-                adapted.append(key)
+                adapted.append(f"{key}({old_dim}→{target.shape[1]})")
                 continue
             skipped.append(f"{key}({tuple(val.shape)}->{tuple(target.shape)})")
             continue  # shape 불일치 시 스킵
@@ -144,7 +145,7 @@ def load_worker_state_compat(
     worker.load_state_dict(compatible, strict=False)
     if verbose:
         if adapted:
-            print(f"  ⚙️ Worker 7→8dim 적응: {len(adapted)}개 키")
+            print(f"  ⚙️ Worker dim 적응: {', '.join(adapted[:3])}")
         if skipped:
             preview = ", ".join(skipped[:4])
             suffix = "..." if len(skipped) > 4 else ""
@@ -168,7 +169,7 @@ def load_checkpoint(
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Phase 1: edge_dim=1 (length만 사용)
-    worker = WorkerLSTM(node_dim=8, hidden_dim=hidden_dim, edge_dim=1).to(device)
+    worker = WorkerLSTM(node_dim=9, hidden_dim=hidden_dim, edge_dim=1).to(device)
     if isinstance(payload, dict) and "worker_state" in payload:
         load_worker_state_compat(worker, payload["worker_state"])
     else:
@@ -190,10 +191,10 @@ def load_checkpoint(
 # ============================================================
 
 def ensure_env_layout(env: DisasterEnv) -> None:
-    """환경 노드 피처가 9채널인지 확인하고, 부족하면 패딩한다."""
+    """환경 노드 피처가 10채널인지 확인하고, 부족하면 패딩한다."""
     x = env.pyg_data.x
-    if x.size(1) < 9:
-        pad = torch.zeros(x.size(0), 9 - x.size(1), device=x.device, dtype=x.dtype)
+    if x.size(1) < 10:
+        pad = torch.zeros(x.size(0), 10 - x.size(1), device=x.device, dtype=x.dtype)
         env.pyg_data.x = torch.cat([x, pad], dim=1)
 
 
@@ -284,15 +285,15 @@ def select_edge_attr(edge_attr: Optional[torch.Tensor]) -> Optional[torch.Tensor
 
 
 def build_worker_input(env_x: torch.Tensor) -> torch.Tensor:
-    """환경 x(9채널)에서 Worker 입력(8채널)으로 변환한다.
+    """환경 x(10채널)에서 Worker 입력(9채널)으로 변환한다.
 
     Why: Worker는 visit_count(채널4)를 사용하지 않음.
     """
     raw = env_x
-    if raw.size(1) < 9:
-        pad = torch.zeros(raw.size(0), 9 - raw.size(1), device=raw.device)
+    if raw.size(1) < 10:
+        pad = torch.zeros(raw.size(0), 10 - raw.size(1), device=raw.device)
         raw = torch.cat([raw, pad], dim=1)
-    return torch.cat([raw[:, :4], raw[:, 5:9]], dim=1)
+    return torch.cat([raw[:, :4], raw[:, 5:10]], dim=1)
 
 
 def safe_softmax(scores: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:

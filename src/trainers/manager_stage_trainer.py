@@ -45,6 +45,10 @@ class ManagerStageTrainer(DOMOTrainer):
         # Why: RL 신호가 불안정한 초기에 A* 교사 신호로 더 오래 안내해야 SL 지식 보존됨
         self.sparse_warmstart_ratio = 0.40
 
+        # [Track 2] Hard Example Mining 버퍼
+        from collections import deque
+        self.hard_buffer = deque(maxlen=2048)
+
     def _compute_manager_plan_score(
         self,
         plan_diag: dict,
@@ -119,11 +123,16 @@ class ManagerStageTrainer(DOMOTrainer):
                 ),
             )
 
-        plan_score = (
-            r_count + r_anchor + r_spacing + r_mono + r_budget
-            + r_front + r_first + r_corr + r_empty
-            + r_feasibility + r_goal_reached
-        )
+        # =====================================================================
+        # [Track 2] 보상 Soft Diet
+        # 메인 보상 3개 (가중치 1.0): r_goal_reached + r_corr + r_spacing
+        # Soft 가드레일 (가중치 0.1): Over-Plan 및 예산 일탈 방어
+        # Fatal 페널티 (가중치 1.0): 빈 플랜 절대 금지
+        # =====================================================================
+        r_main = r_goal_reached + r_corr + r_spacing
+        r_soft = 0.1 * (r_count + r_anchor + r_mono + r_budget + r_front + r_first)
+        r_fatal = r_empty  # + r_feasibility (이미 zeros)
+        plan_score = r_main + r_soft + r_fatal
         return {
             'plan_score': plan_score,
             'r_count': r_count,
@@ -194,7 +203,18 @@ class ManagerStageTrainer(DOMOTrainer):
             self._collect_debug_this_episode = self._should_collect_debug(ep, episodes)
             curriculum_ratio = min(1.0, ep / max(episodes * 0.8, 1.0))
             self.env.set_curriculum_ratio(curriculum_ratio)
-            self.env.reset(batch_size=self.num_pomo, sync_problem=True)
+
+            # [Track 2] Hard Example Mining: 25% 확률로 실패한 OD 쌍 재출제
+            import random
+            use_hard = (len(self.hard_buffer) >= self.num_pomo and random.random() < 0.25)
+            if use_hard:
+                hard_samples = random.sample(list(self.hard_buffer), 1)  # sync_problem이므로 1개만
+                fs = torch.tensor([s[0] for s in hard_samples], device=self.device)
+                ft = torch.tensor([s[1] for s in hard_samples], device=self.device)
+                self.env.reset(batch_size=self.num_pomo, sync_problem=True,
+                              forced_start=fs, forced_target=ft)
+            else:
+                self.env.reset(batch_size=self.num_pomo, sync_problem=True)
 
             s0 = self.env.current_node[0].item()
             g0 = self.env.target_node[0].item()
@@ -219,6 +239,13 @@ class ManagerStageTrainer(DOMOTrainer):
                 plan_diag, goal_idx=g0, sequences=sequences,
             )
             plan_score = score_bundle['plan_score']
+
+            # [Track 2] Hard Example Mining: 점수가 낮은 OD 쌍을 버퍼에 저장
+            with torch.no_grad():
+                best_score = plan_score.max().item()
+                if best_score < 0.0:
+                    self.hard_buffer.append((s0, g0))
+
             # [Step 1] 이상치 클리핑 후 정규화 (r_empty=-5.0 등이 정규화를 오염하지 않도록)
             clipped_score = torch.clamp(plan_score, min=-2.0)
             adv_raw = (clipped_score - clipped_score.mean()) / (clipped_score.std(unbiased=False) + 1e-8)
@@ -380,7 +407,11 @@ class ManagerStageTrainer(DOMOTrainer):
 
             plan_score_mean = plan_score.mean().item()
             plan_len_mean = plan_diag['plan_lengths'].mean().item()
-            pbar.set_postfix({'Score': f"{plan_score_mean:.2f}", 'Plan': f"{plan_len_mean:.1f}"})
+            pbar.set_postfix({
+                'QualEMA': f"{quality_ema*100:.1f}%",
+                'Score': f"{plan_score_mean:.2f}",
+                'Plan': f"{plan_len_mean:.1f}",
+            })
 
             history['rewards'].append(plan_score_mean)
             history['losses'].append(loss.item())
@@ -495,8 +526,14 @@ class ManagerStageTrainer(DOMOTrainer):
                     f"  NLL/Entropy/Aux: {row['mgr_nll']:.3f} / {row['mgr_entropy']:.3f} / {row['aux_ce_loss']:.3f}",
                     f"  Warmstart/Weights: {bool(warmstart_active)} / RL {row['policy_weight']:.2f} / Aux {row['aux_weight']:.2f}",
                 ]
-                for line in lines:
-                    pbar.write(line)
+                # [터미널 출력 정리] 핵심 지표 1줄만 터미널에 표시, 상세는 파일에만 기록
+                compact = (
+                    f"  📊 QualEMA={quality_ema*100:.1f}% | "
+                    f"Under/Over={row['plan_under_rate']*100:.0f}/{row['plan_over_rate']*100:.0f}% | "
+                    f"Corr={row['corridor_ratio_mean']*100:.0f}% | "
+                    f"AnchorNear={row['anchor_near_rate']*100:.0f}%"
+                )
+                pbar.write(compact)
                 with open(self._debug_log_path, 'a', encoding='utf-8') as f:
                     for line in lines:
                         f.write(line + "\n")

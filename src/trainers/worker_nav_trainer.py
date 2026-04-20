@@ -150,16 +150,18 @@ class WorkerNavTrainer(DOMOTrainer):
 
     def _build_worker_input(self):
         x = self.env.pyg_data.x
-        if x.size(1) < 9:
+        if x.size(1) < 10:
             pad = torch.zeros(
                 x.size(0),
-                9 - x.size(1),
+                10 - x.size(1),
                 device=x.device,
                 dtype=x.dtype,
             )
             x = torch.cat([x, pad], dim=1)
             self.env.pyg_data.x = x
-        return torch.cat([x[:, :4], x[:, 5:9]], dim=1)
+        # Env X: [x, y, is_curr(2), is_tgt(3), visit(4), dist(5), dir_x(6), dir_y(7), is_final_target_phase(8), hop_dist(9)]
+        # visit 제외 -> [x, y, is_curr, is_tgt, dist, dir_x, dir_y, is_final, hop] (9 channels)
+        return torch.cat([x[:, :4], x[:, 5:]], dim=1)
 
     def _hidden_bonus_weight(self, episode_idx):
         if int(episode_idx) < self.guidance_schedule_ep_1:
@@ -814,7 +816,7 @@ class WorkerNavTrainer(DOMOTrainer):
             self._init_debug_outputs()
             with open(self._debug_log_path, "w", encoding="utf-8") as f:
                 f.write(
-                    f"=== APTE Phase1 Debug Log (LR={self.config.lr}, POMO={self.num_pomo}) ===\n\n"
+                    f"=== Worker Stage Debug Log (LR={self.config.lr}, POMO={self.num_pomo}) ===\n\n"
                 )
 
         # min → max 변경: LR이 wkr_lr_floor 이하로 떨어지지 않도록 하한선 보장
@@ -839,12 +841,13 @@ class WorkerNavTrainer(DOMOTrainer):
             self.env.set_curriculum_ratio(min(1.0, ep / max(int(episodes * 0.8), 1)))
             self.env.reset(batch_size=self.num_pomo, sync_problem=True)
 
-            total_loss, diag = self._execute_goal_conditioned_rollout(ep, episodes)
-            if not total_loss.requires_grad:
-                raise RuntimeError("APTE phase1 total_loss does not require grad.")
-
             self.wkr_opt.zero_grad(set_to_none=True)
-            total_loss.backward()
+            
+            if getattr(total_loss, 'requires_grad', False):
+                total_loss.backward()
+            else:
+                # 활성 스텝이 0인 코너케이스: backward 생략
+                pass
             grad_pre = self._compute_grad_norm(self.worker.parameters())
             grad_post = grad_pre
             clip_hit = 0.0
@@ -966,4 +969,4 @@ class WorkerNavTrainer(DOMOTrainer):
         best_path = os.path.join(self.save_dir, "best.pt")
         if os.path.exists(best_path):
             os.remove(best_path)
-        self._plot_rl_curves(rl_history, title="APTE Phase1 Learning Curves")
+        self._plot_rl_curves(rl_history, title="Worker Stage Learning Curves")

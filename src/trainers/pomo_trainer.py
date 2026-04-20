@@ -489,9 +489,10 @@ class DOMOTrainer:
             
             if ep % self.debug_interval == 0:
                 wkr_lr_val = self.wkr_scheduler.get_last_lr()[0] if self.wkr_scheduler is not None else 0.0
-                pbar.write(f"[Ep {ep}] Mgr LR: {self.mgr_scheduler.get_last_lr()[0]:.6f}, Wkr LR: {wkr_lr_val:.6f}, SuccessEMA: {success_ema*100:.1f}%, Loss: {loss.item():.2f}")
+                # 터미널에는 핵심 1줄만 출력
+                pbar.write(f"[Ep {ep}] EMA={success_ema*100:.1f}% | Loss={loss.item():.2f} | MgrLR={self.mgr_scheduler.get_last_lr()[0]:.1e} | WkrLR={wkr_lr_val:.1e}")
                 
-                # [Diagnostic] 디버그 모드에서 상세 진단 로그 출력 + 파일 저장
+                # [Diagnostic] 디버그 모드: 상세 로그는 파일에만 기록, 터미널 출력 생략
                 if self.debug_mode and self._debug_window:
                     self._emit_debug_window(
                         ep=ep,
@@ -1839,9 +1840,17 @@ class DOMOTrainer:
             f"  └────────────────────────",
         ]
 
-        for line in lines:
-            pbar.write(line)
+        # [터미널 출력 정리] 상세 로그는 파일에만 기록, 터미널에는 핵심 지표 1줄만 표시
+        compact_line = (
+            f"  📊 SR={summary['success_rate']*100:.1f}% | "
+            f"Plan={summary['plan_density_mean']:.3f} | "
+            f"Corr={summary['corridor_mean']*100:.0f}% | "
+            f"Under/Over={summary['plan_under_rate']*100:.0f}/{summary['plan_over_rate']*100:.0f}% | "
+            f"Hit@1={summary['subgoal_rank1_rate']*100:.0f}%"
+        )
+        pbar.write(compact_line)
 
+        # 상세 로그는 파일에만 기록
         with open(self._debug_log_path, 'a', encoding='utf-8') as f:
             f.write(f"[Ep {ep}] SuccessEMA: {success_ema*100:.1f}%, Loss: {current_loss:.2f}\n")
             for line in lines:
@@ -2269,10 +2278,10 @@ class DOMOTrainer:
             goal_finish_window = in_post_last_subgoal_phase & (steps_after_last_subgoal < POST_HANDOFF_WINDOW)
 
             # Worker Action (Gradient 유지)
-            # Env X: [x, y, is_curr(2), is_tgt(3), visit(4), dist(5), dir_x(6), dir_y(7), is_final_target_phase(8)]
-            # Worker: [x, y, is_curr, is_tgt, dist, dir_x, dir_y, is_final_target_phase] (visit 제외 = 8채널)
+            # Env X: [x, y, is_curr(2), is_tgt(3), visit(4), dist(5), dir_x(6), dir_y(7), is_final_target_phase(8), hop_dist(9)]
+            # Worker: [x, y, is_curr, is_tgt, dist, dir_x, dir_y, is_final_target_phase, hop_dist] (visit 제외 = 9채널)
             env_x = self.env.pyg_data.x
-            wkr_in = torch.cat([env_x[:, :4], env_x[:, 5:]], dim=1) # [B*N, 8]
+            wkr_in = torch.cat([env_x[:, :4], env_x[:, 5:]], dim=1) # [B*N, 9]
 
             # [Fix] 동적으로 edge_attr 5D 슬라이싱 (환경이 변할 수 있으므로 매 스텝 계산)
             ea = self.env.pyg_data.edge_attr[:, 0:1]  # Phase 1: length만 사용
