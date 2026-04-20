@@ -841,6 +841,8 @@ class WorkerNavTrainer(DOMOTrainer):
             self.env.set_curriculum_ratio(min(1.0, ep / max(int(episodes * 0.8), 1)))
             self.env.reset(batch_size=self.num_pomo, sync_problem=True)
 
+            total_loss, diag = self._execute_goal_conditioned_rollout(ep, episodes)
+
             self.wkr_opt.zero_grad(set_to_none=True)
             
             if getattr(total_loss, 'requires_grad', False):
