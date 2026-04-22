@@ -935,7 +935,8 @@ def load_models_for_rollout(
         enable_disaster=disaster,
     )
 
-    worker = WorkerLSTM(node_dim=9, hidden_dim=hidden_dim, edge_dim=3).to(device)
+    # [v3] node_dim=8: x,y 제거 + time_pct 추가 → cross-map 일반화
+    worker = WorkerLSTM(node_dim=8, hidden_dim=hidden_dim, edge_dim=3).to(device)
 
     if checkpoint_info["source"] == "apte_phase1":
         manager = None
@@ -3806,9 +3807,9 @@ def generate_trajectory_metrics_txt(traj_info: dict[str, Any], output_dir: Path,
 
     summary = (
         f"================================================================\n"
-        f"Trajectory Comparison on {env.name} ({env.num_nodes} nodes)\n"
+        f"Trajectory Comparison on {map_name} ({env.num_nodes} nodes)\n"
         f"================================================================\n\n"
-        f"[Problem Setting]\n  Map: {env.name}\n  Start Node: {traj_info['start']}\n  Goal Node: {traj_info['goal']}\n"
+        f"[Problem Setting]\n  Map: {map_name}\n  Start Node: {traj_info['start']}\n  Goal Node: {traj_info['goal']}\n"
         f"  Optimal Hops: {opt_hops:.0f}\n  Optimal Distance: {opt_dist:.1f} km\n\n[Results]\n"
         f"  {'Metric':<30s} {'A*':>12s} {'Flat RL':>12s} {'HRL(N=16)':>12s}\n  {'-'*66}\n"
         f"  {'Success':<30s} {'Yes':>12s} {'Yes' if flat['success'] else 'No':>12s} {'Yes' if hrl['success'] else 'No':>12s}\n"
@@ -4012,7 +4013,7 @@ def cmd_paper_full(args: argparse.Namespace) -> None:
             print(f"\n🎨 궤적 시각화 (Goldcoast)")
             start_idx, goal_idx = core.find_long_od_pair(env_map, min_hops=50, seed=args.seed)
             traj_info = generate_trajectory_figures(env_map, flat_worker, joint_worker, manager, start_idx, goal_idx, output_dir, args.num_samples)
-            generate_trajectory_metrics_txt(traj_info, output_dir, env_map)
+            generate_trajectory_metrics_txt(traj_info, output_dir, env_map, map_name)
 
     save_all_maps_eval_txt(all_map_results, args.episodes, output_dir)
     

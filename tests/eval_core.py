@@ -168,8 +168,8 @@ def load_checkpoint(
 
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    # edge_dim=3: [length, capacity, speed]
-    worker = WorkerLSTM(node_dim=9, hidden_dim=hidden_dim, edge_dim=3).to(device)
+    # [v3] node_dim=8: x,y 제거 + time_pct 추가 → cross-map 일반화 지원
+    worker = WorkerLSTM(node_dim=8, hidden_dim=hidden_dim, edge_dim=3).to(device)
     if isinstance(payload, dict) and "worker_state" in payload:
         load_worker_state_compat(worker, payload["worker_state"])
     else:
@@ -275,25 +275,38 @@ def configure_single_problem(
 
 
 def select_edge_attr(edge_attr: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    """Phase 1: length(인덱스 0)만 사용. A*/APSP 학습 신호와 일치하는 유일한 피처."""
+    """엣지 피처 선택 + Min-Max 정규화.
+    
+    [v3] 정규화 추가: length/capacity/speed의 스케일 불일치로 인한
+    GATv2 attention 편향을 방지. 각 피처를 [0, 1] 범위로 정규화.
+    """
     if edge_attr is None:
         return None
     if edge_attr.size(1) == 0:
         return None
-    # edge_dim=3: [length, capacity, speed]
-    return edge_attr[:, [0, 7, 8]]
+    # edge_dim=3: [length, capacity, speed] (인덱스 0, 7, 8)
+    selected = edge_attr[:, [0, 7, 8]]
+    # Min-Max 정규화: 각 피처를 [0, 1] 범위로 스케일링
+    feat_min = selected.min(dim=0, keepdim=True)[0]
+    feat_max = selected.max(dim=0, keepdim=True)[0]
+    scale = (feat_max - feat_min).clamp(min=1e-8)
+    return (selected - feat_min) / scale
 
 
-def build_worker_input(env_x: torch.Tensor) -> torch.Tensor:
-    """환경 x(10채널)에서 Worker 입력(9채널)으로 변환한다.
+def build_worker_input(env_x: torch.Tensor, time_pct: float = 0.0) -> torch.Tensor:
+    """환경 x(10채널)에서 Worker 입력(8채널)으로 변환한다.
 
-    Why: Worker는 visit_count(채널4)를 사용하지 않음.
+    [v3 변경] x,y 절대좌표 제거, time_pct 추가.
+    Worker 입력: [is_curr, is_tgt, net_dist, dir_x, dir_y, is_final, hop_dist, time_pct]
     """
     raw = env_x
     if raw.size(1) < 10:
         pad = torch.zeros(raw.size(0), 10 - raw.size(1), device=raw.device)
         raw = torch.cat([raw, pad], dim=1)
-    return torch.cat([raw[:, :4], raw[:, 5:10]], dim=1)
+    # x,y(0,1) 제거, visit(4) 제거 → [is_curr(2), is_tgt(3), dist(5), dir(6,7), final(8), hop(9)]
+    spatial = torch.cat([raw[:, 2:4], raw[:, 5:10]], dim=1)  # [N, 7]
+    t_feat = torch.full((spatial.size(0), 1), time_pct, device=raw.device, dtype=raw.dtype)
+    return torch.cat([spatial, t_feat], dim=1)  # [N, 8]
 
 
 def safe_softmax(scores: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
@@ -538,7 +551,10 @@ def run_joint_rollout(
 
         # Worker Forward
         env_x = env.pyg_data.x
-        worker_input = torch.cat([env_x[:, :4], env_x[:, 5:]], dim=1)
+        worker_input = torch.cat([env_x[:, 2:4], env_x[:, 5:]], dim=1)  # [v3] x,y 제거
+        # time_pct 추가
+        t_feat = torch.full((worker_input.size(0), 1), float(step) / float(max_steps), device=device)
+        worker_input = torch.cat([worker_input, t_feat], dim=1)
         edge_attr = select_edge_attr(env.pyg_data.edge_attr)
         t0_wk = time.perf_counter() if measure_time else 0.0
         scores, h, c, _ = worker.predict_next_hop(

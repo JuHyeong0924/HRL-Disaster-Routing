@@ -2,26 +2,25 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv
+from torch_geometric.nn import GATv2Conv, GraphNorm
 
 class WorkerLSTM(nn.Module):
-    def __init__(self, node_dim: int = 9, hidden_dim: int = 256, num_layers: int = 3, 
+    def __init__(self, node_dim: int = 8, hidden_dim: int = 256, num_layers: int = 3, 
                  dropout: float = 0.2, edge_dim: int = 5, num_scorer_heads: int = 4):
         """
         Worker: Local Navigation with Memory.
-        [v2] 아키텍처 강화:
-          ① Residual Connection: GATv2 레이어 간 skip connection (gradient flow 개선)
-          ② Multi-head Scorer: 4개 독립 scorer 앙상블 (의사결정 다양화)
-          ③ Edge Feature: GATv2 attention에 도로 속성 반영 (edge_dim)
+        [v4] 아키텍처 및 State 전면 개편:
+          ① Node State: 8-Dim (is_curr, is_subgoal, is_final, hop_to_subgoal, hop_to_final, global_heading_x, global_heading_y, time_to_go)
+          ② GraphNorm: GATv2 내부 공변량 편이 방어 및 Over-smoothing 억제
+          ③ Single-head Scorer: 다중공선성 및 오버헤드 제거를 위해 단일 헤드로 다이어트
         
         Args:
-            node_dim: 노드 피처 차원
-                (9: [x, y, is_curr, is_tgt, net_dist, dir_x, dir_y, is_final_target_phase, hop_dist])
+            node_dim: 노드 피처 차원 (8)
             hidden_dim: 은닉층 차원
             num_layers: GATv2 레이어 수
             dropout: Dropout 비율
-            edge_dim: 엣지 피처 차원 (SL=1: length, RL Phase2=9: full attrs)
-            num_scorer_heads: Multi-head Scorer의 head 수
+            edge_dim: 엣지 피처 차원 (3: [length, capacity, speed] 정규화)
+            num_scorer_heads: 사용 안 함 (1로 강제)
         """
         super(WorkerLSTM, self).__init__()
         self.dropout = dropout
@@ -42,21 +41,21 @@ class WorkerLSTM(nn.Module):
             self.convs.append(GATv2Conv(hidden_dim, hidden_dim, heads=4, concat=False, 
                                          dropout=dropout, edge_dim=edge_dim))
         
-        # 레이어별 LayerNorm (Residual 후 안정화)
-        self.layer_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+        # 레이어별 GraphNorm (Residual 후 안정화, Over-smoothing 방지)
+        self.graph_norms = nn.ModuleList([GraphNorm(hidden_dim) for _ in range(num_layers)])
             
         # 2. Temporal Memory (LSTM)
         self.lstm = nn.LSTMCell(hidden_dim, hidden_dim)
         
-        # 3. Decision Head: ② Multi-head Scorer
-        self.num_scorer_heads = num_scorer_heads
+        # 3. Decision Head: Single-head Scorer (다이어트)
+        self.num_scorer_heads = 1
         self.scorer_heads = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(hidden_dim * 2, hidden_dim // num_scorer_heads),  # [Node_Emb, LSTM_H]
+                nn.Linear(hidden_dim * 2, hidden_dim),  # [Node_Emb, LSTM_H]
                 nn.ReLU(),
                 nn.Dropout(dropout),
-                nn.Linear(hidden_dim // num_scorer_heads, 1)
-            ) for _ in range(num_scorer_heads)
+                nn.Linear(hidden_dim, 1)
+            )
         ])
         
         # 4. Value Head (Critic): [Refactor: Task 2] 2-Layer MLP 고도화
@@ -96,14 +95,14 @@ class WorkerLSTM(nn.Module):
                 h_residual = self.input_proj(h)
                 h = self.convs[0](h, edge_index, edge_attr=edge_attr)
                 h = F.elu(h) + h_residual
-                h = self.layer_norms[0](h)
+                h = self.graph_norms[0](h, batch)
                 
                 # 나머지 레이어: 직접 Residual
                 for i in range(1, self.num_layers):
                     h_residual = h
                     h = self.convs[i](h, edge_index, edge_attr=edge_attr)
                     h = F.elu(h) + h_residual  # ① Skip Connection
-                    h = self.layer_norms[i](h)
+                    h = self.graph_norms[i](h, batch)
             h = h.detach()  # gradient 그래프에서 완전 분리
         else:
             # RL / SL 학습: End-to-End 직접 역전파 (속도 우선, VRAM ~13GiB 소모)
@@ -114,7 +113,7 @@ class WorkerLSTM(nn.Module):
             h = self.convs[0](h, edge_index, edge_attr=edge_attr)
             h = F.dropout(F.elu(h), p=self.dropout, training=self.training)
             h = h + h_residual
-            h = self.layer_norms[0](h)
+            h = self.graph_norms[0](h, batch)
             
             # 나머지 레이어
             for i in range(1, self.num_layers):
@@ -122,10 +121,10 @@ class WorkerLSTM(nn.Module):
                 h = self.convs[i](h, edge_index, edge_attr=edge_attr)
                 h = F.dropout(F.elu(h), p=self.dropout, training=self.training)
                 h = h + h_residual
-                h = self.layer_norms[i](h)
+                h = self.graph_norms[i](h, batch)
         
         # === Temporal Memory (LSTM) — gradient 유지 ===
-        is_current = x[:, 2].bool()
+        is_current = x[:, 0].bool()
         
         # [Safety] Prevent crash if no current node is found
         if is_current.sum() == 0:

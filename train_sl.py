@@ -4,7 +4,7 @@ from datetime import datetime
 
 # [Warning Suppression] Filter PyTorch Prototype Warnings
 import warnings
-warnings.filterwarnings("ignore", ".*nested_tensor.*", category=UserWarning)
+warnings.filterwarnings("ignore", ".*nested.*", category=UserWarning)
 
 import pickle
 import torch
@@ -32,8 +32,11 @@ print("Imports done. Starting... ", flush=True)
 
 def train_sl(args):
     print(">>> STARTING SL TRAINING <<<", flush=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Active Device: {device}")
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    device_mgr = device
+    device_wkr = torch.device('cuda:1') if torch.cuda.device_count() > 1 and args.parallel else device_mgr
+    tqdm.write(f"Active Device (Manager): {device_mgr}")
+    tqdm.write(f"Active Device (Worker): {device_wkr}")
     
     # MEMORY OPTIMIZATION: Try loading Pre-processed Tensors
     # MEMORY OPTIMIZATION: Enforce Pre-processed Tensors
@@ -46,7 +49,7 @@ def train_sl(args):
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
                 
     if os.path.exists(pt_manager_path) and os.path.exists(pt_worker_path):
-        print("✅ Loading Optimized Tensor Data (.pt)...", flush=True)
+        tqdm.write("✅ Loading Optimized Tensor Data (.pt)...")
         mgr_samples = torch.load(pt_manager_path)
         wkr_samples = torch.load(pt_worker_path)
         
@@ -65,7 +68,7 @@ def train_sl(args):
     num_nodes = pyg_data.x.size(0)
     
     # APSP 행렬 계산: Worker의 거리/방향 피처용
-    print("🌍 Computing APSP for Worker features...", flush=True)
+    tqdm.write("🌍 Computing APSP for Worker features...")
     G = loader.get_nx_graph()
     nodes = list(G.nodes())
     node_to_idx = {n: i for i, n in enumerate(nodes)}
@@ -77,9 +80,9 @@ def train_sl(args):
             v_idx = node_to_idx[v_id]
             apsp_matrix[u_idx, v_idx] = dist_val
     max_dist = apsp_matrix.max().item()
-    print(f"✅ APSP Ready. Max Distance: {max_dist:.2f}", flush=True)
+    tqdm.write(f"✅ APSP Ready. Max Distance: {max_dist:.2f}")
 
-    print("🔗 Computing Hop APSP for Manager masking...", flush=True)
+    tqdm.write("🔗 Computing Hop APSP for Manager masking...")
     hop_apsp = dict(nx.all_pairs_shortest_path_length(G))
     hop_apsp_matrix = torch.full((num_nodes, num_nodes), float('inf'), dtype=torch.float32)
     for u_id, lengths in hop_apsp.items():
@@ -88,7 +91,7 @@ def train_sl(args):
             v_idx = node_to_idx[v_id]
             hop_apsp_matrix[u_idx, v_idx] = float(hop_val)
     hop_apsp_device = hop_apsp_matrix.to(device)
-    print("✅ Hop APSP Ready.", flush=True)
+    tqdm.write("✅ Hop APSP Ready.")
     
     # [DAgger] APSP Next Hop 테이블 계산: next_hop[src][dst] = src에서 dst로 최단경로의 첫 번째 노드
     # Worker가 틀린 위치에 있을 때 "올바른 다음 행동"을 재계산하는 데 사용
@@ -107,7 +110,7 @@ def train_sl(args):
                 apsp_next_hop[src_idx, dst_idx] = src_idx
     apsp_next_hop_device = apsp_next_hop.to(device)
     del all_paths  # 메모리 해제
-    print(f"✅ Next Hop Table Ready. Shape: {apsp_next_hop.shape}", flush=True)
+    tqdm.write(f"✅ Next Hop Table Ready. Shape: {apsp_next_hop.shape}")
     
     # [Fix #1] GPU 캐싱 먼저 수행 (학습 루프에서 실제로 사용할 텐서)
     apsp_device_global = apsp_matrix.to(device)
@@ -117,6 +120,8 @@ def train_sl(args):
     # Worker에 APSP 행렬 전달 (net_dist, dir_x, dir_y 피처 계산용)
     wkr_dataset = HierarchicalDataset(wkr_samples, pyg_data, mode='worker',
                                        apsp_matrix=apsp_matrix, max_dist=max_dist)
+    # [v4] Worker State에 위상학적 특성(hop)을 주입하기 위해 Dataset 객체에 hop_matrix 부착
+    wkr_dataset.hop_matrix = hop_apsp_matrix
     
     # [Fix #1] Dataset 생성 완료 후 CPU 원본 해제 (이중 보유 방지)
     del apsp_matrix
@@ -133,8 +138,8 @@ def train_sl(args):
     wkr_val_size = len(wkr_dataset) - wkr_train_size
     wkr_train_ds, wkr_val_ds = random_split(wkr_dataset, [wkr_train_size, wkr_val_size])
     
-    print(f"📊 Manager: Train={mgr_train_size}, Val={mgr_val_size}")
-    print(f"📊 Worker: Train={wkr_train_size}, Val={wkr_val_size}")
+    tqdm.write(f"📊 Manager: Train={mgr_train_size}, Val={mgr_val_size}")
+    tqdm.write(f"📊 Worker: Train={wkr_train_size}, Val={wkr_val_size}")
     
     # Clean up
     if 'data_dict' in locals():
@@ -144,14 +149,20 @@ def train_sl(args):
     # DATA LOADER OMPTIMIZATION:
     num_workers = 0 # Force single process for debug/stability on Windows 
     print(f"Using {num_workers} DataLoader workers (Optimal for Mem/Speed)...")
+    if args.parallel:
+        mgr_batch_size = int(args.batch_size * 1.5)
+        wkr_batch_size = args.batch_size
+    else:
+        mgr_batch_size = args.batch_size
+        wkr_batch_size = args.batch_size
     
     # Train Loaders
-    mgr_loader = DataLoader(mgr_train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=hierarchical_collate, num_workers=0, pin_memory=True)
-    wkr_loader = DataLoader(wkr_train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=hierarchical_collate, num_workers=0, pin_memory=True)
+    mgr_loader = DataLoader(mgr_train_ds, batch_size=mgr_batch_size, shuffle=True, collate_fn=hierarchical_collate, num_workers=0, pin_memory=True)
+    wkr_loader = DataLoader(wkr_train_ds, batch_size=wkr_batch_size, shuffle=True, collate_fn=hierarchical_collate, num_workers=0, pin_memory=True)
     
     # Validation Loaders
-    mgr_val_loader = DataLoader(mgr_val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=hierarchical_collate, num_workers=0, pin_memory=True)
-    wkr_val_loader = DataLoader(wkr_val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=hierarchical_collate, num_workers=0, pin_memory=True)
+    mgr_val_loader = DataLoader(mgr_val_ds, batch_size=mgr_batch_size, shuffle=False, collate_fn=hierarchical_collate, num_workers=0, pin_memory=True)
+    wkr_val_loader = DataLoader(wkr_val_ds, batch_size=wkr_batch_size, shuffle=False, collate_fn=hierarchical_collate, num_workers=0, pin_memory=True)
     
     # edge_dim=3: [length, capacity, speed] → 인덱스 [0, 7, 8]
     manager = GraphTransformerManager(
@@ -159,13 +170,13 @@ def train_sl(args):
         hidden_dim=args.hidden_dim, 
         dropout=0.2,
         edge_dim=3
-    ).to(device)
+    ).to(device_mgr)
     
     worker = WorkerLSTM(
-        node_dim=9,  # [x, y, is_current, is_target, net_dist, dir_x, dir_y, is_final_target_phase, hop_dist]
+        node_dim=8,  # [v3] [is_curr, is_tgt, net_dist, dir_x, dir_y, is_final, hop_dist, time_pct]
         hidden_dim=args.hidden_dim,
         edge_dim=3
-    ).to(device)
+    ).to(device_wkr)
     
     
     # [Hyperparam] Separate LRs
@@ -176,8 +187,8 @@ def train_sl(args):
     # Manager: ReduceLROnPlateau (Plateau detection)
     mgr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer_mgr, mode='min', factor=0.5, patience=5)
     
-    # Worker: Cosine Annealing (Stable decay)
-    wkr_scheduler = optim.lr_scheduler.CosineAnnealingLR(wkr_opt, T_max=args.epochs, eta_min=args.lr_worker * 0.01)
+    # Worker: Cosine Annealing (Stable decay) — T_max는 Worker 실제 에포크 수 기준
+    wkr_scheduler = optim.lr_scheduler.CosineAnnealingLR(wkr_opt, T_max=max(1, args.epochs // 2), eta_min=args.lr_worker * 0.01)
     
     mgr_criterion = nn.CrossEntropyLoss(ignore_index=-100)
     wkr_criterion = nn.CrossEntropyLoss()
@@ -213,661 +224,1377 @@ def train_sl(args):
     
     # [Fix #1] APSP 행렬은 이미 GPU에 캐싱 완료 (apsp_device_global)
     
-    for epoch in range(1, args.epochs + 1):
-        print(f"\nEpoch {epoch}/{args.epochs}", flush=True)
+    def run_sequential_pipeline():
+        nonlocal best_mgr_val, mgr_es_counter, best_mgr_state, best_wkr_val, wkr_es_counter, best_wkr_state, wkr_frozen
+        for epoch in range(1, args.epochs + 1):
+            tqdm.write(f"\nEpoch {epoch}/{args.epochs}")
         
-        # --- Manager Train ---
-        manager.train()
-        mgr_loss = 0
-        mgr_batches = 0
-        mgr_correct = 0
-        mgr_total = 0
+            # --- Manager Train ---
+            if not getattr(args, 'worker_only', False):
+                manager.train()
+            mgr_loss = 0
+            mgr_batches = 0
+            mgr_correct = 0
+            mgr_total = 0
         
-        pbar = tqdm(mgr_loader, desc="Manager", leave=False, dynamic_ncols=True)
-        for batch in pbar:
-            batch = batch.to(device)
-            # === Manager Training (Inductive Pointer Network) ===
-            optimizer_mgr.zero_grad()
-            
-            # [Robustness] Dynamic Token Definition based on current batch's graph
-            # 1. Project Features & Dense Batching
-            # [Refactor] Teacher Forcing Logic:
-            # We calculate embeddings EXTERNALLY and pass them to Manager.
-            mgr_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
-            node_emb_all = manager.topology_enc(batch.x, batch.edge_index, edge_attr=mgr_edge_attr) # [B*N, Hidden]
-            
-            # [Fix #6] import는 파일 상단으로 이동 완료
-            node_emb_dense, mask_dense = to_dense_batch(node_emb_all, batch.batch) # [B, N_max, H]
-            x_dense, _ = to_dense_batch(batch.x, batch.batch) # [B, N_max, F]
-            
-            B, N_max, H = node_emb_dense.size()
-            
-            # Dynamic Special Tokens
-            # Valid Nodes: 0 ~ N_max-1
-            # EOS Index: N_max (Virtual Node)
-            # PAD Index: -100 (Ignored in Loss)
-            EOS_IDX_for_pointer = N_max
-            
-            # 2. Prepare Target Sequence (Indices)
-            raw_targets = batch.y # [B, L]
-            is_valid = (raw_targets != -100)
-            
-            # 3. Create Target Embeddings
-            # Extend Reference Embeddings with EOS
-            eos_emb_expanded = manager.eos_token_emb.expand(B, 1, H)
-            full_ref_embs = torch.cat([node_emb_dense, eos_emb_expanded], dim=1) # [B, N+1, H]
-            
-            # Gather mask & indices
-            # raw_targets has indices 0~N-1, or -100
-            safe_gather_idx = raw_targets.clone()
-            safe_gather_idx[~is_valid] = 0
-            
-            # Gather Embeddings [B, L, H]
-            target_seq_emb = torch.gather(full_ref_embs, 1, safe_gather_idx.unsqueeze(-1).expand(-1, -1, H))
-            
-            # Mask out embedding for PAD positions
-            target_seq_emb = target_seq_emb * is_valid.unsqueeze(-1).float()
-            
-            # Call Forward
-            # target_seq_emb: [B, L, H]
-            # edge_attr: Manager DataLoader에 edge_attr가 없을 수 있으므로 None-safe 처리
-            mgr_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
-            pointer_logits = manager(batch.x, batch.edge_index, batch.batch, target_seq_emb=target_seq_emb, edge_attr=mgr_edge_attr)
-            # logits: [B, L+1, N+1] (Time steps shifted by 1 due to SOS)
-            
-            # 3. Construct Final Targets [B, L+1]
-            # Input:  [SOS, n1, n2, ..., nk] (implicitly constructed by fwd)
-            # Target: [n1,  n2, ..., nk, EOS]
-            
-            seq_L = raw_targets.size(1)
-            final_targets = torch.full((B, seq_L + 1), -100, dtype=torch.long, device=device)
-            
-            lengths = is_valid.sum(dim=1) # [B]
-            
-            # [Optimize] 파이썬 루핑 제거 및 벡터화 연산 도입 (CPU-GPU 동기화 병목 해소)
-            valid_mask = torch.arange(seq_L, device=device).unsqueeze(0) < lengths.unsqueeze(1)
-            final_targets[:, :seq_L][valid_mask] = raw_targets[valid_mask]
-            
-            batch_indices = torch.arange(B, device=device)
-            final_targets[batch_indices, lengths] = EOS_IDX_for_pointer
-            
-            # Flatten for Loss
-            logits_flat = pointer_logits.view(-1, N_max + 1) # [B*(L+1), N+1]
-            targets_flat = final_targets.view(-1)            # [B*(L+1)]
-            
-            # 1. NLL Loss
-            nll_loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=-100)
-            
-            # 2. Soft Label Loss (Only for Real Node Targets)
-            # Mask for Real Nodes (Target < N_max and Target != -100)
-            real_node_mask = (targets_flat < N_max) & (targets_flat >= 0)
-            
-            if real_node_mask.sum() > 0:
-                # [Fix 5] EOS 토큰을 제외한 순수 공간 노드에 대해서만 log_softmax 적용
-                logits_nodes = pointer_logits[..., :-1] # [B, L+1, N_max]
-                log_probs_nodes = F.log_softmax(logits_nodes, dim=-1) 
-                
-                # Get Network Distances for Soft Label
-                # We use the pre-computed APSP matrix for topologically accurate distances.
-                real_mask_2d = (final_targets < N_max) & (final_targets >= 0)
-                safe_targets_2d = final_targets.clone()
-                safe_targets_2d[~real_mask_2d] = 0
-                
-                dists = apsp_device_global[safe_targets_2d] # [B, L+1, N_max]
-                
-                # [Hyperparam] Soft Label Temperature
-                temperature = 1.0 
-                soft_probs = F.softmax(-dists / temperature, dim=-1) # [B, L+1, N_max]
-                del dists  # [Fix #2] Soft Label 중간 텐서 즉시 해제 (~50MB/batch 회수)
-                
-                kl_loss_raw = F.kl_div(log_probs_nodes, soft_probs, reduction='none', log_target=False) # [B, L+1, N_max]
-                
-                # Sum over node classes, then mask
-                kl_loss = (kl_loss_raw.sum(dim=-1) * real_mask_2d.float()).sum() / (real_mask_2d.sum() + 1e-6)
-            else:
-                kl_loss = torch.tensor(0.0, device=device)
-            
-            # Total Loss
-            loss = 0.5 * nll_loss + 0.5 * kl_loss
-            
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"Warning: NaN/Inf Loss detected. Skipping batch.")
-                continue
-                
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(manager.parameters(), max_norm=1.0)
-            optimizer_mgr.step()
-            
-            mgr_loss += loss.item()
-            mgr_batches += 1
-            
-            # Accuracy
-            pred_tokens = torch.argmax(pointer_logits, dim=-1)
-            correct = (pred_tokens == final_targets) & (final_targets != -100)
-            mgr_correct += correct.sum().item()
-            mgr_total += (final_targets != -100).sum().item()
-            
-            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{100*mgr_correct/max(1,mgr_total):.1f}%"})
-            
-        print(f"Manager Loss: {mgr_loss/max(1, mgr_batches):.4f}", flush=True)
-            
-        # --- Worker Train ---
-        # [Improved] Worker 학습 빈도 2배 증가 (20에폭에서 10회)
-        WORKER_FREQ = 2
-        
-        # [DAgger] TF Ratio 감소: 0.3까지 감소 (원래 경로 감독 유지)
-        # 0.0으로 내리면 CE/KL 충돌로 성능 하락 → 70% 자율 + 30% Teacher로 균형
-        tf_ratio = max(0.3, 1.0 - 1.5 * (epoch - 1) / args.epochs)
-        window_size = 5 # 다중 스텝 언롤링(Multi-step Unrolling) 윈도우 크기
-        
-        if WORKER_FREQ > 0 and epoch % WORKER_FREQ == 0 and not wkr_frozen:
-            worker.train()
-            wkr_loss = 0
-            wkr_batches = 0
-            wkr_correct = 0
-            wkr_total_steps = 0
-            
-            pbar = tqdm(wkr_loader, desc=f"Worker (Ep {epoch})", leave=False, dynamic_ncols=True)
+            pbar = tqdm(mgr_loader, desc="Manager", leave=False, dynamic_ncols=True)
             for batch in pbar:
                 batch = batch.to(device)
-                
-                # 시퀀스 데이터 로드
-                # segment_loader에서 c_nodes, t_nodes, n_hops 리스트 반환함
-                c_seqs = batch.c_nodes
-                t_seqs = batch.t_nodes
-                n_seqs = batch.n_hops
-                
-                num_graphs = len(c_seqs) # 배치 내 그래프(경로) 개수
-                
-                wkr_opt.zero_grad()
-                
-                # [Optimization] 단일 텐서 기반 은닉 상태 관리 (리스트 제거)
-                h = torch.zeros(num_graphs, args.hidden_dim, device=device)
-                c = torch.zeros(num_graphs, args.hidden_dim, device=device)
-                
-                # [Optimization] 벡터 추출을 위한 시퀀스 텐서 패딩 (CPU-GPU 동기화 병목 방지)
-                # [Fix #6] pad_sequence import는 파일 상단으로 이동 완료
-                c_seqs_pad = pad_sequence(c_seqs, batch_first=True, padding_value=0) # [B, Max_Seq_Len]
-                t_seqs_pad = pad_sequence(t_seqs, batch_first=True, padding_value=0)
-                n_seqs_pad = pad_sequence(n_seqs, batch_first=True, padding_value=0)
-                seq_lens = torch.tensor([seq.size(0) for seq in c_seqs], dtype=torch.long, device=device)
-                
-                max_seq_len = c_seqs_pad.size(1)
-                
-                loss_buffer = [] # 윈도우 손실 버퍼
-                
-                # 이전 스텝의 예측 노드 (Autoregressive 용도)
-                prev_preds = c_seqs_pad[:, 0].clone() # [B]
-                
-                # [Optimization v3] 동적 배치 축소를 위한 기본 변수 사전 정의 (루프 밖)
-                node_coords_per_graph = batch.x[:, :2].view(num_graphs, -1, 2)  # [B, N, 2]
-                num_nodes_per_graph = node_coords_per_graph.size(1)
-                base_edges = pyg_data.edge_index.to(device)  # [2, E_single]
-                base_edge_attr = pyg_data.edge_attr[:, [0, 7, 8]].to(device)  # [E_single, 3] length+capacity+speed
-                num_edges_per_graph = base_edges.size(1)
-                
-                # [Fix A] Pre-allocation: 초기 K=num_graphs에 대해 사전 계산
-                # K가 줄어들 때만 재계산 (대부분의 스텝에서 재활용)
-                cached_K = num_graphs
-                cached_offsets = torch.arange(num_graphs, device=device) * num_nodes_per_graph
-                cached_edge_offset = cached_offsets.view(num_graphs, 1, 1)
-                cached_edge_index = (base_edges.unsqueeze(0) + cached_edge_offset).permute(1, 0, 2).reshape(2, -1)
-                cached_edge_attr = base_edge_attr.repeat(num_graphs, 1)  # [E_single*K, edge_dim]
-                cached_batch_vec = torch.arange(num_graphs, device=device).repeat_interleave(num_nodes_per_graph)
-                
-                for step in range(max_seq_len):
-                    # === 1. 활성 그래프 인덱스 도출 ===
-                    active_mask = step < seq_lens  # [B] 전체 배치 마스크
-                    if not active_mask.any(): break
-                    
-                    active_idx = active_mask.nonzero(as_tuple=True)[0]  # [K] 활성 인덱스
-                    K = active_idx.size(0)
-                    
-                    # [Fix A] K가 변했을 때만 edge_index/batch_vec 재계산
-                    # (edge_index/batch_vec는 gradient graph에 참여하지 않으므로 캐싱 안전)
-                    if K != cached_K:
-                        cached_K = K
-                        cached_offsets = torch.arange(K, device=device) * num_nodes_per_graph
-                        cached_edge_offset = cached_offsets.view(K, 1, 1)
-                        cached_edge_index = (base_edges.unsqueeze(0) + cached_edge_offset).permute(1, 0, 2).reshape(2, -1)
-                        cached_edge_attr = base_edge_attr.repeat(K, 1)  # [E_single*K, edge_dim]
-                        cached_batch_vec = torch.arange(K, device=device).repeat_interleave(num_nodes_per_graph)
-                    
-                    # === 2. 패딩된 텐서에서 활성 그래프만 슬라이싱 ===
-                    act_step = torch.clamp(torch.tensor(step, device=device), max=seq_lens[active_idx] - 1)
-                    
-                    use_tf = torch.rand(K, device=device) < tf_ratio
-                    curr_nodes_k = torch.where(
-                        use_tf | (step == 0),
-                        c_seqs_pad[active_idx, step],
-                        prev_preds[active_idx]
-                    )
-                    tgt_nodes_k = t_seqs_pad[active_idx, act_step]
-                    
-                    # [DAgger] 정답 재계산: 모델 예측 위치에 있을 때 APSP 기반 올바른 행동
-                    # Teacher Forcing이 아닌 경우 → 현재 위치에서 서브골까지의 
-                    # [Fix 4] Subset 우회
-                    ds = wkr_loader.dataset.dataset if hasattr(wkr_loader.dataset, 'dataset') else wkr_loader.dataset
-                    
-                    original_labels = n_seqs_pad[active_idx, act_step]  # 원래 정답
-                    dagger_labels = apsp_next_hop_device[curr_nodes_k, tgt_nodes_k]  # APSP 재계산 정답
-                    
-                    # TF 사용 시 원래 정답, 아닌 경우 DAgger 정답 사용
-                    # 단, DAgger 정답이 -1이면 (경로 없음) 원래 정답 유지
-                    valid_dagger = (dagger_labels >= 0)
-                    target_labels_k = torch.where(
-                        (use_tf | (step == 0)) | (~valid_dagger),
-                        original_labels,
-                        dagger_labels
-                    )  # [K]
-                    
-                    # === 3. 컴팩트 GNN 입력 조립 ===
-                    # gradient checkpoint는 backward 시 입력을 재사용하므로
-                    # in-place 수정 대신 매 스텝 새 텐서 생성 (CUDA 캐싱 풀이 크기 동일 시 즉시 재할당)
-                    compact_coords = node_coords_per_graph[active_idx].reshape(K * num_nodes_per_graph, 2)
-                    
-                    worker_in = torch.zeros((K * num_nodes_per_graph, 9), device=device)
-                    worker_in[:, :2] = compact_coords
-                    worker_in[cached_offsets + curr_nodes_k, 2] = 1.0  # is_current
-                    worker_in[cached_offsets + tgt_nodes_k, 3] = 1.0   # is_target
-                    
-                    # APSP 거리 피처
-                    if hasattr(ds, 'apsp_matrix'):
-                        max_dst = ds.max_dist
-                        active_dists = apsp_device_global[tgt_nodes_k] / max_dst  # [K, N]
-                        worker_in[:, 4] = active_dists.reshape(-1)
-                    else:
-                        worker_in[:, 4] = 0.0
-                    
-                    # 방향 벡터 피처
-                    tgt_coords = compact_coords[cached_offsets + tgt_nodes_k]  # [K, 2]
-                    tgt_coords_rep = tgt_coords.repeat_interleave(num_nodes_per_graph, dim=0)  # [K*N, 2]
-                    diff = tgt_coords_rep - compact_coords
-                    norm_val = diff.norm(dim=1, keepdim=True).clamp(min=1e-8)
-                    worker_in[:, 5:7] = diff / norm_val
-                    is_final_target = (act_step == (seq_lens[active_idx] - 1)).float()
-                    worker_in[:, 7] = is_final_target.repeat_interleave(num_nodes_per_graph)
-
-                    # [Track 1] hop_dist 피처 (col 8): 서브골까지의 정규화된 홉 거리
-                    if hasattr(ds, 'hop_matrix'):
-                        hop_matrix_device = ds.hop_matrix.to(device)
-                        hop_dists_k = hop_matrix_device[curr_nodes_k, tgt_nodes_k]
-                        hop_dists = hop_dists_k.clone()
-                        finite_hops = hop_matrix_device[hop_matrix_device < float('inf')]
-                        max_h = float(finite_hops.max().item()) if finite_hops.numel() > 0 else 50.0
-                        worker_in[:, 8] = torch.clamp(hop_dists.float() / max_h, 0.0, 1.0).reshape(-1)
-                    else:
-                        worker_in[:, 8] = 0.0
-                    
-                    # === 4. 활성 은닉 상태 슬라이싱 & Forward ===
-                    h_active = h[active_idx]  # [K, H]
-                    c_active = c[active_idx]  # [K, H]
-                    
-                    scores, h_next_k, c_next_k, _ = worker.predict_next_hop(
-                        worker_in, cached_edge_index, h_active, c_active, cached_batch_vec,
-                        edge_attr=cached_edge_attr
-                    )
-                    
-                    # === 5. 은닉 상태 원본 텐서에 매핑 (BPTT 유지) ===
-                    h_new = h.clone()
-                    c_new = c.clone()
-                    h_new[active_idx] = h_next_k
-                    c_new[active_idx] = c_next_k
-                    h = h_new
-                    c = c_new
-                    
-                    # === 6. 손실 계산: Heuristic-Guided SL (CE + KL) ===
-                    scores_view = scores.view(K, num_nodes_per_graph)
-                    
-                    # CE 손실: 정답 노드 학습 (DAgger 시 재계산된 정답 사용)
-                    ce_loss = F.cross_entropy(scores_view, target_labels_k)
-                    
-                    # KL 손실: APSP 기반 Soft Label
-                    # [Fix] DAgger 시 curr_nodes_k 기준 서브골까지 거리 사용 (CE와 일치)
-                    # TF 모드: 원래 서브골(tgt_nodes_k) 기준
-                    # DAgger 모드: 동일하게 서브골(tgt_nodes_k) 기준이지만 curr 위치가 다름
-                    dist_to_target = apsp_device_global[:, tgt_nodes_k].T / max_dist  # [K, N]
-                    wkr_soft_labels = F.softmax(-dist_to_target / 0.1, dim=-1)  # T=0.1 (sharp)
-                    log_probs = F.log_softmax(scores_view, dim=-1)
-                    kl_loss = F.kl_div(log_probs, wkr_soft_labels, reduction='batchmean', log_target=False)
-                    
-                    # [Fix] DAgger 비율에 따라 KL 가중치 조절
-                    # TF 비율이 낮을수록 DAgger 정답과 KL이 충돌할 수 있으므로 KL 가중치 감소
-                    kl_weight = 0.3 * tf_ratio + 0.1 * (1.0 - tf_ratio)  # TF=1→0.3, TF=0.3→0.21
-                    step_loss = (1.0 - kl_weight) * ce_loss + kl_weight * kl_loss
-                    
-                    # Autoregressive: 예측 노드 갱신
-                    pred_k = scores_view.argmax(dim=1)  # [K]
-                    prev_preds = prev_preds.clone()
-                    prev_preds[active_idx] = pred_k
-                            
-                    loss_buffer.append(step_loss)
-                    
-                    # Accuracy 추적: 활성 K개 그래프의 정답 여부
-                    wkr_correct += (pred_k == target_labels_k).sum().item()
-                    wkr_total_steps += K
-                    
-                    if (step + 1) % window_size == 0 or (step + 1) == max_seq_len:
-                        if len(loss_buffer) > 0:
-                            avg_window_loss = sum(loss_buffer) / len(loss_buffer)
-                            avg_window_loss.backward()
-                            wkr_loss += avg_window_loss.item()
-                            loss_buffer.clear()
-                        
-                        # 단일 텐서 BPTT Detach
-                        h = h.detach()
-                        c = c.detach()
-                        
-                        torch.nn.utils.clip_grad_norm_(worker.parameters(), max_norm=1.0)
-                        wkr_opt.step()
-                        wkr_opt.zero_grad()
-                        
-                    if not active_mask.any():
-                        loss_buffer.clear()
-                        
-                    # 메모리 해제
-                    del worker_in, scores, h_next_k, c_next_k, h_new, c_new, scores_view, step_loss
-                        
-                wkr_batches += (max_seq_len / window_size) # Approximate batches
-                wkr_acc = 100 * wkr_correct / max(1, wkr_total_steps)
-                pbar.set_postfix({'loss': f"{wkr_loss/max(1, wkr_batches):.4f}", 'acc': f"{wkr_acc:.1f}%"})
+                # === Manager Training (Inductive Pointer Network) ===
+                optimizer_mgr.zero_grad()
             
-            print(f"Worker Train Loss: {wkr_loss/max(1, wkr_batches):.4f}, Acc: {wkr_acc:.1f}% (TF Ratio: {tf_ratio:.2f})", flush=True)
-        elif wkr_frozen:
-            print(f"Worker Train: ⛔ Frozen (Early Stopping at best Val={best_wkr_val:.4f})", flush=True)
-        else:
-            print(f"Worker Train: Skipped (Freq={WORKER_FREQ})", flush=True)
-        
-        # === Validation Loss ===
-        manager.eval()
-        worker.eval()
-        mgr_val_loss = 0
-        wkr_val_loss = 0
-        mgr_val_batches = 0
-        wkr_val_batches = 0
-        
-        with torch.no_grad():
-            # Manager Validation
-            for batch in mgr_val_loader:
-                batch = batch.to(device)
-                
-                # [Robustness] Dynamic Token Definition
-                # [Refactor] Validation Embedding Gathering
+                # [Robustness] Dynamic Token Definition based on current batch's graph
+                # 1. Project Features & Dense Batching
+                # [Refactor] Teacher Forcing Logic:
+                # We calculate embeddings EXTERNALLY and pass them to Manager.
                 mgr_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
-                node_emb_all = manager.topology_enc(batch.x, batch.edge_index, edge_attr=mgr_edge_attr)
-                
+                node_emb_all = manager.topology_enc(batch.x, batch.edge_index, edge_attr=mgr_edge_attr) # [B*N, Hidden]
+            
                 # [Fix #6] import는 파일 상단으로 이동 완료
                 node_emb_dense, mask_dense = to_dense_batch(node_emb_all, batch.batch) # [B, N_max, H]
-                x_dense, _ = to_dense_batch(batch.x, batch.batch) # Needed for Soft Label
+                x_dense, _ = to_dense_batch(batch.x, batch.batch) # [B, N_max, F]
+            
                 B, N_max, H = node_emb_dense.size()
-                
+            
+                # Dynamic Special Tokens
+                # Valid Nodes: 0 ~ N_max-1
+                # EOS Index: N_max (Virtual Node)
+                # PAD Index: -100 (Ignored in Loss)
                 EOS_IDX_for_pointer = N_max
-                PAD_VAL = -100
-                
+            
+                # 2. Prepare Target Sequence (Indices)
                 raw_targets = batch.y # [B, L]
-                is_valid = (raw_targets != PAD_VAL)
-                
-                # 1. Construct Target Embeddings with EOS extension
+                is_valid = (raw_targets != -100)
+            
+                # 3. Create Target Embeddings
+                # Extend Reference Embeddings with EOS
                 eos_emb_expanded = manager.eos_token_emb.expand(B, 1, H)
                 full_ref_embs = torch.cat([node_emb_dense, eos_emb_expanded], dim=1) # [B, N+1, H]
-                
+            
                 # Gather mask & indices
+                # raw_targets has indices 0~N-1, or -100
                 safe_gather_idx = raw_targets.clone()
                 safe_gather_idx[~is_valid] = 0
-                
+            
+                # Gather Embeddings [B, L, H]
                 target_seq_emb = torch.gather(full_ref_embs, 1, safe_gather_idx.unsqueeze(-1).expand(-1, -1, H))
+            
+                # Mask out embedding for PAD positions
                 target_seq_emb = target_seq_emb * is_valid.unsqueeze(-1).float()
-                
-                # 2. Forward Pass
-                val_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
-                pointer_logits = manager(batch.x, batch.edge_index, batch.batch, target_seq_emb=target_seq_emb, edge_attr=val_edge_attr)
-                
-                # 3. Construct Targets for Loss
+            
+                # Call Forward
+                # target_seq_emb: [B, L, H]
+                # edge_attr: Manager DataLoader에 edge_attr가 없을 수 있으므로 None-safe 처리
+                mgr_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
+                pointer_logits = manager(batch.x, batch.edge_index, batch.batch, target_seq_emb=target_seq_emb, edge_attr=mgr_edge_attr)
+                # logits: [B, L+1, N+1] (Time steps shifted by 1 due to SOS)
+            
+                # 3. Construct Final Targets [B, L+1]
+                # Input:  [SOS, n1, n2, ..., nk] (implicitly constructed by fwd)
+                # Target: [n1,  n2, ..., nk, EOS]
+            
                 seq_L = raw_targets.size(1)
-                final_targets = torch.full((B, seq_L + 1), PAD_VAL, dtype=torch.long, device=device)
-                
-                lengths = is_valid.sum(dim=1)
-                
-                # [Optimize] 파이썬 루핑 제거 및 벡터화 연산 도입
+                final_targets = torch.full((B, seq_L + 1), -100, dtype=torch.long, device=device)
+            
+                lengths = is_valid.sum(dim=1) # [B]
+            
+                # [Optimize] 파이썬 루핑 제거 및 벡터화 연산 도입 (CPU-GPU 동기화 병목 해소)
                 valid_mask = torch.arange(seq_L, device=device).unsqueeze(0) < lengths.unsqueeze(1)
                 final_targets[:, :seq_L][valid_mask] = raw_targets[valid_mask]
-                
+            
                 batch_indices = torch.arange(B, device=device)
                 final_targets[batch_indices, lengths] = EOS_IDX_for_pointer
-
+            
                 # Flatten for Loss
-                logits_flat = pointer_logits.view(-1, N_max + 1)
-                targets_flat = final_targets.view(-1)
-                
-                # 4. Hybrid Loss Calculation
-                nll_loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=PAD_VAL)
-                
-                # Soft Label Logic
+                logits_flat = pointer_logits.view(-1, N_max + 1) # [B*(L+1), N+1]
+                targets_flat = final_targets.view(-1)            # [B*(L+1)]
+            
+                # 1. NLL Loss
+                nll_loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=-100)
+            
+                # 2. Soft Label Loss (Only for Real Node Targets)
+                # Mask for Real Nodes (Target < N_max and Target != -100)
                 real_node_mask = (targets_flat < N_max) & (targets_flat >= 0)
+            
                 if real_node_mask.sum() > 0:
                     # [Fix 5] EOS 토큰을 제외한 순수 공간 노드에 대해서만 log_softmax 적용
-                    logits_nodes = pointer_logits[..., :-1]
-                    log_probs_nodes = F.log_softmax(logits_nodes, dim=-1)
-                    
+                    logits_nodes = pointer_logits[..., :-1] # [B, L+1, N_max]
+                    log_probs_nodes = F.log_softmax(logits_nodes, dim=-1) 
+                
+                    # Get Network Distances for Soft Label
+                    # We use the pre-computed APSP matrix for topologically accurate distances.
                     real_mask_2d = (final_targets < N_max) & (final_targets >= 0)
                     safe_targets_2d = final_targets.clone()
                     safe_targets_2d[~real_mask_2d] = 0
-                    
-                    dists = apsp_device_global[safe_targets_2d]
-                    
-                    temperature = 1.0
-                    soft_probs = F.softmax(-dists / temperature, dim=-1)
-                    del dists  # [Fix #2] Validation Soft Label 중간 텐서 즉시 해제
-                    kl_loss_raw = F.kl_div(log_probs_nodes, soft_probs, reduction='none', log_target=False)
+                
+                    dists = apsp_device_global[safe_targets_2d] # [B, L+1, N_max]
+                
+                    # [Hyperparam] Soft Label Temperature
+                    temperature = 1.0 
+                    soft_probs = F.softmax(-dists / temperature, dim=-1) # [B, L+1, N_max]
+                    del dists  # [Fix #2] Soft Label 중간 텐서 즉시 해제 (~50MB/batch 회수)
+                
+                    kl_loss_raw = F.kl_div(log_probs_nodes, soft_probs, reduction='none', log_target=False) # [B, L+1, N_max]
+                
+                    # Sum over node classes, then mask
                     kl_loss = (kl_loss_raw.sum(dim=-1) * real_mask_2d.float()).sum() / (real_mask_2d.sum() + 1e-6)
                 else:
                     kl_loss = torch.tensor(0.0, device=device)
-                    
-                loss = 0.5 * nll_loss + 0.5 * kl_loss
-                mgr_val_loss += loss.item()
-                mgr_val_batches += 1
             
-            # Worker Validation (Frequency: 1/5)
-            if epoch % WORKER_FREQ == 0:
-                for batch in wkr_val_loader:
+                # Total Loss
+                loss = 0.5 * nll_loss + 0.5 * kl_loss
+            
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Warning: NaN/Inf Loss detected. Skipping batch.")
+                    continue
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(manager.parameters(), max_norm=1.0)
+                optimizer_mgr.step()
+            
+                mgr_loss += loss.item()
+                mgr_batches += 1
+            
+                # Accuracy
+                pred_tokens = torch.argmax(pointer_logits, dim=-1)
+                correct = (pred_tokens == final_targets) & (final_targets != -100)
+                mgr_correct += correct.sum().item()
+                mgr_total += (final_targets != -100).sum().item()
+            
+                pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{100*mgr_correct/max(1,mgr_total):.1f}%"})
+            
+            tqdm.write(f"Manager Loss: {mgr_loss/max(1, mgr_batches):.4f}")
+            
+            # --- Worker Train ---
+            # [Improved] Worker 학습 빈도 2배 증가 (20에폭에서 10회)
+            WORKER_FREQ = 2
+        
+            # [DAgger] TF Ratio 감소: 0.3까지 감소 (원래 경로 감독 유지)
+            # 0.0으로 내리면 CE/KL 충돌로 성능 하락 → 70% 자율 + 30% Teacher로 균형
+            tf_ratio = max(0.3, 1.0 - 1.5 * (epoch - 1) / args.epochs)
+            window_size = 5 # 다중 스텝 언롤링(Multi-step Unrolling) 윈도우 크기
+        
+            if WORKER_FREQ > 0 and epoch % WORKER_FREQ == 0 and not wkr_frozen:
+                worker.train()
+                wkr_loss = 0
+                wkr_batches = 0
+                wkr_correct = 0
+                wkr_total_steps = 0
+            
+                pbar = tqdm(wkr_loader, desc=f"Worker (Ep {epoch})", leave=False, dynamic_ncols=True)
+                for batch in pbar:
                     batch = batch.to(device)
-                    
+                
+                    # 시퀀스 데이터 로드
+                    # segment_loader에서 c_nodes, t_nodes, n_hops 리스트 반환함
                     c_seqs = batch.c_nodes
                     t_seqs = batch.t_nodes
                     n_seqs = batch.n_hops
-                    
-                    val_num_graphs = len(c_seqs)
-                    
-                    # [Optimization v3] 단일 텐서 기반 은닉 상태 (Validation)
-                    h = torch.zeros(val_num_graphs, args.hidden_dim, device=device)
-                    c = torch.zeros(val_num_graphs, args.hidden_dim, device=device)
-                    
-                    # [Optimization] Validation 텐서 패딩 (CPU-GPU 싱크 병목 차단)
+                
+                    num_graphs = len(c_seqs) # 배치 내 그래프(경로) 개수
+                
+                    wkr_opt.zero_grad()
+                
+                    # [Optimization] 단일 텐서 기반 은닉 상태 관리 (리스트 제거)
+                    h = torch.zeros(num_graphs, args.hidden_dim, device=device)
+                    c = torch.zeros(num_graphs, args.hidden_dim, device=device)
+                
+                    # [Optimization] 벡터 추출을 위한 시퀀스 텐서 패딩 (CPU-GPU 동기화 병목 방지)
                     # [Fix #6] pad_sequence import는 파일 상단으로 이동 완료
-                    c_seqs_pad = pad_sequence(c_seqs, batch_first=True, padding_value=0)
-                    t_seqs_pad = pad_sequence(t_seqs, batch_first=True, padding_value=0)
-                    n_seqs_pad = pad_sequence(n_seqs, batch_first=True, padding_value=0)
-                    seq_lens = torch.tensor([seq.size(0) for seq in c_seqs], dtype=torch.long, device=device)
-                    
+                    c_seqs_pad = pad_sequence(c_seqs, batch_first=True, padding_value=0) # [B, Max_Seq_Len]
+                       # [v4] Global Z-score 정규화: GATv2 GraphNorm 성능 극대화 및 공변량 편이 방지
+                    _ea_mean = base_edge_attr.mean(dim=0, keepdim=True)
+                    _ea_std = base_edge_attr.std(dim=0, keepdim=True).clamp(min=1e-8)
+                    base_edge_attr = (base_edge_attr - _ea_mean) / _ea_std         
                     max_seq_len = c_seqs_pad.size(1)
-                    
-                    # [Optimization v3] 동적 배치 축소용 사전 정의 (Validation)
-                    node_coords_per_graph = batch.x[:, :2].view(val_num_graphs, -1, 2)  # [B, N, 2]
+                
+                    loss_buffer = [] # 윈도우 손실 버퍼
+                
+                    # 이전 스텝의 예측 노드 (Autoregressive 용도)
+                    prev_preds = c_seqs_pad[:, 0].clone() # [B]
+                
+                    # [Optimization v3] 동적 배치 축소를 위한 기본 변수 사전 정의 (루프 밖)
+                    node_coords_per_graph = batch.x[:, :2].view(num_graphs, -1, 2)  # [B, N, 2]
                     num_nodes_per_graph = node_coords_per_graph.size(1)
-                    base_edges = pyg_data.edge_index.to(device)
-                    base_edge_attr = pyg_data.edge_attr[:, [0, 7, 8]].to(device)  # length+capacity+speed
-                    
-                    # [Fix A] Pre-allocation (Validation) — edge_index/batch_vec만 캐싱
-                    cached_K = val_num_graphs
-                    cached_offsets = torch.arange(val_num_graphs, device=device) * num_nodes_per_graph
-                    cached_edge_offset = cached_offsets.view(val_num_graphs, 1, 1)
+                    base_edges = pyg_data.edge_index.to(device)  # [2, E_single]
+                    base_edge_attr = pyg_data.edge_attr[:, [0, 7, 8]].to(device)  # [E_single, 3] length+capacity+speed
+                    # [v3] Min-Max 정규화: GATv2 attention 편향 방지
+                    _ea_min = base_edge_attr.min(dim=0, keepdim=True)[0]
+                    _ea_max = base_edge_attr.max(dim=0, keepdim=True)[0]
+                    base_edge_attr = (base_edge_attr - _ea_min) / (_ea_max - _ea_min).clamp(min=1e-8)
+                    num_edges_per_graph = base_edges.size(1)
+                
+                    # [Fix A] Pre-allocation: 초기 K=num_graphs에 대해 사전 계산
+                    # K가 줄어들 때만 재계산 (대부분의 스텝에서 재활용)
+                    cached_K = num_graphs
+                    cached_offsets = torch.arange(num_graphs, device=device) * num_nodes_per_graph
+                    cached_edge_offset = cached_offsets.view(num_graphs, 1, 1)
                     cached_edge_index = (base_edges.unsqueeze(0) + cached_edge_offset).permute(1, 0, 2).reshape(2, -1)
-                    cached_edge_attr = base_edge_attr.repeat(val_num_graphs, 1)
-                    cached_batch_vec = torch.arange(val_num_graphs, device=device).repeat_interleave(num_nodes_per_graph)
-                    
-                    # [Fix 4] Subset 우회
-                    val_ds = wkr_val_loader.dataset.dataset if hasattr(wkr_val_loader.dataset, 'dataset') else wkr_val_loader.dataset
-                    
+                    cached_edge_attr = base_edge_attr.repeat(num_graphs, 1)  # [E_single*K, edge_dim]
+                    cached_batch_vec = torch.arange(num_graphs, device=device).repeat_interleave(num_nodes_per_graph)
+                
                     for step in range(max_seq_len):
                         # === 1. 활성 그래프 인덱스 도출 ===
-                        active_mask = step < seq_lens
+                        active_mask = step < seq_lens  # [B] 전체 배치 마스크
                         if not active_mask.any(): break
-                        
-                        active_idx = active_mask.nonzero(as_tuple=True)[0]  # [K]
+                    
+                        active_idx = active_mask.nonzero(as_tuple=True)[0]  # [K] 활성 인덱스
                         K = active_idx.size(0)
-                        
-                        # [Fix A] K 변경 시에만 재계산
+                    
+                        # [Fix A] K가 변했을 때만 edge_index/batch_vec 재계산
+                        # (edge_index/batch_vec는 gradient graph에 참여하지 않으므로 캐싱 안전)
                         if K != cached_K:
                             cached_K = K
                             cached_offsets = torch.arange(K, device=device) * num_nodes_per_graph
                             cached_edge_offset = cached_offsets.view(K, 1, 1)
                             cached_edge_index = (base_edges.unsqueeze(0) + cached_edge_offset).permute(1, 0, 2).reshape(2, -1)
-                            cached_edge_attr = base_edge_attr.repeat(K, 1)
+                            cached_edge_attr = base_edge_attr.repeat(K, 1)  # [E_single*K, edge_dim]
                             cached_batch_vec = torch.arange(K, device=device).repeat_interleave(num_nodes_per_graph)
-                        
-                        # === 2. 활성 그래프만 슬라이싱 ===
+                    
+                        # === 2. 패딩된 텐서에서 활성 그래프만 슬라이싱 ===
                         act_step = torch.clamp(torch.tensor(step, device=device), max=seq_lens[active_idx] - 1)
-                        
-                        curr_nodes_k = c_seqs_pad[active_idx, step]
+                    
+                        use_tf = torch.rand(K, device=device) < tf_ratio
+                        curr_nodes_k = torch.where(
+                            use_tf | (step == 0),
+                            c_seqs_pad[active_idx, step],
+                            prev_preds[active_idx]
+                        )
                         tgt_nodes_k = t_seqs_pad[active_idx, act_step]
-                        target_labels_k = n_seqs_pad[active_idx, act_step]
-                        
-                        # === 3. 컴팩트 GNN 입력 (새 텐서 생성) ===
+                    
+                        # [DAgger] 정답 재계산: 모델 예측 위치에 있을 때 APSP 기반 올바른 행동
+                        # Teacher Forcing이 아닌 경우 → 현재 위치에서 서브골까지의 
+                        # [Fix 4] Subset 우회
+                        ds = wkr_loader.dataset.dataset if hasattr(wkr_loader.dataset, 'dataset') else wkr_loader.dataset
+                    
+                        original_labels = n_seqs_pad[active_idx, act_step]  # 원래 정답
+                        dagger_labels = apsp_next_hop_device[curr_nodes_k, tgt_nodes_k]  # APSP 재계산 정답
+                    
+                        # TF 사용 시 원래 정답, 아닌 경우 DAgger 정답 사용
+                        # 단, DAgger 정답이 -1이면 (경로 없음) 원래 정답 유지
+                        valid_dagger = (dagger_labels >= 0)
+                        target_labels_k = torch.where(
+                            (use_tf | (step == 0)) | (~valid_dagger),
+                            original_labels,
+                            dagger_labels
+                        )  # [K]
+                    
+                        # === 3. 컴팩트 GNN 입력 조립 ===
+                        # gradient checkpoint는 backward 시 입력을 재사용하므로
+                        # in-place 수정 대신 매 스텝 새 텐서 생성 (CUDA 캐싱 풀이 크기 동일 시 즉시 재할당)
                         compact_coords = node_coords_per_graph[active_idx].reshape(K * num_nodes_per_graph, 2)
-                        
-                        worker_in = torch.zeros((K * num_nodes_per_graph, 9), device=device)
-                        worker_in[:, :2] = compact_coords
-                        worker_in[cached_offsets + curr_nodes_k, 2] = 1.0
-                        worker_in[cached_offsets + tgt_nodes_k, 3] = 1.0
-                        
+                    
+                        worker_in = torch.zeros((K * num_nodes_per_graph, 8), device=device)
+                        worker_in[cached_offsets + curr_nodes_k, 0] = 1.0  # is_current
+                        worker_in[cached_offsets + tgt_nodes_k, 1] = 1.0   # is_target
+                    
                         # APSP 거리 피처
-                        val_ds = wkr_val_loader.dataset.dataset if hasattr(wkr_val_loader.dataset, 'dataset') else wkr_val_loader.dataset
-                        if hasattr(val_ds, 'apsp_matrix'):
-                            max_dst = val_ds.max_dist
-                            active_dists = apsp_device_global[tgt_nodes_k] / max_dst
-                            worker_in[:, 4] = active_dists.reshape(-1)
+                        if hasattr(ds, 'apsp_matrix'):
+                            max_dst = ds.max_dist
+                            active_dists = apsp_device_global[tgt_nodes_k] / max_dst  # [K, N]
+                            worker_in[:, 2] = active_dists.reshape(-1)
                         else:
-                            worker_in[:, 4] = 0.0
-                        
+                            worker_in[:, 2] = 0.0
+                    
                         # 방향 벡터 피처
-                        tgt_coords = compact_coords[cached_offsets + tgt_nodes_k]
-                        tgt_coords_rep = tgt_coords.repeat_interleave(num_nodes_per_graph, dim=0)
+                        tgt_coords = compact_coords[cached_offsets + tgt_nodes_k]  # [K, 2]
+                        tgt_coords_rep = tgt_coords.repeat_interleave(num_nodes_per_graph, dim=0)  # [K*N, 2]
                         diff = tgt_coords_rep - compact_coords
                         norm_val = diff.norm(dim=1, keepdim=True).clamp(min=1e-8)
-                        worker_in[:, 5:7] = diff / norm_val
+                        worker_in[:, 3:5] = diff / norm_val
                         is_final_target = (act_step == (seq_lens[active_idx] - 1)).float()
-                        worker_in[:, 7] = is_final_target.repeat_interleave(num_nodes_per_graph)
+                        worker_in[:, 5] = is_final_target.repeat_interleave(num_nodes_per_graph)
 
-                        # [Track 1] hop_dist 피처 (col 8)
-                        if hasattr(val_ds, 'hop_matrix'):
-                            hop_matrix_device = val_ds.hop_matrix.to(device)
-                            hop_dists_k = hop_matrix_device[curr_nodes_k, tgt_nodes_k]
-                            hop_dists = hop_dists_k.clone()
-                            finite_hops = hop_matrix_device[hop_matrix_device < float('inf')]
-                            max_h = float(finite_hops.max().item()) if finite_hops.numel() > 0 else 50.0
-                            worker_in[:, 8] = torch.clamp(hop_dists.float() / max_h, 0.0, 1.0).reshape(-1)
+                        # [Track 1] hop_dist 피처 (col 8): 서브골까지의 정규화된 홉 거리
+                        if hasattr(ds, 'hop_matrix'):
+                            if not hasattr(ds, '_cached_max_h'):
+                                _hm = ds.hop_matrix
+                                ds._cached_max_h = float(_hm[_hm < float('inf')].max().item()) if _hm.numel() > 0 else 50.0
+                                ds._cached_hm_dev = _hm.to(device)
+                            hop_dists_k = ds._cached_hm_dev[curr_nodes_k, tgt_nodes_k]
+                            worker_in[:, 6] = torch.clamp(hop_dists_k.float() / ds._cached_max_h, 0.0, 1.0).reshape(-1)
                         else:
-                            worker_in[:, 8] = 0.0
-                        
-                        # === 4. Forward ===
-                        h_active = h[active_idx]
-                        c_active = c[active_idx]
-                        
+                            worker_in[:, 6] = 0.0
+                    
+                        # === 4. 활성 은닉 상태 슬라이싱 & Forward ===
+                        h_active = h[active_idx]  # [K, H]
+                        c_active = c[active_idx]  # [K, H]
+                    
                         scores, h_next_k, c_next_k, _ = worker.predict_next_hop(
                             worker_in, cached_edge_index, h_active, c_active, cached_batch_vec,
                             edge_attr=cached_edge_attr
                         )
-                        
-                        # [Fix #3] no_grad() 내부이므로 clone 불필요 → 직접 대입
-                        h[active_idx] = h_next_k
-                        c[active_idx] = c_next_k
-                        
-                        # === 6. 손실 계산: Heuristic-Guided SL (Validation) ===
+                    
+                        # === 5. 은닉 상태 원본 텐서에 매핑 (BPTT 유지) ===
+                        h_new = h.clone()
+                        c_new = c.clone()
+                        h_new[active_idx] = h_next_k
+                        c_new[active_idx] = c_next_k
+                        h = h_new
+                        c = c_new
+                    
+                        # === 6. 손실 계산: Heuristic-Guided SL (CE + KL) ===
                         scores_view = scores.view(K, num_nodes_per_graph)
+                    
+                        # CE 손실: 정답 노드 학습 (DAgger 시 재계산된 정답 사용)
                         ce_loss = F.cross_entropy(scores_view, target_labels_k)
-                        dist_to_target = apsp_device_global[:, tgt_nodes_k].T / max_dist
-                        wkr_soft_labels = F.softmax(-dist_to_target / 0.1, dim=-1)
+                    
+                        # KL 손실: APSP 기반 Soft Label
+                        # [Fix] DAgger 시 curr_nodes_k 기준 서브골까지 거리 사용 (CE와 일치)
+                        # TF 모드: 원래 서브골(tgt_nodes_k) 기준
+                        # DAgger 모드: 동일하게 서브골(tgt_nodes_k) 기준이지만 curr 위치가 다름
+                        dist_to_target = apsp_device_global[:, tgt_nodes_k].T / max_dist  # [K, N]
+                        wkr_soft_labels = F.softmax(-dist_to_target / 0.1, dim=-1)  # T=0.1 (sharp)
                         log_probs = F.log_softmax(scores_view, dim=-1)
                         kl_loss = F.kl_div(log_probs, wkr_soft_labels, reduction='batchmean', log_target=False)
-                        step_loss = 0.7 * ce_loss + 0.3 * kl_loss
+                    
+                        # [Fix] DAgger 비율에 따라 KL 가중치 조절
+                        # TF 비율이 낮을수록 DAgger 정답과 KL이 충돌할 수 있으므로 KL 가중치 감소
+                        kl_weight = 0.3 * tf_ratio + 0.1 * (1.0 - tf_ratio)  # TF=1→0.3, TF=0.3→0.21
+                        step_loss = (1.0 - kl_weight) * ce_loss + kl_weight * kl_loss
+                    
+                        # Autoregressive: 예측 노드 갱신
+                        pred_k = scores_view.argmax(dim=1)  # [K]
+                        prev_preds = prev_preds.clone()
+                        prev_preds[active_idx] = pred_k
                             
-                        wkr_val_loss += step_loss.item()
-                        wkr_val_batches += 1
+                        loss_buffer.append(step_loss)
+                    
+                        # Accuracy 추적: 활성 K개 그래프의 정답 여부
+                        wkr_correct += (pred_k == target_labels_k).sum().item()
+                        wkr_total_steps += K
+                    
+                        if (step + 1) % window_size == 0 or (step + 1) == max_seq_len:
+                            if len(loss_buffer) > 0:
+                                avg_window_loss = sum(loss_buffer) / len(loss_buffer)
+                                avg_window_loss.backward()
+                                wkr_loss += avg_window_loss.item()
+                                loss_buffer.clear()
+                        
+                            # 단일 텐서 BPTT Detach
+                            h = h.detach()
+                            c = c.detach()
+                        
+                            torch.nn.utils.clip_grad_norm_(worker.parameters(), max_norm=1.0)
+                            wkr_opt.step()
+                            wkr_opt.zero_grad()
+                        
+                        if not active_mask.any():
+                            loss_buffer.clear()
+                        
+                        # 메모리 해제
+                        del worker_in, scores, h_next_k, c_next_k, h_new, c_new, scores_view, step_loss
+                        
+                    wkr_batches += (max_seq_len / window_size) # Approximate batches
+                    wkr_acc = 100 * wkr_correct / max(1, wkr_total_steps)
+                    pbar.set_postfix({'loss': f"{wkr_loss/max(1, wkr_batches):.4f}", 'acc': f"{wkr_acc:.1f}%"})
             
-                # [Fix #4] 유효 변수만 해제 (h_list, c_list는 이전 코드 잔해)
+                tqdm.write(f"Worker Train Loss: {wkr_loss/max(1, wkr_batches):.4f}, Acc: {wkr_acc:.1f}% (TF Ratio: {tf_ratio:.2f})")
+            elif wkr_frozen:
+                pass
+            else:
                 pass
         
-        mgr_val = mgr_val_loss/max(1, mgr_val_batches)
-        if epoch % WORKER_FREQ == 0 and not wkr_frozen:
-            wkr_val = wkr_val_loss/max(1, wkr_val_batches)
-            print(f"📊 Validation - Manager: {mgr_val:.4f}, Worker: {wkr_val:.4f}", flush=True)
-            # wkr_val logging
-            history['wkr_train_loss'].append(wkr_loss/max(1, wkr_batches))
-            history['wkr_val_loss'].append(wkr_val)
-            
-            # === Worker Early Stopping 체크 ===
-            if wkr_val < best_wkr_val:
-                best_wkr_val = wkr_val
-                wkr_es_counter = 0
-                best_wkr_state = copy.deepcopy(worker.state_dict())
-                print(f"  ✅ Worker Best Val Loss 갱신: {best_wkr_val:.4f}")
-            else:
-                wkr_es_counter += 1
-                print(f"  ⚠️ Worker Val Loss 미개선 ({wkr_es_counter}/{WORKER_ES_PATIENCE})")
-                if wkr_es_counter >= WORKER_ES_PATIENCE:
-                    print(f"  ⛔ Worker Early Stopping! Best Val={best_wkr_val:.4f}에서 동결.")
-                    print(f"     → Worker 가중치를 Best 시점으로 복원합니다.")
-                    worker.load_state_dict(best_wkr_state)
-                    wkr_frozen = True
-        elif wkr_frozen:
-            print(f"📊 Validation - Manager: {mgr_val:.4f}, Worker: Frozen (Best={best_wkr_val:.4f})")
-        else:
-            print(f"📊 Validation - Manager: {mgr_val:.4f}, Worker: Skipped", flush=True)
-            # Worker가 skip된 에폭에는 기록하지 않음 (learning curve에서 학습 에폭만 표시)
-            pass
+            # === Validation Loss ===
+            manager.eval()
+            worker.eval()
+            mgr_val_loss = 0
+            wkr_val_loss = 0
+            mgr_val_batches = 0
+            wkr_val_batches = 0
         
-        # === Manager Early Stopping 체크 ===
-        if mgr_val < best_mgr_val:
-            best_mgr_val = mgr_val
-            mgr_es_counter = 0
-            best_mgr_state = copy.deepcopy(manager.state_dict())
-            print(f"  ✅ Manager Best Val Loss 갱신: {best_mgr_val:.4f}")
-        else:
-            mgr_es_counter += 1
-            print(f"  ⚠️ Manager Val Loss 미개선 ({mgr_es_counter}/{MANAGER_ES_PATIENCE})")
-        
-        # 학습 곡선 기록
-        mgr_train = mgr_loss/max(1, mgr_batches)
-        # wkr_train handled above
-        history['mgr_train_loss'].append(mgr_train)
-        history['mgr_val_loss'].append(mgr_val)
-        
-        manager.train()
-        if not wkr_frozen:
-            worker.train()
-        
-        # Step LR Schedulers
-        mgr_scheduler.step(mgr_val) # ReduceLROnPlateau needs metric
-        if epoch % WORKER_FREQ == 0 and not wkr_frozen:
-            wkr_scheduler.step()
-        
-        # Get LR safely
-        current_lr_mgr = optimizer_mgr.param_groups[0]['lr']
-        current_lr_wkr = wkr_opt.param_groups[0]['lr']
-        print(f"Current LR - Manager: {current_lr_mgr:.6f}, Worker: {current_lr_wkr:.6f}", flush=True)
+            with torch.no_grad():
+                # Manager Validation
+                for batch in mgr_val_loader:
+                    batch = batch.to(device)
+                
+                    # [Robustness] Dynamic Token Definition
+                    # [Refactor] Validation Embedding Gathering
+                    mgr_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
+                    node_emb_all = manager.topology_enc(batch.x, batch.edge_index, edge_attr=mgr_edge_attr)
+                
+                    # [Fix #6] import는 파일 상단으로 이동 완료
+                    node_emb_dense, mask_dense = to_dense_batch(node_emb_all, batch.batch) # [B, N_max, H]
+                    x_dense, _ = to_dense_batch(batch.x, batch.batch) # Needed for Soft Label
+                    B, N_max, H = node_emb_dense.size()
+                
+                    EOS_IDX_for_pointer = N_max
+                    PAD_VAL = -100
+                
+                    raw_targets = batch.y # [B, L]
+                    is_valid = (raw_targets != PAD_VAL)
+                
+                    # 1. Construct Target Embeddings with EOS extension
+                    eos_emb_expanded = manager.eos_token_emb.expand(B, 1, H)
+                    full_ref_embs = torch.cat([node_emb_dense, eos_emb_expanded], dim=1) # [B, N+1, H]
+                
+                    # Gather mask & indices
+                    safe_gather_idx = raw_targets.clone()
+                    safe_gather_idx[~is_valid] = 0
+                
+                    target_seq_emb = torch.gather(full_ref_embs, 1, safe_gather_idx.unsqueeze(-1).expand(-1, -1, H))
+                    target_seq_emb = target_seq_emb * is_valid.unsqueeze(-1).float()
+                
+                    # 2. Forward Pass
+                    val_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
+                    pointer_logits = manager(batch.x, batch.edge_index, batch.batch, target_seq_emb=target_seq_emb, edge_attr=val_edge_attr)
+                
+                    # 3. Construct Targets for Loss
+                    seq_L = raw_targets.size(1)
+                    final_targets = torch.full((B, seq_L + 1), PAD_VAL, dtype=torch.long, device=device)
+                
+                    lengths = is_valid.sum(dim=1)
+                
+                    # [Optimize] 파이썬 루핑 제거 및 벡터화 연산 도입
+                    valid_mask = torch.arange(seq_L, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+                    final_targets[:, :seq_L][valid_mask] = raw_targets[valid_mask]
+                
+                    batch_indices = torch.arange(B, device=device)
+                    final_targets[batch_indices, lengths] = EOS_IDX_for_pointer
 
-        # === Manager Early Stopping: 전체 학습 종료 ===
-        if mgr_es_counter >= MANAGER_ES_PATIENCE:
-            print(f"\n⛔ Manager Early Stopping! Best Val={best_mgr_val:.4f}")
-            print(f"   → 에폭 {epoch}에서 학습 조기 종료.")
-            manager.load_state_dict(best_mgr_state)
+                    # Flatten for Loss
+                    logits_flat = pointer_logits.view(-1, N_max + 1)
+                    targets_flat = final_targets.view(-1)
+                
+                    # 4. Hybrid Loss Calculation
+                    nll_loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=PAD_VAL)
+                
+                    # Soft Label Logic
+                    real_node_mask = (targets_flat < N_max) & (targets_flat >= 0)
+                    if real_node_mask.sum() > 0:
+                        # [Fix 5] EOS 토큰을 제외한 순수 공간 노드에 대해서만 log_softmax 적용
+                        logits_nodes = pointer_logits[..., :-1]
+                        log_probs_nodes = F.log_softmax(logits_nodes, dim=-1)
+                    
+                        real_mask_2d = (final_targets < N_max) & (final_targets >= 0)
+                        safe_targets_2d = final_targets.clone()
+                        safe_targets_2d[~real_mask_2d] = 0
+                    
+                        dists = apsp_device_global[safe_targets_2d]
+                    
+                        temperature = 1.0
+                        soft_probs = F.softmax(-dists / temperature, dim=-1)
+                        del dists  # [Fix #2] Validation Soft Label 중간 텐서 즉시 해제
+                        kl_loss_raw = F.kl_div(log_probs_nodes, soft_probs, reduction='none', log_target=False)
+                        kl_loss = (kl_loss_raw.sum(dim=-1) * real_mask_2d.float()).sum() / (real_mask_2d.sum() + 1e-6)
+                    else:
+                        kl_loss = torch.tensor(0.0, device=device)
+                    
+                    loss = 0.5 * nll_loss + 0.5 * kl_loss
+                    mgr_val_loss += loss.item()
+                    mgr_val_batches += 1
+            
+                # Worker Validation (Frequency: 1/5)
+                if epoch % WORKER_FREQ == 0:
+                    for batch in wkr_val_loader:
+                        batch = batch.to(device)
+                    
+                        c_seqs = batch.c_nodes
+                        t_seqs = batch.t_nodes
+                        n_seqs = batch.n_hops
+                    
+                        val_num_graphs = len(c_seqs)
+                    
+                        # [Optimization v3] 단일 텐서 기반 은닉 상태 (Validation)
+                        h = torch.zeros(val_num_graphs, args.hidden_dim, device=device)
+                        c = torch.zeros(val_num_graphs, args.hidden_dim, device=device)
+                    
+                        # [Optimization] Validation 텐서 패딩 (CPU-GPU 싱크 병목 차단)
+                        # [Fix #6] pad_sequence import는 파일 상단으로 이동 완료
+                        c_seqs_pad = pad_sequence(c_seqs, batch_first=True, padding_value=0)
+                        t_seqs_pad = pad_sequence(t_seqs, batch_first=True, padding_value=0)
+                        n_seqs_pad = pad_sequence(n_seqs, batch_first=True, padding_value=0)
+                        seq_lens = torch.tensor([seq.size(0) for seq in c_seqs], dtype=torch.long, device=device)
+                    
+                        max_seq_len = c_seqs_pad.size(1)
+                    
+                        # [Optimization v3] 동적 배치 축소용 사전 정의 (Validation)
+                        node_coords_per_graph = batch.x[:, :2].view(val_num_graphs, -1, 2)  # [B, N, 2]
+                        num_nodes_per_graph = node_coords_per_graph.size(1)
+                        base_edges = pyg_data.edge_index.to(device)
+                        base_edge_attr = pyg_data.edge_attr[:, [0, 7, 8]].to(device)  # length+capacity+speed
+                        # [v3] Min-Max 정규화
+                        _ea_min = base_edge_attr.min(dim=0, keepdim=True)[0]
+                        _ea_max = base_edge_attr.max(dim=0, keepdim=True)[0]
+                        base_edge_attr = (base_edge_attr - _ea_min) / (_ea_max - _ea_min).clamp(min=1e-8)
+                    
+                        # [Fix A] Pre-allocation (Validation) — edge_index/batch_vec만 캐싱
+                        cached_K = val_num_graphs
+                        cached_offsets = torch.arange(val_num_graphs, device=device) * num_nodes_per_graph
+                        cached_edge_offset = cached_offsets.view(val_num_graphs, 1, 1)
+                        cached_edge_index = (base_edges.unsqueeze(0) + cached_edge_offset).permute(1, 0, 2).reshape(2, -1)
+                        cached_edge_attr = base_edge_attr.repeat(val_num_graphs, 1)
+                        cached_batch_vec = torch.arange(val_num_graphs, device=device).repeat_interleave(num_nodes_per_graph)
+                    
+                        # [Fix 4] Subset 우회
+                        val_ds = wkr_val_loader.dataset.dataset if hasattr(wkr_val_loader.dataset, 'dataset') else wkr_val_loader.dataset
+                    
+                        for step in range(max_seq_len):
+                            # === 1. 활성 그래프 인덱스 도출 ===
+                            active_mask = step < seq_lens
+                            if not active_mask.any(): break
+                        
+                            active_idx = active_mask.nonzero(as_tuple=True)[0]  # [K]
+                            K = active_idx.size(0)
+                        
+                            # [Fix A] K 변경 시에만 재계산
+                            if K != cached_K:
+                                cached_K = K
+                                cached_offsets = torch.arange(K, device=device) * num_nodes_per_graph
+                                cached_edge_offset = cached_offsets.view(K, 1, 1)
+                                cached_edge_index = (base_edges.unsqueeze(0) + cached_edge_offset).permute(1, 0, 2).reshape(2, -1)
+                                cached_edge_attr = base_edge_attr.repeat(K, 1)
+                                cached_batch_vec = torch.arange(K, device=device).repeat_interleave(num_nodes_per_graph)
+                        
+                            # === 2. 활성 그래프만 슬라이싱 ===
+                            act_step = torch.clamp(torch.tensor(step, device=device), max=seq_lens[active_idx] - 1)
+                        
+                            curr_nodes_k = c_seqs_pad[active_idx, step]
+                            tgt_nodes_k = t_seqs_pad[active_idx, act_step]
+                            target_labels_k = n_seqs_pad[active_idx, act_step]
+                        
+                            # === 3. 컴팩트 GNN 입력 (새 텐서 생성) ===
+                            compact_coords = node_coords_per_graph[active_idx].reshape(K * num_nodes_per_graph, 2)
+                        
+                            worker_in = torch.zeros((K * num_nodes_per_graph, 8), device=device)
+                            worker_in[cached_offsets + curr_nodes_k, 0] = 1.0
+                            worker_in[cached_offsets + tgt_nodes_k, 1] = 1.0
+                        
+                            # APSP 거리 피처
+                            val_ds = wkr_val_loader.dataset.dataset if hasattr(wkr_val_loader.dataset, 'dataset') else wkr_val_loader.dataset
+                            if hasattr(val_ds, 'apsp_matrix'):
+                                max_dst = val_ds.max_dist
+                                active_dists = apsp_device_global[tgt_nodes_k] / max_dst
+                                worker_in[:, 2] = active_dists.reshape(-1)
+                            else:
+                                worker_in[:, 2] = 0.0
+                        
+                            # 방향 벡터 피처
+                            tgt_coords = compact_coords[cached_offsets + tgt_nodes_k]
+                            tgt_coords_rep = tgt_coords.repeat_interleave(num_nodes_per_graph, dim=0)
+                            diff = tgt_coords_rep - compact_coords
+                            norm_val = diff.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                            worker_in[:, 3:5] = diff / norm_val
+                            is_final_target = (act_step == (seq_lens[active_idx] - 1)).float()
+                            worker_in[:, 5] = is_final_target.repeat_interleave(num_nodes_per_graph)
+
+                            # [Track 1] hop_dist 피처 (col 8)
+                            if hasattr(val_ds, 'hop_matrix'):
+                                if not hasattr(val_ds, '_cached_max_h'):
+                                    _hm = val_ds.hop_matrix
+                                    val_ds._cached_max_h = float(_hm[_hm < float('inf')].max().item()) if _hm.numel() > 0 else 50.0
+                                    val_ds._cached_hm_dev = _hm.to(device)
+                                hop_dists_k = val_ds._cached_hm_dev[curr_nodes_k, tgt_nodes_k]
+                                worker_in[:, 6] = torch.clamp(hop_dists_k.float() / val_ds._cached_max_h, 0.0, 1.0).reshape(-1)
+                            else:
+                                worker_in[:, 6] = 0.0
+                        
+                            # === 4. Forward ===
+                            h_active = h[active_idx]
+                            c_active = c[active_idx]
+                        
+                            scores, h_next_k, c_next_k, _ = worker.predict_next_hop(
+                                worker_in, cached_edge_index, h_active, c_active, cached_batch_vec,
+                                edge_attr=cached_edge_attr
+                            )
+                        
+                            # [Fix #3] no_grad() 내부이므로 clone 불필요 → 직접 대입
+                            h[active_idx] = h_next_k
+                            c[active_idx] = c_next_k
+                        
+                            # === 6. 손실 계산: Heuristic-Guided SL (Validation) ===
+                            scores_view = scores.view(K, num_nodes_per_graph)
+                            ce_loss = F.cross_entropy(scores_view, target_labels_k)
+                            dist_to_target = apsp_device_global[:, tgt_nodes_k].T / max_dist
+                            wkr_soft_labels = F.softmax(-dist_to_target / 0.1, dim=-1)
+                            log_probs = F.log_softmax(scores_view, dim=-1)
+                            kl_loss = F.kl_div(log_probs, wkr_soft_labels, reduction='batchmean', log_target=False)
+                            step_loss = 0.7 * ce_loss + 0.3 * kl_loss
+                            
+                            wkr_val_loss += step_loss.item()
+                            wkr_val_batches += 1
+            
+                    # [Fix #4] 유효 변수만 해제 (h_list, c_list는 이전 코드 잔해)
+                    pass
+        
+            mgr_val = mgr_val_loss/max(1, mgr_val_batches)
+            if epoch % WORKER_FREQ == 0 and not wkr_frozen:
+                wkr_val = wkr_val_loss/max(1, wkr_val_batches)
+                tqdm.write(f"📊 Validation - Manager: {mgr_val:.4f}, Worker: {wkr_val:.4f}")
+                # wkr_val logging
+                history['wkr_train_loss'].append(wkr_loss/max(1, wkr_batches))
+                history['wkr_val_loss'].append(wkr_val)
+            
+                # === Worker Early Stopping 체크 ===
+                if wkr_val < best_wkr_val:
+                    best_wkr_val = wkr_val
+                    wkr_es_counter = 0
+                    best_wkr_state = copy.deepcopy(worker.state_dict())
+                    tqdm.write(f"  ✅ Worker Best Val Loss 갱신: {best_wkr_val:.4f}")
+                else:
+                    wkr_es_counter += 1
+                    tqdm.write(f"  ⚠️ Worker Val Loss 미개선 ({wkr_es_counter}/{WORKER_ES_PATIENCE})")
+                    if wkr_es_counter >= WORKER_ES_PATIENCE:
+                        tqdm.write(f"  ⛔ Worker Early Stopping! Best Val={best_wkr_val:.4f}에서 동결.")
+                        tqdm.write(f"     → Worker 가중치를 Best 시점으로 복원합니다.")
+                        worker.load_state_dict(best_wkr_state)
+                        wkr_frozen = True
+            elif wkr_frozen:
+                pass
+            else:
+                pass
+        
+            # === Manager Early Stopping 체크 ===
+            if mgr_val < best_mgr_val:
+                best_mgr_val = mgr_val
+                mgr_es_counter = 0
+                best_mgr_state = copy.deepcopy(manager.state_dict())
+                tqdm.write(f"  ✅ Manager Best Val Loss 갱신: {best_mgr_val:.4f}")
+            else:
+                mgr_es_counter += 1
+                tqdm.write(f"  ⚠️ Manager Val Loss 미개선 ({mgr_es_counter}/{MANAGER_ES_PATIENCE})")
+        
+            # 학습 곡선 기록
+            mgr_train = mgr_loss/max(1, mgr_batches)
+            # wkr_train handled above
+            history['mgr_train_loss'].append(mgr_train)
+            history['mgr_val_loss'].append(mgr_val)
+        
+            manager.train()
             if not wkr_frozen:
-                # Worker도 마지막 best로 복원
-                worker.load_state_dict(best_wkr_state)
-            break
+                worker.train()
+        
+            # Step LR Schedulers
+            mgr_scheduler.step(mgr_val) # ReduceLROnPlateau needs metric
+            if epoch % WORKER_FREQ == 0 and not wkr_frozen:
+                wkr_scheduler.step()
+        
+            # Get LR safely
+            current_lr_mgr = optimizer_mgr.param_groups[0]['lr']
+            current_lr_wkr = wkr_opt.param_groups[0]['lr']
+            tqdm.write(f"Current LR - Manager: {current_lr_mgr:.6f}, Worker: {current_lr_wkr:.6f}")
+
+            # === Manager Early Stopping: 전체 학습 종료 ===
+            if mgr_es_counter >= MANAGER_ES_PATIENCE:
+                tqdm.write(f"\n⛔ Manager Early Stopping! Best Val={best_mgr_val:.4f}")
+                print(f"   → 에폭 {epoch}에서 학습 조기 종료.")
+                manager.load_state_dict(best_mgr_state)
+                if not wkr_frozen:
+                    # Worker도 마지막 best로 복원
+                    worker.load_state_dict(best_wkr_state)
+                break
     
+
+
+    # Worker GPU allocation copies
+    apsp_device_wkr = apsp_device_global.to(device_wkr) if 'apsp_device_global' in locals() else None
+    apsp_next_hop_wkr = apsp_next_hop_device.to(device_wkr) if 'apsp_next_hop_device' in locals() else None
+    
+    def run_manager_pipeline():
+        nonlocal best_mgr_val, mgr_es_counter, best_mgr_state
+        mgr_pbar = tqdm(total=args.epochs, desc="Manager SL", position=0, dynamic_ncols=True)
+        for epoch in range(1, args.epochs + 1):
+            # --- Manager Train ---
+            if not getattr(args, 'worker_only', False):
+                manager.train()
+            mgr_loss = 0
+            mgr_batches = 0
+            mgr_correct = 0
+            mgr_total = 0
+        
+            mgr_batch_iter = tqdm(mgr_loader, desc=f"  Mgr Train Ep{epoch}", leave=False, position=2, dynamic_ncols=True)
+            for batch in mgr_batch_iter:
+                batch = batch.to(device)
+                # === Manager Training (Inductive Pointer Network) ===
+                optimizer_mgr.zero_grad()
+            
+                # [Robustness] Dynamic Token Definition based on current batch's graph
+                # 1. Project Features & Dense Batching
+                # [Refactor] Teacher Forcing Logic:
+                # We calculate embeddings EXTERNALLY and pass them to Manager.
+                mgr_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
+                node_emb_all = manager.topology_enc(batch.x, batch.edge_index, edge_attr=mgr_edge_attr) # [B*N, Hidden]
+            
+                # [Fix #6] import는 파일 상단으로 이동 완료
+                node_emb_dense, mask_dense = to_dense_batch(node_emb_all, batch.batch) # [B, N_max, H]
+                x_dense, _ = to_dense_batch(batch.x, batch.batch) # [B, N_max, F]
+            
+                B, N_max, H = node_emb_dense.size()
+            
+                # Dynamic Special Tokens
+                # Valid Nodes: 0 ~ N_max-1
+                # EOS Index: N_max (Virtual Node)
+                # PAD Index: -100 (Ignored in Loss)
+                EOS_IDX_for_pointer = N_max
+            
+                # 2. Prepare Target Sequence (Indices)
+                raw_targets = batch.y # [B, L]
+                is_valid = (raw_targets != -100)
+            
+                # 3. Create Target Embeddings
+                # Extend Reference Embeddings with EOS
+                eos_emb_expanded = manager.eos_token_emb.expand(B, 1, H)
+                full_ref_embs = torch.cat([node_emb_dense, eos_emb_expanded], dim=1) # [B, N+1, H]
+            
+                # Gather mask & indices
+                # raw_targets has indices 0~N-1, or -100
+                safe_gather_idx = raw_targets.clone()
+                safe_gather_idx[~is_valid] = 0
+            
+                # Gather Embeddings [B, L, H]
+                target_seq_emb = torch.gather(full_ref_embs, 1, safe_gather_idx.unsqueeze(-1).expand(-1, -1, H))
+            
+                # Mask out embedding for PAD positions
+                target_seq_emb = target_seq_emb * is_valid.unsqueeze(-1).float()
+            
+                # Call Forward
+                # target_seq_emb: [B, L, H]
+                # edge_attr: Manager DataLoader에 edge_attr가 없을 수 있으므로 None-safe 처리
+                mgr_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
+                pointer_logits = manager(batch.x, batch.edge_index, batch.batch, target_seq_emb=target_seq_emb, edge_attr=mgr_edge_attr)
+                # logits: [B, L+1, N+1] (Time steps shifted by 1 due to SOS)
+            
+                # 3. Construct Final Targets [B, L+1]
+                # Input:  [SOS, n1, n2, ..., nk] (implicitly constructed by fwd)
+                # Target: [n1,  n2, ..., nk, EOS]
+            
+                seq_L = raw_targets.size(1)
+                final_targets = torch.full((B, seq_L + 1), -100, dtype=torch.long, device=device)
+            
+                lengths = is_valid.sum(dim=1) # [B]
+            
+                # [Optimize] 파이썬 루핑 제거 및 벡터화 연산 도입 (CPU-GPU 동기화 병목 해소)
+                valid_mask = torch.arange(seq_L, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+                final_targets[:, :seq_L][valid_mask] = raw_targets[valid_mask]
+            
+                batch_indices = torch.arange(B, device=device)
+                final_targets[batch_indices, lengths] = EOS_IDX_for_pointer
+            
+                # Flatten for Loss
+                logits_flat = pointer_logits.view(-1, N_max + 1) # [B*(L+1), N+1]
+                targets_flat = final_targets.view(-1)            # [B*(L+1)]
+            
+                # 1. NLL Loss
+                nll_loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=-100)
+            
+                # 2. Soft Label Loss (Only for Real Node Targets)
+                # Mask for Real Nodes (Target < N_max and Target != -100)
+                real_node_mask = (targets_flat < N_max) & (targets_flat >= 0)
+            
+                if real_node_mask.sum() > 0:
+                    # [Fix 5] EOS 토큰을 제외한 순수 공간 노드에 대해서만 log_softmax 적용
+                    logits_nodes = pointer_logits[..., :-1] # [B, L+1, N_max]
+                    log_probs_nodes = F.log_softmax(logits_nodes, dim=-1) 
+                
+                    # Get Network Distances for Soft Label
+                    # We use the pre-computed APSP matrix for topologically accurate distances.
+                    real_mask_2d = (final_targets < N_max) & (final_targets >= 0)
+                    safe_targets_2d = final_targets.clone()
+                    safe_targets_2d[~real_mask_2d] = 0
+                
+                    dists = apsp_device_global[safe_targets_2d] # [B, L+1, N_max]
+                
+                    # [Hyperparam] Soft Label Temperature
+                    temperature = 1.0 
+                    soft_probs = F.softmax(-dists / temperature, dim=-1) # [B, L+1, N_max]
+                    del dists  # [Fix #2] Soft Label 중간 텐서 즉시 해제 (~50MB/batch 회수)
+                
+                    kl_loss_raw = F.kl_div(log_probs_nodes, soft_probs, reduction='none', log_target=False) # [B, L+1, N_max]
+                
+                    # Sum over node classes, then mask
+                    kl_loss = (kl_loss_raw.sum(dim=-1) * real_mask_2d.float()).sum() / (real_mask_2d.sum() + 1e-6)
+                else:
+                    kl_loss = torch.tensor(0.0, device=device)
+            
+                # Total Loss
+                loss = 0.5 * nll_loss + 0.5 * kl_loss
+            
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Warning: NaN/Inf Loss detected. Skipping batch.")
+                    continue
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(manager.parameters(), max_norm=1.0)
+                optimizer_mgr.step()
+            
+                mgr_loss += loss.item()
+                mgr_batches += 1
+            
+                # Accuracy
+                pred_tokens = torch.argmax(pointer_logits, dim=-1)
+                correct = (pred_tokens == final_targets) & (final_targets != -100)
+                mgr_correct += correct.sum().item()
+                mgr_total += (final_targets != -100).sum().item()
+                
+                mgr_batch_iter.set_postfix({
+                    'loss': f"{mgr_loss/max(1, mgr_batches):.4f}", 
+                    'lr': f"{optimizer_mgr.param_groups[0]['lr']:.2e}", 
+                    'acc': f"{100*mgr_correct/max(1,mgr_total):.1f}%"
+                })
+            
+            mgr_pbar.set_postfix({
+                'loss': f"{mgr_loss/max(1, mgr_batches):.4f}", 
+                'lr': f"{optimizer_mgr.param_groups[0]['lr']:.2e}", 
+                'acc': f"{100*mgr_correct/max(1,mgr_total):.1f}%"
+            })
+            
+            manager.eval()
+            mgr_val_loss = 0
+            mgr_val_batches = 0
+            with torch.no_grad():
+                # Manager Validation
+                mgr_val_iter = tqdm(mgr_val_loader, desc=f"  Mgr Val Ep{epoch}", leave=False, position=2, dynamic_ncols=True)
+                for batch in mgr_val_iter:
+                    batch = batch.to(device)
+                
+                    # [Robustness] Dynamic Token Definition
+                    # [Refactor] Validation Embedding Gathering
+                    mgr_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
+                    node_emb_all = manager.topology_enc(batch.x, batch.edge_index, edge_attr=mgr_edge_attr)
+                
+                    # [Fix #6] import는 파일 상단으로 이동 완료
+                    node_emb_dense, mask_dense = to_dense_batch(node_emb_all, batch.batch) # [B, N_max, H]
+                    x_dense, _ = to_dense_batch(batch.x, batch.batch) # Needed for Soft Label
+                    B, N_max, H = node_emb_dense.size()
+                
+                    EOS_IDX_for_pointer = N_max
+                    PAD_VAL = -100
+                
+                    raw_targets = batch.y # [B, L]
+                    is_valid = (raw_targets != PAD_VAL)
+                
+                    # 1. Construct Target Embeddings with EOS extension
+                    eos_emb_expanded = manager.eos_token_emb.expand(B, 1, H)
+                    full_ref_embs = torch.cat([node_emb_dense, eos_emb_expanded], dim=1) # [B, N+1, H]
+                
+                    # Gather mask & indices
+                    safe_gather_idx = raw_targets.clone()
+                    safe_gather_idx[~is_valid] = 0
+                
+                    target_seq_emb = torch.gather(full_ref_embs, 1, safe_gather_idx.unsqueeze(-1).expand(-1, -1, H))
+                    target_seq_emb = target_seq_emb * is_valid.unsqueeze(-1).float()
+                
+                    # 2. Forward Pass
+                    val_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
+                    pointer_logits = manager(batch.x, batch.edge_index, batch.batch, target_seq_emb=target_seq_emb, edge_attr=val_edge_attr)
+                
+                    # 3. Construct Targets for Loss
+                    seq_L = raw_targets.size(1)
+                    final_targets = torch.full((B, seq_L + 1), PAD_VAL, dtype=torch.long, device=device)
+                
+                    lengths = is_valid.sum(dim=1)
+                
+                    # [Optimize] 파이썬 루핑 제거 및 벡터화 연산 도입
+                    valid_mask = torch.arange(seq_L, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+                    final_targets[:, :seq_L][valid_mask] = raw_targets[valid_mask]
+                
+                    batch_indices = torch.arange(B, device=device)
+                    final_targets[batch_indices, lengths] = EOS_IDX_for_pointer
+
+                    # Flatten for Loss
+                    logits_flat = pointer_logits.view(-1, N_max + 1)
+                    targets_flat = final_targets.view(-1)
+                
+                    # 4. Hybrid Loss Calculation
+                    nll_loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=PAD_VAL)
+                
+                    # Soft Label Logic
+                    real_node_mask = (targets_flat < N_max) & (targets_flat >= 0)
+                    if real_node_mask.sum() > 0:
+                        # [Fix 5] EOS 토큰을 제외한 순수 공간 노드에 대해서만 log_softmax 적용
+                        logits_nodes = pointer_logits[..., :-1]
+                        log_probs_nodes = F.log_softmax(logits_nodes, dim=-1)
+                    
+                        real_mask_2d = (final_targets < N_max) & (final_targets >= 0)
+                        safe_targets_2d = final_targets.clone()
+                        safe_targets_2d[~real_mask_2d] = 0
+                    
+                        dists = apsp_device_global[safe_targets_2d]
+                    
+                        temperature = 1.0
+                        soft_probs = F.softmax(-dists / temperature, dim=-1)
+                        del dists  # [Fix #2] Validation Soft Label 중간 텐서 즉시 해제
+                        kl_loss_raw = F.kl_div(log_probs_nodes, soft_probs, reduction='none', log_target=False)
+                        kl_loss = (kl_loss_raw.sum(dim=-1) * real_mask_2d.float()).sum() / (real_mask_2d.sum() + 1e-6)
+                    else:
+                        kl_loss = torch.tensor(0.0, device=device)
+                    
+                    loss = 0.5 * nll_loss + 0.5 * kl_loss
+                    mgr_val_loss += loss.item()
+                    mgr_val_batches += 1
+                    
+                    mgr_val_iter.set_postfix({'loss': f"{mgr_val_loss/max(1, mgr_val_batches):.4f}"})
+            
+            mgr_val = mgr_val_loss/max(1, mgr_val_batches)
+            # === Manager Early Stopping 체크 ===
+            if mgr_val < best_mgr_val:
+                best_mgr_val = mgr_val
+                mgr_es_counter = 0
+                best_mgr_state = copy.deepcopy(manager.state_dict())
+                tqdm.write(f"  ✅ Manager Best Val Loss 갱신: {best_mgr_val:.4f}")
+            else:
+                mgr_es_counter += 1
+                tqdm.write(f"  ⚠️ Manager Val Loss 미개선 ({mgr_es_counter}/{MANAGER_ES_PATIENCE})")
+        
+            mgr_train = mgr_loss/max(1, mgr_batches)
+            history['mgr_train_loss'].append(mgr_train)
+            history['mgr_val_loss'].append(mgr_val)
+            mgr_scheduler.step(mgr_val) # ReduceLROnPlateau needs metric
+            current_lr_mgr = optimizer_mgr.param_groups[0]['lr']
+            mgr_pbar.set_postfix({'loss': f"{mgr_val:.4f}", 'lr': f"{current_lr_mgr:.2e}"})
+            mgr_pbar.update(1)
+            # === Manager Early Stopping: 전체 학습 종료 ===
+            if mgr_es_counter >= MANAGER_ES_PATIENCE:
+                tqdm.write(f"\n⛔ Manager Early Stopping! Best Val={best_mgr_val:.4f}")
+                print(f"   → 에폭 {epoch}에서 학습 조기 종료.", flush=True)
+                manager.load_state_dict(best_mgr_state)
+                break
+
+    def run_worker_pipeline():
+        nonlocal best_wkr_val, wkr_es_counter, best_wkr_state, wkr_frozen
+        WORKER_FREQ = 2  # Worker 에포크 = args.epochs // WORKER_FREQ
+        wkr_epochs = args.epochs // WORKER_FREQ
+        wkr_pbar = tqdm(total=wkr_epochs, desc="Worker SL", position=1, dynamic_ncols=True)
+        for epoch in range(1, wkr_epochs + 1):
+            # --- Worker Train ---
+            # [v3] Parallel 모드: Worker 전용 에포크 수만큼 매 에포크 학습
+        
+            # [DAgger] TF Ratio 감소: 0.3까지 감소 (원래 경로 감독 유지)
+            tf_ratio = max(0.3, 1.0 - 1.5 * (epoch - 1) / wkr_epochs)
+            window_size = 5  # 다중 스텝 언롤링(Multi-step Unrolling) 윈도우 크기
+        
+            if not wkr_frozen:
+                worker.train()
+                wkr_loss = 0
+                wkr_batches = 0
+                wkr_correct = 0
+                wkr_total_steps = 0
+            
+                wkr_batch_iter = tqdm(wkr_loader, desc=f"  Worker Ep{epoch}", leave=False, position=2, dynamic_ncols=True)
+                batch_idx = 0
+                for batch in wkr_batch_iter:
+                    batch = batch.to(device_wkr)
+                
+                    # 시퀀스 데이터 로드
+                    # segment_loader에서 c_nodes, t_nodes, n_hops 리스트 반환함
+                    c_seqs = batch.c_nodes
+                    t_seqs = batch.t_nodes
+                    n_seqs = batch.n_hops
+                
+                    num_graphs = len(c_seqs) # 배치 내 그래프(경로) 개수
+                
+                    wkr_opt.zero_grad()
+                
+                    # [Optimization] 단일 텐서 기반 은닉 상태 관리 (리스트 제거)
+                    h = torch.zeros(num_graphs, args.hidden_dim, device=device_wkr)
+                    c = torch.zeros(num_graphs, args.hidden_dim, device=device_wkr)
+                
+                    # [Optimization] 벡터 추출을 위한 시퀀스 텐서 패딩 (CPU-GPU 동기화 병목 방지)
+                    # [Fix #6] pad_sequence import는 파일 상단으로 이동 완료
+                    c_seqs_pad = pad_sequence(c_seqs, batch_first=True, padding_value=0) # [B, Max_Seq_Len]
+                    t_seqs_pad = pad_sequence(t_seqs, batch_first=True, padding_value=0)
+                    n_seqs_pad = pad_sequence(n_seqs, batch_first=True, padding_value=0)
+                    seq_lens = torch.tensor([seq.size(0) for seq in c_seqs], dtype=torch.long, device=device_wkr)
+                
+                    max_seq_len = c_seqs_pad.size(1)
+                
+                    loss_buffer = [] # 윈도우 손실 버퍼
+                
+                    # 이전 스텝의 예측 노드 (Autoregressive 용도)
+                    prev_preds = c_seqs_pad[:, 0].clone() # [B]
+                
+                    # [Optimization v3] 동적 배치 축소를 위한 기본 변수 사전 정의 (루프 밖)
+                    node_coords_per_graph = batch.x[:, :2].view(num_graphs, -1, 2)  # [B, N, 2]
+                    num_nodes_per_graph = node_coords_per_graph.size(1)
+                    base_edges = pyg_data.edge_index.to(device_wkr)  # [2, E_single]
+                    base_edge_attr = pyg_data.edge_attr[:, [0, 7, 8]].to(device_wkr)  # [E_single, 3] length+capacity+speed
+                    # [v3] Min-Max 정규화: GATv2 attention 편향 방지
+                    _ea_min = base_edge_attr.min(dim=0, keepdim=True)[0]
+                    _ea_max = base_edge_attr.max(dim=0, keepdim=True)[0]
+                    base_edge_attr = (base_edge_attr - _ea_min) / (_ea_max - _ea_min).clamp(min=1e-8)
+                    num_edges_per_graph = base_edges.size(1)
+                
+                    # [Fix A] Pre-allocation: 초기 K=num_graphs에 대해 사전 계산
+                    # K가 줄어들 때만 재계산 (대부분의 스텝에서 재활용)
+                    cached_K = num_graphs
+                    cached_offsets = torch.arange(num_graphs, device=device_wkr) * num_nodes_per_graph
+                    cached_edge_offset = cached_offsets.view(num_graphs, 1, 1)
+                    cached_edge_index = (base_edges.unsqueeze(0) + cached_edge_offset).permute(1, 0, 2).reshape(2, -1)
+                    cached_edge_attr = base_edge_attr.repeat(num_graphs, 1)  # [E_single*K, edge_dim]
+                    cached_batch_vec = torch.arange(num_graphs, device=device_wkr).repeat_interleave(num_nodes_per_graph)
+                
+                    for step in range(max_seq_len):
+                        # === 1. 활성 그래프 인덱스 도출 ===
+                        active_mask = step < seq_lens  # [B] 전체 배치 마스크
+                        if not active_mask.any(): break
+                    
+                        active_idx = active_mask.nonzero(as_tuple=True)[0]  # [K] 활성 인덱스
+                        K = active_idx.size(0)
+                    
+                        # [Fix A] K가 변했을 때만 edge_index/batch_vec 재계산
+                        # (edge_index/batch_vec는 gradient graph에 참여하지 않으므로 캐싱 안전)
+                        if K != cached_K:
+                            cached_K = K
+                            cached_offsets = torch.arange(K, device=device_wkr) * num_nodes_per_graph
+                            cached_edge_offset = cached_offsets.view(K, 1, 1)
+                            cached_edge_index = (base_edges.unsqueeze(0) + cached_edge_offset).permute(1, 0, 2).reshape(2, -1)
+                            cached_edge_attr = base_edge_attr.repeat(K, 1)  # [E_single*K, edge_dim]
+                            cached_batch_vec = torch.arange(K, device=device_wkr).repeat_interleave(num_nodes_per_graph)
+                    
+                        # === 2. 패딩된 텐서에서 활성 그래프만 슬라이싱 ===
+                        act_step = torch.clamp(torch.tensor(step, device=device_wkr), max=seq_lens[active_idx] - 1)
+                    
+                        use_tf = torch.rand(K, device=device_wkr) < tf_ratio
+                        curr_nodes_k = torch.where(
+                            use_tf | (step == 0),
+                            c_seqs_pad[active_idx, step],
+                            prev_preds[active_idx]
+                        )
+                        tgt_nodes_k = t_seqs_pad[active_idx, act_step]
+                    
+                        # [DAgger] 정답 재계산: 모델 예측 위치에 있을 때 APSP 기반 올바른 행동
+                        # Teacher Forcing이 아닌 경우 → 현재 위치에서 서브골까지의 
+                        # [Fix 4] Subset 우회
+                        ds = wkr_loader.dataset.dataset if hasattr(wkr_loader.dataset, 'dataset') else wkr_loader.dataset
+                    
+                        original_labels = n_seqs_pad[active_idx, act_step]  # 원래 정답
+                        dagger_labels = apsp_next_hop_wkr[curr_nodes_k, tgt_nodes_k]  # APSP 재계산 정답
+                    
+                        # TF 사용 시 원래 정답, 아닌 경우 DAgger 정답 사용
+                        # 단, DAgger 정답이 -1이면 (경로 없음) 원래 정답 유지
+                        valid_dagger = (dagger_labels >= 0)
+                        target_labels_k = torch.where(
+                            (use_tf | (step == 0)) | (~valid_dagger),
+                            original_labels,
+                            dagger_labels
+                        )  # [K]
+                    
+                        # === 3. 컴팩트 GNN 입력 조립 (v4 Architecture) ===
+                        compact_coords = node_coords_per_graph[active_idx].reshape(K * num_nodes_per_graph, 2)
+                        
+                        worker_in = torch.zeros((K * num_nodes_per_graph, 8), device=device_wkr)
+                        
+                        # 0: is_curr
+                        worker_in[cached_offsets + curr_nodes_k, 0] = 1.0  
+                        
+                        # 1: is_subgoal
+                        worker_in[cached_offsets + tgt_nodes_k, 1] = 1.0   
+                        
+                        # SL 훈련을 위한 최종 목적지 추출 (시퀀스의 마지막 노드)
+                        final_nodes_k = c_seqs_pad[active_idx, seq_lens[active_idx] - 1]
+                        
+                        # 2: is_final_goal
+                        worker_in[cached_offsets + final_nodes_k, 2] = 1.0 
+                        
+                        # 위상학적 특성 캐싱 확인
+                        if not hasattr(ds, '_cached_max_h_wkr'):
+                            _hm = ds.hop_matrix
+                            ds._cached_max_h_wkr = float(_hm[_hm < float('inf')].max().item()) if _hm.numel() > 0 else 50.0
+                            ds._cached_hm_dev_wkr = _hm.to(device_wkr)
+                        
+                        # 3: hop_to_subgoal (각 노드 -> 서브골)
+                        hop_to_sub_k = ds._cached_hm_dev_wkr[:, tgt_nodes_k].T  # [K, N]
+                        worker_in[:, 3] = torch.clamp(hop_to_sub_k.float() / ds._cached_max_h_wkr, 0.0, 1.0).reshape(-1)
+                        
+                        # 4: hop_to_final (각 노드 -> 최종 목적지)
+                        hop_to_final_k = ds._cached_hm_dev_wkr[:, final_nodes_k].T  # [K, N]
+                        worker_in[:, 4] = torch.clamp(hop_to_final_k.float() / ds._cached_max_h_wkr, 0.0, 1.0).reshape(-1)
+                        
+                        # 5, 6: global_heading_x, y (각 노드 -> 최종 목적지 유클리드 방향 단위벡터)
+                        final_coords_k = compact_coords[cached_offsets + final_nodes_k]  # [K, 2]
+                        final_coords_rep = final_coords_k.repeat_interleave(num_nodes_per_graph, dim=0)  # [K*N, 2]
+                        diff_final = final_coords_rep - compact_coords
+                        norm_final = diff_final.norm(dim=1, keepdim=True).clamp(min=1e-6)
+                        worker_in[:, 5:7] = diff_final / norm_final
+                        
+                        # 7: time_to_go (남은 스텝 비율)
+                        time_to_go_val = 1.0 - (float(step) / max(max_seq_len, 1))
+                        worker_in[:, 7] = time_to_go_val
+                    
+                        # === 4. 활성 은닉 상태 슬라이싱 & Forward ===
+                        h_active = h[active_idx]  # [K, H]
+                        c_active = c[active_idx]  # [K, H]
+                    
+                        scores, h_next_k, c_next_k, _ = worker.predict_next_hop(
+                            worker_in, cached_edge_index, h_active, c_active, cached_batch_vec,
+                            edge_attr=cached_edge_attr
+                        )
+                    
+                        # === 5. 은닉 상태 원본 텐서에 매핑 (BPTT 유지) ===
+                        h_new = h.clone()
+                        c_new = c.clone()
+                        h_new[active_idx] = h_next_k
+                        c_new[active_idx] = c_next_k
+                        h = h_new
+                        c = c_new
+                    
+                        # === 6. 손실 계산: Heuristic-Guided SL (CE + KL) ===
+                        scores_view = scores.view(K, num_nodes_per_graph)
+                    
+                        # CE 손실: 정답 노드 학습 (DAgger 시 재계산된 정답 사용)
+                        ce_loss = F.cross_entropy(scores_view, target_labels_k)
+                    
+                        # KL 손실: APSP 기반 Soft Label
+                        # [Fix] DAgger 시 curr_nodes_k 기준 서브골까지 거리 사용 (CE와 일치)
+                        # TF 모드: 원래 서브골(tgt_nodes_k) 기준
+                        # DAgger 모드: 동일하게 서브골(tgt_nodes_k) 기준이지만 curr 위치가 다름
+                        dist_to_target = apsp_device_wkr[:, tgt_nodes_k].T / max_dist  # [K, N]
+                        wkr_soft_labels = F.softmax(-dist_to_target / 0.1, dim=-1)  # T=0.1 (sharp)
+                        log_probs = F.log_softmax(scores_view, dim=-1)
+                        kl_loss = F.kl_div(log_probs, wkr_soft_labels, reduction='batchmean', log_target=False)
+                    
+                        # [Fix] DAgger 비율에 따라 KL 가중치 조절
+                        # TF 비율이 낮을수록 DAgger 정답과 KL이 충돌할 수 있으므로 KL 가중치 감소
+                        kl_weight = 0.3 * tf_ratio + 0.1 * (1.0 - tf_ratio)  # TF=1→0.3, TF=0.3→0.21
+                        step_loss = (1.0 - kl_weight) * ce_loss + kl_weight * kl_loss
+                    
+                        # Autoregressive: 예측 노드 갱신
+                        pred_k = scores_view.argmax(dim=1)  # [K]
+                        prev_preds = prev_preds.clone()
+                        prev_preds[active_idx] = pred_k
+                            
+                        loss_buffer.append(step_loss)
+                    
+                        # Accuracy 추적: 활성 K개 그래프의 정답 여부
+                        wkr_correct += (pred_k == target_labels_k).sum().item()
+                        wkr_total_steps += K
+                    
+                        if (step + 1) % window_size == 0 or (step + 1) == max_seq_len:
+                            if len(loss_buffer) > 0:
+                                avg_window_loss = sum(loss_buffer) / len(loss_buffer)
+                                avg_window_loss.backward()
+                                wkr_loss += avg_window_loss.item()
+                                loss_buffer.clear()
+                        
+                            # 단일 텐서 BPTT Detach
+                            h = h.detach()
+                            c = c.detach()
+                        
+                            torch.nn.utils.clip_grad_norm_(worker.parameters(), max_norm=1.0)
+                            wkr_opt.step()
+                            wkr_opt.zero_grad()
+                        
+                        if not active_mask.any():
+                            loss_buffer.clear()
+                        
+                        # 메모리 해제
+                        del worker_in, scores, h_next_k, c_next_k, h_new, c_new, scores_view, step_loss
+                        
+                    wkr_acc = 100 * wkr_correct / max(1, wkr_total_steps)
+                    batch_idx += 1
+                    wkr_batch_iter.set_postfix({
+                        'loss': f"{wkr_loss/max(1, wkr_batches):.4f}",
+                        'acc': f"{wkr_acc:.1f}%",
+                        'seq': f"{max_seq_len}"
+                    })
+                wkr_pbar.set_postfix({
+                    'loss': f"{wkr_loss/max(1, wkr_batches):.4f}",
+                    'lr': f"{wkr_opt.param_groups[0]['lr']:.2e}",
+                    'acc': f"{wkr_acc:.1f}%"
+                })
+            
+                pass
+            elif wkr_frozen:
+                pass
+            else:
+                pass
+        
+            worker.eval()
+            wkr_val_loss = 0
+            wkr_val_batches = 0
+            with torch.no_grad():
+                # Worker Validation (매 에포크)
+                if not wkr_frozen:
+                    wkr_val_iter = tqdm(wkr_val_loader, desc=f"  Worker Val Ep{epoch}", leave=False, position=2, dynamic_ncols=True)
+                    for batch in wkr_val_iter:
+                        batch = batch.to(device_wkr)
+                    
+                        c_seqs = batch.c_nodes
+                        t_seqs = batch.t_nodes
+                        n_seqs = batch.n_hops
+                    
+                        val_num_graphs = len(c_seqs)
+                    
+                        # [Optimization v3] 단일 텐서 기반 은닉 상태 (Validation)
+                        h = torch.zeros(val_num_graphs, args.hidden_dim, device=device_wkr)
+                        c = torch.zeros(val_num_graphs, args.hidden_dim, device=device_wkr)
+                    
+                        # [Optimization] Validation 텐서 패딩 (CPU-GPU 싱크 병목 차단)
+                        # [Fix #6] pad_sequence import는 파일 상단으로 이동 완료
+                        c_seqs_pad = pad_sequence(c_seqs, batch_first=True, padding_value=0)
+                        t_seqs_pad = pad_sequence(t_seqs, batch_first=True, padding_value=0)
+                        n_seqs_pad = pad_sequence(n_seqs, batch_first=True, padding_value=0)
+                        seq_lens = torch.tensor([seq.size(0) for seq in c_seqs], dtype=torch.long, device=device_wkr)
+                    
+                        max_seq_len = c_seqs_pad.size(1)
+                    
+                        # [Optimization v3] 동적 배치 축소용 사전 정의 (Validation)
+                        node_coords_per_graph = batch.x[:, :2].view(val_num_graphs, -1, 2)  # [B, N, 2]
+                        num_nodes_per_graph = node_coords_per_graph.size(1)
+                        base_edges = pyg_data.edge_index.to(device_wkr)
+                        base_edge_attr = pyg_data.edge_attr[:, [0, 7, 8]].to(device_wkr)  # length+capacity+speed
+                        # [v4] Global Z-score 정규화
+                        _ea_mean = base_edge_attr.mean(dim=0, keepdim=True)
+                        _ea_std = base_edge_attr.std(dim=0, keepdim=True).clamp(min=1e-8)
+                        base_edge_attr = (base_edge_attr - _ea_mean) / _ea_std
+                    
+                        # [Fix A] Pre-allocation (Validation) — edge_index/batch_vec만 캐싱
+                        cached_K = val_num_graphs
+                        cached_offsets = torch.arange(val_num_graphs, device=device_wkr) * num_nodes_per_graph
+                        cached_edge_offset = cached_offsets.view(val_num_graphs, 1, 1)
+                        cached_edge_index = (base_edges.unsqueeze(0) + cached_edge_offset).permute(1, 0, 2).reshape(2, -1)
+                        cached_edge_attr = base_edge_attr.repeat(val_num_graphs, 1)
+                        cached_batch_vec = torch.arange(val_num_graphs, device=device_wkr).repeat_interleave(num_nodes_per_graph)
+                    
+                        # [Fix 4] Subset 우회
+                        val_ds = wkr_val_loader.dataset.dataset if hasattr(wkr_val_loader.dataset, 'dataset') else wkr_val_loader.dataset
+                    
+                        for step in range(max_seq_len):
+                            # === 1. 활성 그래프 인덱스 도출 ===
+                            active_mask = step < seq_lens
+                            if not active_mask.any(): break
+                        
+                            active_idx = active_mask.nonzero(as_tuple=True)[0]  # [K]
+                            K = active_idx.size(0)
+                        
+                            # [Fix A] K 변경 시에만 재계산
+                            if K != cached_K:
+                                cached_K = K
+                                cached_offsets = torch.arange(K, device=device_wkr) * num_nodes_per_graph
+                                cached_edge_offset = cached_offsets.view(K, 1, 1)
+                                cached_edge_index = (base_edges.unsqueeze(0) + cached_edge_offset).permute(1, 0, 2).reshape(2, -1)
+                                cached_edge_attr = base_edge_attr.repeat(K, 1)
+                                cached_batch_vec = torch.arange(K, device=device_wkr).repeat_interleave(num_nodes_per_graph)
+                        
+                            # === 2. 활성 그래프만 슬라이싱 ===
+                            act_step = torch.clamp(torch.tensor(step, device=device_wkr), max=seq_lens[active_idx] - 1)
+                        
+                            curr_nodes_k = c_seqs_pad[active_idx, step]
+                            tgt_nodes_k = t_seqs_pad[active_idx, act_step]
+                            target_labels_k = n_seqs_pad[active_idx, act_step]
+                        
+                            # === 3. 컴팩트 GNN 입력 (v4 Architecture) ===
+                            compact_coords = node_coords_per_graph[active_idx].reshape(K * num_nodes_per_graph, 2)
+                        
+                            worker_in = torch.zeros((K * num_nodes_per_graph, 8), device=device_wkr)
+                            worker_in[cached_offsets + curr_nodes_k, 0] = 1.0
+                            worker_in[cached_offsets + tgt_nodes_k, 1] = 1.0
+                            
+                            # SL Validation을 위한 최종 목적지 추출
+                            final_nodes_k = c_seqs_pad[active_idx, seq_lens[active_idx] - 1]
+                            worker_in[cached_offsets + final_nodes_k, 2] = 1.0
+                        
+                            val_ds = wkr_val_loader.dataset.dataset if hasattr(wkr_val_loader.dataset, 'dataset') else wkr_val_loader.dataset
+                            
+                            # 위상학적 특성 캐싱 확인
+                            if not hasattr(val_ds, '_cached_max_h_wkr'):
+                                _hm = val_ds.hop_matrix
+                                val_ds._cached_max_h_wkr = float(_hm[_hm < float('inf')].max().item()) if _hm.numel() > 0 else 50.0
+                                val_ds._cached_hm_dev_wkr = _hm.to(device_wkr)
+                                
+                            # 3: hop_to_subgoal (각 노드 -> 서브골)
+                            hop_to_sub_k = val_ds._cached_hm_dev_wkr[:, tgt_nodes_k].T
+                            worker_in[:, 3] = torch.clamp(hop_to_sub_k.float() / val_ds._cached_max_h_wkr, 0.0, 1.0).reshape(-1)
+                            
+                            # 4: hop_to_final (각 노드 -> 최종 목적지)
+                            hop_to_final_k = val_ds._cached_hm_dev_wkr[:, final_nodes_k].T
+                            worker_in[:, 4] = torch.clamp(hop_to_final_k.float() / val_ds._cached_max_h_wkr, 0.0, 1.0).reshape(-1)
+                            
+                            # 5, 6: global_heading_x, y
+                            final_coords_k = compact_coords[cached_offsets + final_nodes_k]
+                            final_coords_rep = final_coords_k.repeat_interleave(num_nodes_per_graph, dim=0)
+                            diff_final = final_coords_rep - compact_coords
+                            norm_final = diff_final.norm(dim=1, keepdim=True).clamp(min=1e-6)
+                            worker_in[:, 5:7] = diff_final / norm_final
+                            
+                            # 7: time_to_go
+                            time_to_go_val = 1.0 - (float(step) / max(max_seq_len, 1))
+                            worker_in[:, 7] = time_to_go_val
+                        
+                            # === 4. Forward ===
+                            h_active = h[active_idx]
+                            c_active = c[active_idx]
+                        
+                            scores, h_next_k, c_next_k, _ = worker.predict_next_hop(
+                                worker_in, cached_edge_index, h_active, c_active, cached_batch_vec,
+                                edge_attr=cached_edge_attr
+                            )
+                        
+                            # [Fix #3] no_grad() 내부이므로 clone 불필요 → 직접 대입
+                            h[active_idx] = h_next_k
+                            c[active_idx] = c_next_k
+                        
+                            # === 6. 손실 계산: Heuristic-Guided SL (Validation) ===
+                            scores_view = scores.view(K, num_nodes_per_graph)
+                            ce_loss = F.cross_entropy(scores_view, target_labels_k)
+                            dist_to_target = apsp_device_wkr[:, tgt_nodes_k].T / max_dist
+                            wkr_soft_labels = F.softmax(-dist_to_target / 0.1, dim=-1)
+                            log_probs = F.log_softmax(scores_view, dim=-1)
+                            kl_loss = F.kl_div(log_probs, wkr_soft_labels, reduction='batchmean', log_target=False)
+                            step_loss = 0.7 * ce_loss + 0.3 * kl_loss
+                            
+                            wkr_val_loss += step_loss.item()
+                            wkr_val_batches += 1
+                            
+                        wkr_val_iter.set_postfix({'loss': f"{wkr_val_loss/max(1, wkr_val_batches):.4f}"})
+            
+                    # [Fix #4] 유효 변수만 해제 (h_list, c_list는 이전 코드 잔해)
+                    pass
+        
+            if not wkr_frozen:
+                wkr_val = wkr_val_loss/max(1, wkr_val_batches)
+                tqdm.write(f"📊 Validation - Worker: {wkr_val:.4f}")
+                # wkr_val logging
+                history['wkr_train_loss'].append(wkr_loss/max(1, wkr_batches))
+                history['wkr_val_loss'].append(wkr_val)
+            
+                # === Worker Early Stopping 체크 ===
+                if wkr_val < best_wkr_val:
+                    best_wkr_val = wkr_val
+                    wkr_es_counter = 0
+                    best_wkr_state = copy.deepcopy(worker.state_dict())
+                    tqdm.write(f"  ✅ Worker Best Val Loss 갱신: {best_wkr_val:.4f}")
+                else:
+                    wkr_es_counter += 1
+                    tqdm.write(f"  ⚠️ Worker Val Loss 미개선 ({wkr_es_counter}/{WORKER_ES_PATIENCE})")
+                    if wkr_es_counter >= WORKER_ES_PATIENCE:
+                        tqdm.write(f"  ⛔ Worker Early Stopping! Best Val={best_wkr_val:.4f}에서 동결.")
+                        tqdm.write(f"     → Worker 가중치를 Best 시점으로 복원합니다.")
+                        worker.load_state_dict(best_wkr_state)
+                        wkr_frozen = True
+            elif wkr_frozen:
+                pass
+            else:
+                pass
+        
+            if not wkr_frozen:
+                wkr_scheduler.step()
+        
+            current_lr_wkr = wkr_opt.param_groups[0]['lr']
+            wkr_pbar.set_postfix({'loss': f"{best_wkr_val if wkr_frozen else wkr_val_loss/max(1, wkr_val_batches):.4f}", 'lr': f"{current_lr_wkr:.2e}"})
+            wkr_pbar.update(1)
+            if wkr_frozen:
+                tqdm.write(" Worker frozen, stopping thread.")
+                break
+
+
+    if args.parallel:
+        print(f"\n🚀 Running in PARALLEL mode with {args.epochs} epochs", flush=True)
+        import threading
+        t1 = threading.Thread(target=run_manager_pipeline)
+        t2 = threading.Thread(target=run_worker_pipeline)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        print("\n=== Parallel Training Finished ===", flush=True)
+    else:
+        print(f"\n🐢 Running in SEQUENTIAL mode with {args.epochs} epochs", flush=True)
+        run_sequential_pipeline()
+        print("\n=== Sequential Training Finished ===", flush=True)
+
     # === Accuracy Evaluation ===
-    print("\n📊 Evaluating Model Accuracy...", flush=True)
+    tqdm.write("\n📊 Evaluating Model Accuracy...")
     manager.eval()
     worker.eval()
     
@@ -931,6 +1658,12 @@ def train_sl(args):
             num_nodes = x_raw.size(0)
             
             # Autoregressive evaluation
+            # [v3] edge_attr 정규화: 루프 밖에서 1회만 수행
+            _eval_ea = pyg_data.edge_attr[:, [0, 7, 8]].to(device)
+            _ea_min = _eval_ea.min(dim=0, keepdim=True)[0]
+            _ea_max = _eval_ea.max(dim=0, keepdim=True)[0]
+            _eval_ea = (_eval_ea - _ea_min) / (_ea_max - _ea_min).clamp(min=1e-8)
+            
             curr_node_idx = c_seq[0].item()
             
             for step in range(seq_len):
@@ -957,18 +1690,21 @@ def train_sl(args):
                 
                 # hop_dist
                 if hasattr(wkr_dataset, 'hop_matrix'):
-                    hop_apsp_device = wkr_dataset.hop_matrix.to(device)
-                    hop_dists = hop_apsp_device[tgt_node_idx]
-                    finite_hops = hop_apsp_device[hop_apsp_device < float('inf')]
-                    max_h = float(finite_hops.max().item()) if finite_hops.numel() > 0 else 50.0
-                    hop_dist_feat = torch.clamp(hop_dists.float() / max_h, 0.0, 1.0).unsqueeze(1)
+                    if not hasattr(wkr_dataset, '_cached_max_h'):
+                        _hm = wkr_dataset.hop_matrix
+                        wkr_dataset._cached_max_h = float(_hm[_hm < float('inf')].max().item()) if _hm.numel() > 0 else 50.0
+                        wkr_dataset._cached_hm_dev = _hm.to(device)
+                    hop_dists = wkr_dataset._cached_hm_dev[tgt_node_idx]
+                    hop_dist_feat = torch.clamp(hop_dists.float() / wkr_dataset._cached_max_h, 0.0, 1.0).unsqueeze(1)
                 else:
                     hop_dist_feat = torch.zeros(num_nodes, 1, device=device)
                     
-                worker_in = torch.cat([node_coords, flags, net_dist, direction, is_final, hop_dist_feat], dim=1)
+                # [v3] x,y 제거, time_pct 추가
+                time_pct_feat = torch.full((num_nodes, 1), float(step) / max(seq_len, 1), device=device)
+                worker_in = torch.cat([flags, net_dist, direction, is_final, hop_dist_feat, time_pct_feat], dim=1)
                 
-                # edge_dim=3: [length, capacity, speed]
-                scores, h, c, _ = worker.predict_next_hop(worker_in, edge_index, h, c, batch_vec, edge_attr=pyg_data.edge_attr[:, [0, 7, 8]].to(device))
+                # edge_dim=3: [length, capacity, speed] (정규화 완료)
+                scores, h, c, _ = worker.predict_next_hop(worker_in, edge_index, h, c, batch_vec, edge_attr=_eval_ea)
                 pred = scores.argmax().item()
                 
                 if pred == target_label:
@@ -992,8 +1728,8 @@ def train_sl(args):
             torch.save(checkpoint_data, ckpt_path)
             print(f"💾 Saved checkpoint with metadata to {ckpt_path}")
     
-    print(f"📈 Manager: Exact={mgr_exact}/{mgr_total} ({100*mgr_exact/max(1,mgr_total):.1f}%), Near(1-hop)={mgr_near}/{mgr_total} ({100*mgr_near/max(1,mgr_total):.1f}%)")
-    print(f"📈 Worker: Correct={wkr_correct}/{wkr_total} ({100*wkr_correct/max(1,wkr_total):.1f}%)")
+    tqdm.write(f"📈 Manager: Exact={mgr_exact}/{mgr_total} ({100*mgr_exact/max(1,mgr_total):.1f}%), Near(1-hop)={mgr_near}/{mgr_total} ({100*mgr_near/max(1,mgr_total):.1f}%)")
+    tqdm.write(f"📈 Worker: Correct={wkr_correct}/{wkr_total} ({100*wkr_correct/max(1,wkr_total):.1f}%)")
     
     
     # === Success Rate (Simulation-based) ===
@@ -1024,6 +1760,10 @@ def train_sl(args):
     node_coords_device = pyg_x_device[:, :2] # [N, 2]
     edge_index_device = pyg_data.edge_index.to(device)
     edge_attr_device = pyg_data.edge_attr[:, [0, 7, 8]].to(device)  # [E, 3] length+capacity+speed
+    # [v3] Min-Max 정규화
+    _ea_min = edge_attr_device.min(dim=0, keepdim=True)[0]
+    _ea_max = edge_attr_device.max(dim=0, keepdim=True)[0]
+    edge_attr_device = (edge_attr_device - _ea_min) / (_ea_max - _ea_min).clamp(min=1e-8)
     batch_vec_sim = torch.zeros(num_nodes, dtype=torch.long, device=device)
     
     # [Fix] Wrap Simulation in no_grad to prevent VRAM leak
@@ -1063,9 +1803,8 @@ def train_sl(args):
             hid = torch.zeros(1, args.hidden_dim, device=device)
             cell = torch.zeros(1, args.hidden_dim, device=device)
             
-            # [Fix C] 시뮬레이션 입력 텐서 사전 할당 (torch.cat 제거)
-            worker_in_sim = torch.zeros((num_nodes, 9), device=device)
-            worker_in_sim[:, :2] = node_coords_device  # 좌표는 변하지 않음
+            # [v3] x,y 제거: 좌표 할당 없음. time_pct는 스텝별 갱신
+            worker_in_sim = torch.zeros((num_nodes, 8), device=device)
             
             for step in range(max_steps):
                 if current_node == goal_node:
@@ -1087,31 +1826,35 @@ def train_sl(args):
                 # [Fix C] In-place 업데이트 (새 텐서 할당 없음)
                 curr_idx = env.node_mapping[current_node]
                 
-                # is_current, is_target, is_final_target_phase 초기화 및 설정
-                worker_in_sim[:, 2:4].zero_()
-                worker_in_sim[:, 7] = 0.0
-                worker_in_sim[curr_idx, 2] = 1.0
+                # [v3] 인덱스 시프트: x,y 제거로 is_current(0), is_target(1), is_final(5)
+                worker_in_sim[:, 0:2].zero_()
+                worker_in_sim[:, 5] = 0.0
+                worker_in_sim[curr_idx, 0] = 1.0
                 if subgoal < num_nodes:
-                    worker_in_sim[subgoal, 3] = 1.0
+                    worker_in_sim[subgoal, 1] = 1.0
                 if subgoal == goal_idx:
-                    worker_in_sim[:, 7] = 1.0
+                    worker_in_sim[:, 5] = 1.0
                 
-                # Network Distance (Normalized)
-                worker_in_sim[:, 4] = apsp_device[:, subgoal] / max_dist
+                # Network Distance (Normalized) → col 2
+                worker_in_sim[:, 2] = apsp_device[:, subgoal] / max_dist
                 
-                # Direction Vector
+                # Direction Vector → col 3:5
                 target_pos = node_coords_device[subgoal]
                 diff = target_pos - node_coords_device
                 dist_euc = torch.norm(diff, dim=1, keepdim=True) + 1e-6
-                worker_in_sim[:, 5:7] = diff / dist_euc
+                worker_in_sim[:, 3:5] = diff / dist_euc
                 
-                # hop_dist
+                # hop_dist → col 6
                 if hasattr(env, 'hop_matrix'):
-                    hop_matrix_device = env.hop_matrix.to(device)
-                    hop_dists_sim = hop_matrix_device[subgoal]
-                    finite_hops = hop_matrix_device[hop_matrix_device < float('inf')]
-                    max_h_sim = float(finite_hops.max().item()) if finite_hops.numel() > 0 else 50.0
-                    worker_in_sim[:, 8] = torch.clamp(hop_dists_sim.float() / max_h_sim, 0.0, 1.0)
+                    if not hasattr(env, '_cached_max_h'):
+                        _hm = env.hop_matrix
+                        env._cached_max_h = float(_hm[_hm < float('inf')].max().item()) if _hm.numel() > 0 else 50.0
+                        env._cached_hm_dev = _hm.to(device)
+                    hop_dists_sim = env._cached_hm_dev[subgoal]
+                    worker_in_sim[:, 6] = torch.clamp(hop_dists_sim.float() / env._cached_max_h, 0.0, 1.0)
+                
+                # [v3] time_pct → col 7
+                worker_in_sim[:, 7] = float(step) / float(max_steps)
                 
                 # Worker 예측 (predict_next_hop API 사용)
                 scores, hid, cell, _ = worker.predict_next_hop(worker_in_sim, edge_index_device, hid, cell, batch_vec_sim, edge_attr=edge_attr_device)
@@ -1129,11 +1872,11 @@ def train_sl(args):
                 current_node = next_node
     
     success_rate = 100 * success_count / total_episodes
-    print(f"\n🎯 [Manager+Worker] Success Rate: {success_count}/{total_episodes} ({success_rate:.1f}%)")
+    tqdm.write(f"\n🎯 [Manager+Worker] Success Rate: {success_count}/{total_episodes} ({success_rate:.1f}%)")
     
     # === Manager-Only 시뮬레이션 (A* 기반) ===
     # Manager 계획의 품질만 독립 평가: 서브골 간 이동은 A* 최단경로 사용
-    print("\n🔬 Manager-Only Evaluation (A* Navigation)...", flush=True)
+    tqdm.write("\n🔬 Manager-Only Evaluation (A* Navigation)...")
     
     mgr_only_success = 0
     mgr_plan_quality_sum = 0.0  # 경로 길이 비율 합산
@@ -1200,13 +1943,13 @@ def train_sl(args):
     
     mgr_only_rate = 100 * mgr_only_success / total_episodes
     avg_path_ratio = mgr_plan_quality_sum / max(1, mgr_plan_quality_count)
-    print(f"🔬 [Manager-Only] Success Rate: {mgr_only_success}/{total_episodes} ({mgr_only_rate:.1f}%)")
-    print(f"📏 [Manager-Only] Avg Path Ratio (vs A*): {avg_path_ratio:.2f}x")
+    tqdm.write(f"🔬 [Manager-Only] Success Rate: {mgr_only_success}/{total_episodes} ({mgr_only_rate:.1f}%)")
+    tqdm.write(f"📏 [Manager-Only] Avg Path Ratio (vs A*): {avg_path_ratio:.2f}x")
     
     if mgr_only_rate >= 70:
-        print("✅ Manager 계획 품질 양호. Worker가 병목이라면 RL Fine-tuning 진행.")
+        tqdm.write("✅ Manager 계획 품질 양호. Worker가 병목이라면 RL Fine-tuning 진행.")
     else:
-        print("⚠️ Manager 계획 품질 부족. Manager 학습 추가 필요.")
+        tqdm.write("⚠️ Manager 계획 품질 부족. Manager 학습 추가 필요.")
     
     # === 학습 곡선 그래프 생성 (논문용: 타이틀 제거, 폰트 확대, 개별 저장) ===
     import matplotlib
@@ -1234,7 +1977,7 @@ def train_sl(args):
     mgr_path = os.path.join(save_dir, 'sl_curve_manager.png')
     fig_mgr.savefig(mgr_path, dpi=300, bbox_inches='tight')
     plt.close(fig_mgr)
-    print(f"📈 Manager learning curve saved to {mgr_path}")
+    tqdm.write(f"📈 Manager learning curve saved to {mgr_path}")
     
     # --- Worker 단독 차트 ---
     fig_wkr, ax_wkr = plt.subplots(figsize=(8, 6))
@@ -1251,7 +1994,7 @@ def train_sl(args):
     wkr_path = os.path.join(save_dir, 'sl_curve_worker.png')
     fig_wkr.savefig(wkr_path, dpi=300, bbox_inches='tight')
     plt.close(fig_wkr)
-    print(f"📈 Worker learning curve saved to {wkr_path}")
+    tqdm.write(f"📈 Worker learning curve saved to {wkr_path}")
     
     # --- 합본 차트 (기존 호환) ---
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
@@ -1398,6 +2141,8 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--lr_manager', type=float, default=5e-4, help='Manager Learning Rate (default: 5e-4)')
     parser.add_argument('--lr_worker', type=float, default=5e-5, help='Worker Learning Rate (default: 5e-5)')
-    
+    parser.add_argument('--worker_only', action='store_true', help='Train Worker only')
+    parser.add_argument('--parallel', action='store_true', help='Use parallel multi-threading for SL training (Default: False)')
+
     args = parser.parse_args()
     train_sl(args)

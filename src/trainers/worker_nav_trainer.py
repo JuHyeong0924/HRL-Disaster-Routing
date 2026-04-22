@@ -143,16 +143,37 @@ class WorkerNavTrainer(DOMOTrainer):
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
     @staticmethod
-    def _select_edge_attr(edge_attr):
-        """Phase 1: length(인덱스 0)만 사용. A*/APSP 학습 신호와 일치하는 유일한 피처."""
+    def _select_edge_attr(edge_attr: torch.Tensor) -> torch.Tensor:
+        """엣지 피처 선택 + Min-Max 정규화.
+        
+        [v3] 정규화 추가: length/capacity/speed의 스케일 불일치로 인한
+        GATv2 attention 편향을 방지. 각 피처를 [0, 1] 범위로 정규화.
+        """
         if edge_attr is None:
             return None
         if edge_attr.size(1) == 0:
             return None
-        # edge_dim=3: [length, capacity, speed]
-        return edge_attr[:, [0, 7, 8]]
+        # edge_dim=3: [length, capacity, speed] (인덱스 0, 7, 8)
+        selected = edge_attr[:, [0, 7, 8]]
+        # Min-Max 정규화: 각 피처를 [0, 1] 범위로 스케일링
+        feat_min = selected.min(dim=0, keepdim=True)[0]
+        feat_max = selected.max(dim=0, keepdim=True)[0]
+        scale = (feat_max - feat_min).clamp(min=1e-8)  # 0-division 방지
+        return (selected - feat_min) / scale
 
-    def _build_worker_input(self):
+    def _build_worker_input(self, time_pct: float = 0.0) -> torch.Tensor:
+        """환경 x(10채널)에서 Worker 입력(8채널)으로 변환.
+        
+        [v3 변경]
+        - x,y 절대좌표 제거: cross-map 일반화를 위해 맵 종속 피처 배제
+        - time_pct 추가: 남은 스텝 비율로 MDP 완전 관측성 보장
+        
+        Env X: [x(0), y(1), is_curr(2), is_tgt(3), visit(4), dist(5),
+                dir_x(6), dir_y(7), is_final(8), hop_dist(9)]
+        
+        Worker 입력: [is_curr, is_tgt, net_dist, dir_x, dir_y, is_final, hop_dist, time_pct]
+                      (8 channels)
+        """
         x = self.env.pyg_data.x
         if x.size(1) < 10:
             pad = torch.zeros(
@@ -163,9 +184,14 @@ class WorkerNavTrainer(DOMOTrainer):
             )
             x = torch.cat([x, pad], dim=1)
             self.env.pyg_data.x = x
-        # Env X: [x, y, is_curr(2), is_tgt(3), visit(4), dist(5), dir_x(6), dir_y(7), is_final_target_phase(8), hop_dist(9)]
-        # visit 제외 -> [x, y, is_curr, is_tgt, dist, dir_x, dir_y, is_final, hop] (9 channels)
-        return torch.cat([x[:, :4], x[:, 5:]], dim=1)
+        # x,y(0,1) 제거, visit(4) 제거 → [is_curr(2), is_tgt(3), dist(5), dir(6,7), final(8), hop(9)]
+        spatial = torch.cat([x[:, 2:4], x[:, 5:]], dim=1)  # [N, 7]
+        # time_pct 브로드캐스트: 모든 노드에 동일한 시간 진행률 부여
+        t_feat = torch.full(
+            (spatial.size(0), 1), time_pct,
+            device=x.device, dtype=x.dtype,
+        )
+        return torch.cat([spatial, t_feat], dim=1)  # [N, 8]
 
     def _hidden_bonus_weight(self, episode_idx):
         if int(episode_idx) < self.guidance_schedule_ep_1:
@@ -437,10 +463,9 @@ class WorkerNavTrainer(DOMOTrainer):
         fail_penalty = float(self.reward_cfg["FAIL_PENALTY"])
         goal_reward = float(self.reward_cfg["GOAL_REWARD"])
 
-        # [VRAM Fix] GATv2 encoder는 항상 detach(spatial freeze)하여 LSTM+Scorer+Critic만 학습.
-        # 이유: GATv2 3레이어 × 400스텝 BPTT는 ~100GB VRAM 필요 → 24GB 4090에서 불가능.
-        #       SL pretrained GATv2 가중치는 이미 충분히 좋으므로, 노드 임베딩 품질 유지.
-        is_joint_stage = True  # Worker Stage에서도 spatial detach 적용
+        # [v3] GATv2 encoder detach 여부: config 기반 (기본: True)
+        # Why: GATv2 3레이어 × 400스텝 BPTT는 ~100GB VRAM 필요 → 24GB 4090에서 불가능
+        detach_spatial = bool(getattr(self.config, "detach_spatial", True))
         
         # [Perf] edge_attr는 스텝마다 되풀이되지 않으므로 루프 밖에서 1회만 계산
         _cached_edge_attr = self._select_edge_attr(self.env.pyg_data.edge_attr)
@@ -462,7 +487,9 @@ class WorkerNavTrainer(DOMOTrainer):
                 c = c.detach()
 
             current_nodes = self.env.current_node.clone()
-            worker_input = self._build_worker_input()
+            # [v3] time_pct: 현재 스텝 / 최대 스텝 → 에이전트가 마감 시간 인지
+            time_pct = float(_step_counter) / float(self.max_steps)
+            worker_input = self._build_worker_input(time_pct=time_pct)
 
             scores, h_next, c_next, value_pred = self.worker.predict_next_hop(
                 worker_input,
@@ -470,7 +497,7 @@ class WorkerNavTrainer(DOMOTrainer):
                 h,
                 c,
                 self.env.pyg_data.batch,
-                detach_spatial=is_joint_stage, 
+                detach_spatial=detach_spatial, 
                 edge_attr=_cached_edge_attr,
             )
             # inactive 에이전트의 LSTM 상태는 detach하여 불필요한 연산 그래프 VRAM 누적 방지
