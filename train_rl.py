@@ -210,9 +210,9 @@ def _init_env_and_models(args):
         print("⚠️ GPU NOT DETECTED! Training will be slow on CPU.")
     print(f"Active Device: {device}")
 
-    # Phase 1: edge_dim=1 (length만 사용. A*/APSP 학습 신호와 일치하는 유일한 엣지 피처)
-    manager = GraphTransformerManager(node_dim=4, hidden_dim=args.hidden_dim, dropout=0.2, edge_dim=1).to(device)
-    worker = WorkerLSTM(node_dim=9, hidden_dim=args.hidden_dim, edge_dim=1).to(device)
+    # edge_dim=3: [length, capacity, speed] → 인덱스 [0, 7, 8]
+    manager = GraphTransformerManager(node_dim=4, hidden_dim=args.hidden_dim, dropout=0.2, edge_dim=3).to(device)
+    worker = WorkerLSTM(node_dim=9, hidden_dim=args.hidden_dim, edge_dim=3).to(device)
 
     # 단계별 배치 크기 (개별 학습은 64, Joint는 OOM 방지를 위해 절반으로 고정)
     raw_pomo = str(args.num_pomo)

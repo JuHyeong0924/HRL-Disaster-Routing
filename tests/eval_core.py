@@ -168,8 +168,8 @@ def load_checkpoint(
 
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    # Phase 1: edge_dim=1 (length만 사용)
-    worker = WorkerLSTM(node_dim=9, hidden_dim=hidden_dim, edge_dim=1).to(device)
+    # edge_dim=3: [length, capacity, speed]
+    worker = WorkerLSTM(node_dim=9, hidden_dim=hidden_dim, edge_dim=3).to(device)
     if isinstance(payload, dict) and "worker_state" in payload:
         load_worker_state_compat(worker, payload["worker_state"])
     else:
@@ -179,7 +179,7 @@ def load_checkpoint(
     # Manager 로드 (요청 시)
     manager = None
     if load_manager and isinstance(payload, dict) and "manager_state" in payload:
-        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, edge_dim=1).to(device)
+        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, edge_dim=3).to(device)
         manager.load_state_dict(payload["manager_state"])
         manager.eval()
 
@@ -280,8 +280,8 @@ def select_edge_attr(edge_attr: Optional[torch.Tensor]) -> Optional[torch.Tensor
         return None
     if edge_attr.size(1) == 0:
         return None
-    # Phase 1: length만 사용 (edge_dim=1)
-    return edge_attr[:, 0:1]
+    # edge_dim=3: [length, capacity, speed]
+    return edge_attr[:, [0, 7, 8]]
 
 
 def build_worker_input(env_x: torch.Tensor) -> torch.Tensor:

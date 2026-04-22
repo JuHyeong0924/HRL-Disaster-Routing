@@ -153,18 +153,18 @@ def train_sl(args):
     mgr_val_loader = DataLoader(mgr_val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=hierarchical_collate, num_workers=0, pin_memory=True)
     wkr_val_loader = DataLoader(wkr_val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=hierarchical_collate, num_workers=0, pin_memory=True)
     
-    # Phase 1: edge_dim=1 (length만 사용. A*/APSP 학습 신호와 일치하는 유일한 엣지 피처)
+    # edge_dim=3: [length, capacity, speed] → 인덱스 [0, 7, 8]
     manager = GraphTransformerManager(
         node_dim=4, 
         hidden_dim=args.hidden_dim, 
         dropout=0.2,
-        edge_dim=1
+        edge_dim=3
     ).to(device)
     
     worker = WorkerLSTM(
         node_dim=9,  # [x, y, is_current, is_target, net_dist, dir_x, dir_y, is_final_target_phase, hop_dist]
         hidden_dim=args.hidden_dim,
-        edge_dim=1
+        edge_dim=3
     ).to(device)
     
     
@@ -233,7 +233,7 @@ def train_sl(args):
             # 1. Project Features & Dense Batching
             # [Refactor] Teacher Forcing Logic:
             # We calculate embeddings EXTERNALLY and pass them to Manager.
-            mgr_edge_attr = batch.edge_attr[:, 0:1] if batch.edge_attr is not None else None
+            mgr_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
             node_emb_all = manager.topology_enc(batch.x, batch.edge_index, edge_attr=mgr_edge_attr) # [B*N, Hidden]
             
             # [Fix #6] import는 파일 상단으로 이동 완료
@@ -271,7 +271,7 @@ def train_sl(args):
             # Call Forward
             # target_seq_emb: [B, L, H]
             # edge_attr: Manager DataLoader에 edge_attr가 없을 수 있으므로 None-safe 처리
-            mgr_edge_attr = batch.edge_attr[:, 0:1] if batch.edge_attr is not None else None
+            mgr_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
             pointer_logits = manager(batch.x, batch.edge_index, batch.batch, target_seq_emb=target_seq_emb, edge_attr=mgr_edge_attr)
             # logits: [B, L+1, N+1] (Time steps shifted by 1 due to SOS)
             
@@ -403,7 +403,7 @@ def train_sl(args):
                 node_coords_per_graph = batch.x[:, :2].view(num_graphs, -1, 2)  # [B, N, 2]
                 num_nodes_per_graph = node_coords_per_graph.size(1)
                 base_edges = pyg_data.edge_index.to(device)  # [2, E_single]
-                base_edge_attr = pyg_data.edge_attr[:, 0:1].to(device)  # [E_single, 1] Phase 1: length만 사용
+                base_edge_attr = pyg_data.edge_attr[:, [0, 7, 8]].to(device)  # [E_single, 3] length+capacity+speed
                 num_edges_per_graph = base_edges.size(1)
                 
                 # [Fix A] Pre-allocation: 초기 K=num_graphs에 대해 사전 계산
@@ -593,7 +593,7 @@ def train_sl(args):
                 
                 # [Robustness] Dynamic Token Definition
                 # [Refactor] Validation Embedding Gathering
-                mgr_edge_attr = batch.edge_attr[:, 0:1] if batch.edge_attr is not None else None
+                mgr_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
                 node_emb_all = manager.topology_enc(batch.x, batch.edge_index, edge_attr=mgr_edge_attr)
                 
                 # [Fix #6] import는 파일 상단으로 이동 완료
@@ -619,7 +619,7 @@ def train_sl(args):
                 target_seq_emb = target_seq_emb * is_valid.unsqueeze(-1).float()
                 
                 # 2. Forward Pass
-                val_edge_attr = batch.edge_attr[:, 0:1] if batch.edge_attr is not None else None
+                val_edge_attr = batch.edge_attr[:, [0, 7, 8]] if batch.edge_attr is not None else None
                 pointer_logits = manager(batch.x, batch.edge_index, batch.batch, target_seq_emb=target_seq_emb, edge_attr=val_edge_attr)
                 
                 # 3. Construct Targets for Loss
@@ -695,7 +695,7 @@ def train_sl(args):
                     node_coords_per_graph = batch.x[:, :2].view(val_num_graphs, -1, 2)  # [B, N, 2]
                     num_nodes_per_graph = node_coords_per_graph.size(1)
                     base_edges = pyg_data.edge_index.to(device)
-                    base_edge_attr = pyg_data.edge_attr[:, 0:1].to(device)  # Phase 1: length만 사용
+                    base_edge_attr = pyg_data.edge_attr[:, [0, 7, 8]].to(device)  # length+capacity+speed
                     
                     # [Fix A] Pre-allocation (Validation) — edge_index/batch_vec만 캐싱
                     cached_K = val_num_graphs
@@ -896,7 +896,7 @@ def train_sl(args):
             
             # Manager 예측 (첫 번째 토큰만 비교)
             # target_seq_emb=None으로 주면 SOS만 사용하여 첫 토큰 예측
-            logits = manager(x_in.squeeze(0), edge_index, batch_vec, target_seq_emb=None, edge_attr=pyg_data.edge_attr[:, 0:1].to(device))
+            logits = manager(x_in.squeeze(0), edge_index, batch_vec, target_seq_emb=None, edge_attr=pyg_data.edge_attr[:, [0, 7, 8]].to(device))
             pred = logits[0, 0].argmax().item()
             target = y[0].item() if y.dim() > 0 else y.item()
             
@@ -967,8 +967,8 @@ def train_sl(args):
                     
                 worker_in = torch.cat([node_coords, flags, net_dist, direction, is_final, hop_dist_feat], dim=1)
                 
-                # [Fix] Phase 1: length만 사용 (edge_dim=1)
-                scores, h, c, _ = worker.predict_next_hop(worker_in, edge_index, h, c, batch_vec, edge_attr=pyg_data.edge_attr[:, 0:1].to(device))
+                # edge_dim=3: [length, capacity, speed]
+                scores, h, c, _ = worker.predict_next_hop(worker_in, edge_index, h, c, batch_vec, edge_attr=pyg_data.edge_attr[:, [0, 7, 8]].to(device))
                 pred = scores.argmax().item()
                 
                 if pred == target_label:
@@ -1023,7 +1023,7 @@ def train_sl(args):
     pyg_x_device = pyg_data.x.to(device)
     node_coords_device = pyg_x_device[:, :2] # [N, 2]
     edge_index_device = pyg_data.edge_index.to(device)
-    edge_attr_device = pyg_data.edge_attr[:, 0:1].to(device)  # [E, 1] Phase 1: length만 사용
+    edge_attr_device = pyg_data.edge_attr[:, [0, 7, 8]].to(device)  # [E, 3] length+capacity+speed
     batch_vec_sim = torch.zeros(num_nodes, dtype=torch.long, device=device)
     
     # [Fix] Wrap Simulation in no_grad to prevent VRAM leak

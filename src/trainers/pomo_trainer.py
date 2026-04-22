@@ -152,6 +152,11 @@ class DOMOTrainer:
         }
         success_ema = 0  # Exponential Moving Average
         
+        # [방안 3] Gradient Accumulation: 실질적 배치 크기를 POMO×ACCUM_STEPS로 확대
+        # Why: REINFORCE 고분산을 억제하기 위해 여러 에피소드의 gradient를 누적
+        ACCUM_STEPS = 4
+        self.mgr_opt.zero_grad()  # 누적 시작 전 초기화
+        
         for ep in pbar:
             # [Design 2026-04-21] Worker는 전체 Joint 단계에서 동결 유지 (Frozen Executor)
             # Why: (1) Worker EMA 90%+ 달성 → 이미 충분한 일반화 능력 확보
@@ -161,9 +166,12 @@ class DOMOTrainer:
             self._collect_debug_this_episode = self._should_collect_debug(ep, episodes)
             self._last_debug_tensors = None
 
-            # [Fix 2026-04-21] Curriculum Learning: 난이도 상승 속도 완화 (0.8→0.90)
-            # Why: 커리큘럼이 너무 빠르면 Manager가 적응하기 전에 난이도가 올라감
-            curriculum_ratio = min(1.0, ep / (episodes * 0.90))
+            # [방안 1] Alignment 시 커리큘럼 동결: 정적(Stationary) 환경에서 Manager 안정 학습
+            # Why: 난이도가 매 에피소드 올라가면 비정상 환경 → Manager policy 불안정
+            if self.stage in ('alignment', 'joint'):
+                curriculum_ratio = 1.0  # 최고 난이도로 고정 (학습된 실력 유지)
+            else:
+                curriculum_ratio = min(1.0, ep / (episodes * 0.90))
             self.env.set_curriculum_ratio(curriculum_ratio)
             
             # 1. Reset Env (Vectorized Batch Reset)
@@ -179,7 +187,7 @@ class DOMOTrainer:
             
             temperature = max(0.5, 1.5 - curriculum_ratio)
             # edge_attr 슬라이싱: Env 9D → 모델 5D [length, damage, is_closed, is_danger, speed]
-            ea = self.env.pyg_data.edge_attr[:, 0:1]  # Phase 1: length만 사용
+            ea = self.env.pyg_data.edge_attr[:, [0, 7, 8]]  # [length, capacity, speed]
             # AMP: Manager generate는 autocast로 감싸 메모리 절감
             with autocast('cuda', enabled=self.use_amp):
                 sequences, _ = self.manager.generate(
@@ -321,9 +329,14 @@ class DOMOTrainer:
             # Worker trajectory는 길수록 log-prob가 커지므로 sqrt(step)로만 완만하게 정규화
             wkr_log_probs = log_probs_sum / path_lengths.float().clamp(min=1.0).sqrt()
             
-            # Combined Policy Loss
-            total_log_probs = mgr_log_probs + wkr_log_probs
-            policy_loss = -(advantages.detach() * total_log_probs).mean()
+            # [방안 3] Manager-only Policy Loss: Worker 실패에 의한 gradient 오염 차단
+            # Why: Worker 동결 시 wkr_log_probs는 상수지만, Worker의 실행 실패가
+            #      advantages에 반영되어 Manager에 잘못된 페널티를 부여함
+            if self.stage in ('alignment', 'joint'):
+                policy_loss = -(advantages.detach() * mgr_log_probs).mean()
+            else:
+                total_log_probs = mgr_log_probs + wkr_log_probs
+                policy_loss = -(advantages.detach() * total_log_probs).mean()
             
             # Critic Loss
             critic_loss = 0.5 * val_loss_sum.mean()
@@ -352,39 +365,42 @@ class DOMOTrainer:
                 + wkr_aux_weight * worker_aux_ce_loss
             )
             
-            self.mgr_opt.zero_grad()
-            if self.wkr_opt is not None:
-                self.wkr_opt.zero_grad()
+            # [방안 3] Gradient Accumulation: Loss를 ACCUM_STEPS로 나눠서 누적
+            loss = loss / ACCUM_STEPS
                 
             if loss.requires_grad:
-                # AMP: GradScaler로 loss를 스케일링하여 backward 수행
+                # AMP: GradScaler로 loss를 스케일링하여 backward 수행 (gradient 누적)
                 self.grad_scaler.scale(loss).backward()
                 
-                # 각 optimizer에 실제 gradient가 존재하는지 확인
-                # (loss 연산 그래프에 참여하지 않은 optimizer는 inf 체크가 등록되지 않아 step() 시 AssertionError 발생)
-                mgr_has_grad = any(p.grad is not None for p in self.manager.parameters())
-                wkr_has_grad = getattr(self, 'wkr_opt', None) is not None and any(p.grad is not None for p in self.worker.parameters())
+                mgr_preclip_norm = 0.0
+                wkr_preclip_norm = 0.0
                 
-                # AMP: unscale 후 gradient clipping (스케일링된 상태에서 clip하면 안 됨)
-                if mgr_has_grad:
-                    self.grad_scaler.unscale_(self.mgr_opt)
-                if wkr_has_grad:
-                    self.grad_scaler.unscale_(self.wkr_opt)
-                
-                # Manager/Worker는 gradient scale이 달라 별도 threshold를 사용한다.
-                mgr_preclip_norm = float(
-                    nn.utils.clip_grad_norm_(self.manager.parameters(), max_norm=self.mgr_max_grad_norm)
-                ) if mgr_has_grad else 0.0
-                wkr_preclip_norm = float(
-                    nn.utils.clip_grad_norm_(self.worker.parameters(), max_norm=self.wkr_max_grad_norm)
-                ) if wkr_has_grad else 0.0
-                
-                # AMP: scaler가 optimizer.step() 대행 (inf/nan 감지 시 스킵)
-                if mgr_has_grad:
-                    self.grad_scaler.step(self.mgr_opt)
-                if wkr_has_grad:
-                    self.grad_scaler.step(self.wkr_opt)
-                self.grad_scaler.update()
+                # ACCUM_STEPS 마다 가중치 업데이트
+                if (ep + 1) % ACCUM_STEPS == 0:
+                    mgr_has_grad = any(p.grad is not None for p in self.manager.parameters())
+                    wkr_has_grad = getattr(self, 'wkr_opt', None) is not None and any(p.grad is not None for p in self.worker.parameters())
+                    
+                    # AMP: unscale 후 gradient clipping
+                    if mgr_has_grad:
+                        self.grad_scaler.unscale_(self.mgr_opt)
+                    if wkr_has_grad:
+                        self.grad_scaler.unscale_(self.wkr_opt)
+                    
+                    mgr_preclip_norm = float(
+                        nn.utils.clip_grad_norm_(self.manager.parameters(), max_norm=self.mgr_max_grad_norm)
+                    ) if mgr_has_grad else 0.0
+                    wkr_preclip_norm = float(
+                        nn.utils.clip_grad_norm_(self.worker.parameters(), max_norm=self.wkr_max_grad_norm)
+                    ) if wkr_has_grad else 0.0
+                    
+                    if mgr_has_grad:
+                        self.grad_scaler.step(self.mgr_opt)
+                    if wkr_has_grad:
+                        self.grad_scaler.step(self.wkr_opt)
+                    self.grad_scaler.update()
+                    self.mgr_opt.zero_grad()  # 업데이트 후 gradient 초기화
+                    if self.wkr_opt is not None:
+                        self.wkr_opt.zero_grad()
             else:
                 mgr_preclip_norm = 0.0
                 wkr_preclip_norm = 0.0
@@ -2264,7 +2280,7 @@ class DOMOTrainer:
             wkr_in = torch.cat([env_x[:, :4], env_x[:, 5:]], dim=1) # [B*N, 9]
 
             # [Fix] 동적으로 edge_attr 5D 슬라이싱 (환경이 변할 수 있으므로 매 스텝 계산)
-            ea = self.env.pyg_data.edge_attr[:, 0:1]  # Phase 1: length만 사용
+            ea = self.env.pyg_data.edge_attr[:, [0, 7, 8]]  # [length, capacity, speed]
             
             # AMP: Worker forward pass를 autocast로 감싸 VRAM 절감 (LSTM BPTT 메모리 핵심)
             # RL에서는 spatial encoder를 고정해 매-step full-graph backward 비용을 줄인다.

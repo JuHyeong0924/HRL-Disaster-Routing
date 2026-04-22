@@ -935,7 +935,7 @@ def load_models_for_rollout(
         enable_disaster=disaster,
     )
 
-    worker = WorkerLSTM(node_dim=9, hidden_dim=hidden_dim, edge_dim=1).to(device)
+    worker = WorkerLSTM(node_dim=9, hidden_dim=hidden_dim, edge_dim=3).to(device)
 
     if checkpoint_info["source"] == "apte_phase1":
         manager = None
@@ -950,13 +950,13 @@ def load_models_for_rollout(
         else:
             load_worker_state_compat(worker, extract_worker_state(payload))
     elif checkpoint_info["source"] == "sl":
-        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, dropout=0.2, edge_dim=1).to(device)
+        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, dropout=0.2, edge_dim=3).to(device)
         payload = torch.load(checkpoint_info["sl_path"], map_location=device)
         manager.load_state_dict(payload["manager_state"])
         load_worker_state_compat(worker, payload["worker_state"])
     elif checkpoint_info["source"] == "joint":
         # Joint best.pt: manager_state + worker_state가 하나의 파일에 저장
-        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, dropout=0.2, edge_dim=1).to(device)
+        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, dropout=0.2, edge_dim=3).to(device)
         payload = torch.load(checkpoint_info["joint_path"], map_location=device)
         if isinstance(payload, dict) and "manager_state" in payload:
             manager.load_state_dict(payload["manager_state"])
@@ -966,7 +966,7 @@ def load_models_for_rollout(
             manager.load_state_dict(payload)
             print("⚠️ Joint checkpoint에서 worker_state를 찾을 수 없어 Manager만 로드했습니다.")
     else:
-        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, dropout=0.2, edge_dim=1).to(device)
+        manager = GraphTransformerManager(node_dim=4, hidden_dim=hidden_dim, dropout=0.2, edge_dim=3).to(device)
         manager.load_state_dict(load_state_dict_flexible(checkpoint_info["manager_path"], device))
         load_worker_state_compat(worker, load_state_dict_flexible(checkpoint_info["worker_path"], device))
 
@@ -2736,7 +2736,7 @@ def cmd_joint(args: argparse.Namespace) -> None:
     # 별도 Manager 체크포인트 처리
     if args.mgr_checkpoint and manager is None:
         from src.models.manager import GraphTransformerManager
-        manager = GraphTransformerManager(node_dim=4, hidden_dim=256, edge_dim=1).to(device)
+        manager = GraphTransformerManager(node_dim=4, hidden_dim=256, edge_dim=3).to(device)
         mgr_payload = torch.load(args.mgr_checkpoint, map_location=device, weights_only=False)
         if "manager_state" in mgr_payload:
             manager.load_state_dict(mgr_payload["manager_state"])
@@ -3116,7 +3116,7 @@ def cmd_paper(args: argparse.Namespace) -> None:
     if manager_hrl is None:
         mgr_ckpt = core.find_latest_checkpoint("logs/rl_manager_stage", "final.pt")
         from src.models.manager import GraphTransformerManager
-        manager_hrl = GraphTransformerManager(node_dim=4, hidden_dim=256, edge_dim=1).to(device)
+        manager_hrl = GraphTransformerManager(node_dim=4, hidden_dim=256, edge_dim=3).to(device)
 
         mgr_loaded = False
         # 1순위: manager_stage 체크포인트
@@ -3721,7 +3721,8 @@ def generate_trajectory_figures(
 
     flat_result = core.run_worker_rollout(flat_worker, env, start_idx, goal_idx, temperature=0.0)
     hrl_result = core.run_joint_rollout_multisampling(
-        joint_worker, manager, env, start_idx, goal_idx, num_samples=num_samples, temperature=core.DEFAULT_SAMPLE_TEMP
+        joint_worker, manager, env, start_idx, goal_idx, num_samples=num_samples, temperature=core.DEFAULT_SAMPLE_TEMP,
+        use_cache=False  # 시각화는 별도 호출이므로 캐시 사용 안 함 (평가 캐시와 충돌 방지)
     )
     hrl_path = hrl_result["path"]
     hrl_subgoals = hrl_result.get("plan_subgoals", [])

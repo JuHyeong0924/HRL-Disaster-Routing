@@ -149,8 +149,8 @@ class WorkerNavTrainer(DOMOTrainer):
             return None
         if edge_attr.size(1) == 0:
             return None
-        # Phase 1: length만 사용 (edge_dim=1)
-        return edge_attr[:, 0:1]
+        # edge_dim=3: [length, capacity, speed]
+        return edge_attr[:, [0, 7, 8]]
 
     def _build_worker_input(self):
         x = self.env.pyg_data.x
@@ -857,6 +857,10 @@ class WorkerNavTrainer(DOMOTrainer):
         }
         success_ema = 0.0
 
+        # [Gradient Accumulation] REINFORCE 고분산 억제를 위한 가상 배치 확대
+        ACCUM_STEPS = 4
+        self.wkr_opt.zero_grad(set_to_none=True)
+
         tqdm_disabled = getattr(self.config, 'disable_tqdm', False)
         pbar = tqdm(range(episodes), desc="Worker", dynamic_ncols=True, disable=tqdm_disabled)
         for ep in pbar:
@@ -867,23 +871,27 @@ class WorkerNavTrainer(DOMOTrainer):
 
             total_loss, diag = self._execute_goal_conditioned_rollout(ep, episodes)
 
-            self.wkr_opt.zero_grad(set_to_none=True)
-            
-            if getattr(total_loss, 'requires_grad', False):
-                total_loss.backward()
-            else:
-                # 활성 스텝이 0인 코너케이스: backward 생략
-                pass
-            grad_pre = self._compute_grad_norm(self.worker.parameters())
-            grad_post = grad_pre
-            clip_hit = 0.0
-            if self.wkr_max_grad_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(self.worker.parameters(), self.wkr_max_grad_norm)
-                grad_post = self._compute_grad_norm(self.worker.parameters())
-                clip_hit = 100.0 if grad_pre > self.wkr_max_grad_norm + 1e-8 else 0.0
-            self.wkr_opt.step()
-            self.wkr_scheduler.step()
+            # [Gradient Accumulation] Loss를 ACCUM_STEPS로 나눠서 누적
+            scaled_loss = total_loss / ACCUM_STEPS
 
+            if getattr(scaled_loss, 'requires_grad', False):
+                scaled_loss.backward()
+            
+            grad_pre = 0.0
+            grad_post = 0.0
+            clip_hit = 0.0
+            
+            # ACCUM_STEPS 마다 가중치 업데이트
+            if (ep + 1) % ACCUM_STEPS == 0:
+                grad_pre = self._compute_grad_norm(self.worker.parameters())
+                grad_post = grad_pre
+                if self.wkr_max_grad_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(self.worker.parameters(), self.wkr_max_grad_norm)
+                    grad_post = self._compute_grad_norm(self.worker.parameters())
+                    clip_hit = 100.0 if grad_pre > self.wkr_max_grad_norm + 1e-8 else 0.0
+                self.wkr_opt.step()
+                self.wkr_opt.zero_grad(set_to_none=True)  # 업데이트 후 gradient 초기화
+            self.wkr_scheduler.step()
             diag["worker_grad_pre"] = float(grad_pre)
             diag["worker_grad_post"] = float(grad_post)
             diag["worker_grad_clip_hit"] = float(clip_hit)
