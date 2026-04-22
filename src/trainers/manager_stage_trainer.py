@@ -1,10 +1,11 @@
 import json
-import json
 import os
+import random
 
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from torch_geometric.utils import to_dense_batch
 from tqdm import tqdm
 
 from src.trainers.pomo_trainer import DOMOTrainer
@@ -206,7 +207,6 @@ class ManagerStageTrainer(DOMOTrainer):
             self.env.set_curriculum_ratio(curriculum_ratio)
 
             # [Track 2] Hard Example Mining: 25% 확률로 실패한 OD 쌍 재출제
-            import random
             use_hard = (len(self.hard_buffer) >= self.num_pomo and random.random() < 0.25)
             if use_hard:
                 hard_samples = random.sample(list(self.hard_buffer), 1)  # sync_problem이므로 1개만
@@ -255,7 +255,6 @@ class ManagerStageTrainer(DOMOTrainer):
             max_len = sequences.size(1)
             target_seq = sequences.to(self.device)
             node_emb_all = self.manager.topology_enc(x_mgr_in, edge_index, edge_attr=ea)
-            from torch_geometric.utils import to_dense_batch
             node_emb_dense, _ = to_dense_batch(node_emb_all, batch_vec)
             _, num_nodes, hidden_dim = node_emb_dense.shape
             eos_node_emb = self.manager.eos_token_emb.expand(self.num_pomo, 1, hidden_dim)

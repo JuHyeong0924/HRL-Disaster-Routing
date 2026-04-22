@@ -639,7 +639,9 @@ def evaluate_worker_batch(
     worker.eval()
     rng = random.Random(seed)
 
-    for ep in range(num_episodes):
+    from tqdm import tqdm
+    pbar = tqdm(range(num_episodes), desc=f"  {label}", ncols=80)
+    for ep in pbar:
         s = rng.randint(0, env.num_nodes - 1)
         g = rng.randint(0, env.num_nodes - 1)
         while g == s:
@@ -657,9 +659,8 @@ def evaluate_worker_batch(
         )
         results.append(result)
 
-        if (ep + 1) % 20 == 0:
-            sr = sum(1 for r in results if r["success"]) / len(results) * 100
-            print(f"  [{label}] Ep {ep + 1}/{num_episodes}: SR={sr:.1f}%")
+        sr = sum(1 for r in results if r["success"]) / len(results) * 100
+        pbar.set_postfix(SR=f"{sr:.1f}%")
 
     successes = [r for r in results if r["success"]]
     success_rate = len(successes) / max(len(results), 1) * 100.0
@@ -697,7 +698,9 @@ def evaluate_joint_batch(
     manager.eval()
     rng = random.Random(seed)
 
-    for ep in range(num_episodes):
+    from tqdm import tqdm
+    pbar = tqdm(range(num_episodes), desc=f"  {label}", ncols=80)
+    for ep in pbar:
         s = rng.randint(0, env.num_nodes - 1)
         g = rng.randint(0, env.num_nodes - 1)
         while g == s:
@@ -737,9 +740,8 @@ def evaluate_joint_batch(
 
         results.append(result)
 
-        if (ep + 1) % 20 == 0:
-            sr = sum(1 for r in results if r["success"]) / len(results) * 100
-            print(f"  [{label}] Ep {ep + 1}/{num_episodes}: SR={sr:.1f}%")
+        sr = sum(1 for r in results if r["success"]) / len(results) * 100
+        pbar.set_postfix(SR=f"{sr:.1f}%")
 
     successes = [r for r in results if r["success"]]
     success_rate = len(successes) / max(len(results), 1) * 100.0
@@ -878,37 +880,258 @@ def run_joint_rollout_multisampling(
     num_samples: int = DEFAULT_NUM_SAMPLES,
     temperature: float = DEFAULT_SAMPLE_TEMP,
     measure_time: bool = False,
+    use_cache: bool = True,  # 재난 시나리오에서는 False로 설정
 ) -> Dict[str, Any]:
-    """N번의 확률적 Joint 롤아웃 수행 후, 성공 경로 중 최단 거리를 채택.
+    """Full POMO 배치 Multi-Sampling: N개 인스턴스를 GPU 병렬로 실행.
 
-    Why: GPU 병렬 특성을 활용하여 단일 추론 대비 성공률과 PLR을 극적으로 개선.
+    Why: env.reset(batch_size=N, sync_problem=True)로 동일 문제를 N개 복제하고,
+         Manager Plan 생성 → Worker 실행을 전부 벡터화하여 GPU 처리량을 극대화한다.
+
+    Args:
+        use_cache: True면 정적 그래프용 캐싱 (edge_index/edge_attr 재사용).
+                   False면 재난 시나리오용 (매 에피소드 env.reset 수행).
     """
-    results: List[Dict[str, Any]] = []
-    total_time = 0.0
+    device = env.device
+    num_nodes = env.num_nodes
 
-    t0 = time.perf_counter()
-    for _ in range(num_samples):
-        result = run_joint_rollout(
-            worker, manager, env, start_idx, goal_idx,
-            temperature=temperature,
-            mgr_temperature=0.5,
-            measure_time=measure_time,
+    t0_total = time.perf_counter() if measure_time else 0.0
+
+    # ─── Phase 0: 환경을 N개 POMO 배치로 초기화 ───
+    if use_cache:
+        # 정적 그래프: edge_index, edge_attr, batch_vec 캐싱
+        cache_key = (id(env), num_samples)
+        if not hasattr(run_joint_rollout_multisampling, '_cache'):
+            run_joint_rollout_multisampling._cache = {}
+        cache = run_joint_rollout_multisampling._cache
+
+        if cache_key not in cache:
+            env.reset(batch_size=num_samples, sync_problem=True)
+            cache[cache_key] = {
+                'edge_index': env.pyg_data.edge_index,
+                'edge_attr': env.pyg_data.edge_attr,
+                'batch_vec': env.pyg_data.batch,
+                'x_template': env.pyg_data.x.clone(),
+            }
+        else:
+            cached = cache[cache_key]
+            env.batch_size = num_samples
+            env.pyg_data.edge_index = cached['edge_index']
+            env.pyg_data.edge_attr = cached['edge_attr']
+            env.pyg_data.batch = cached['batch_vec']
+            env.pyg_data.x = cached['x_template'].clone()
+            env.pyg_data.num_graphs = num_samples
+    else:
+        # 재난 시나리오: 매 에피소드 전체 env.reset (간선 상태 변화 반영)
+        env.reset(batch_size=num_samples, sync_problem=True)
+
+    # start/goal 강제 설정 (매 에피소드)
+    env.current_node = torch.full((num_samples,), start_idx, dtype=torch.long, device=device)
+    env.target_node = torch.full((num_samples,), goal_idx, dtype=torch.long, device=device)
+    env.visited = torch.zeros((num_samples, num_nodes), dtype=torch.bool, device=device)
+    env.visited[:, start_idx] = True
+    env.visit_count = torch.zeros((num_samples, num_nodes), dtype=torch.float32, device=device)
+    env.visit_count[:, start_idx] = 1.0
+    env.step_count = 0
+    if hasattr(env, 'history'):
+        env.history = [env.current_node.clone()]
+
+    # 노드 피처만 갱신 (is_current, is_target, dist, direction)
+    refresh_env_features(env)
+
+    batch_size = num_samples
+    goal_idx_tensor = torch.full((batch_size,), goal_idx, dtype=torch.long, device=device)
+
+    # ─── Phase 1: Manager Plan 생성 (배치) ───
+    x_mgr = env.pyg_data.x[:, :4]
+    edge_index = env.pyg_data.edge_index
+    batch_vec = env.pyg_data.batch
+    ea = select_edge_attr(env.pyg_data.edge_attr)
+
+    t0_mgr = time.perf_counter() if measure_time else 0.0
+    sequences, _ = manager.generate(
+        x_mgr, edge_index, batch_vec,
+        max_len=20, temperature=temperature,
+        apsp_matrix=env.hop_matrix,
+        node_positions=env.pos_tensor,
+        edge_attr=ea,
+    )  # [N, max_len]
+    if measure_time and device.type == "cuda":
+        torch.cuda.synchronize()
+    mgr_time = (time.perf_counter() - t0_mgr) * 1000.0 if measure_time else 0.0
+
+    # Plan 파싱: PAD/EOS를 goal로 대체하여 안전한 시퀀스 생성
+    valid_mask = (sequences < num_nodes) & (sequences >= 0)
+    safe_sequences = torch.where(valid_mask, sequences, goal_idx_tensor.unsqueeze(1))
+    safe_sequences = torch.cat([safe_sequences, goal_idx_tensor.unsqueeze(1)], dim=1)
+    generated_plan_lengths = valid_mask.sum(dim=1)  # [N]
+
+    # ─── Phase 2: Worker 벡터화 실행 ───
+    subgoal_ptrs = torch.zeros(batch_size, dtype=torch.long, device=device)
+    hid_dim = worker.lstm.hidden_size
+    h = torch.zeros(batch_size, hid_dim, device=device)
+    c = torch.zeros(batch_size, hid_dim, device=device)
+
+    active_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+    success_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    visit_counts = torch.zeros(batch_size, num_nodes, device=device)
+    step_counts = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    # 경로 기록 (인스턴스별)
+    all_paths: List[List[int]] = [[start_idx] for _ in range(batch_size)]
+
+    # 초기 타겟 설정
+    target_ptrs = torch.minimum(subgoal_ptrs, generated_plan_lengths)
+    targets = torch.gather(safe_sequences, 1, target_ptrs.unsqueeze(1)).squeeze(1)
+    final_target_phase = (~(subgoal_ptrs < generated_plan_lengths)).float()
+    env.update_target_features(targets, final_target_phase)
+
+    for t in range(MAX_ROLLOUT_STEPS):
+        if not active_mask.any():
+            break
+
+        # ── Goal 도달 체크 ──
+        at_goal = (env.current_node == goal_idx_tensor) & active_mask
+        success_mask = success_mask | at_goal
+        active_mask = active_mask & (~at_goal)
+        if not active_mask.any():
+            break
+
+        # ── Loop 감지 ──
+        curr_nodes = env.current_node.unsqueeze(1)
+        visit_counts.scatter_add_(1, curr_nodes, active_mask.float().unsqueeze(1))
+        curr_visits = torch.gather(visit_counts, 1, curr_nodes).squeeze(1)
+        is_looping = (curr_visits > LOOP_LIMIT) & active_mask
+        active_mask = active_mask & (~is_looping)
+        if not active_mask.any():
+            break
+
+        # ── Subgoal 핸드오프 (Exact + Soft Arrival) ──
+        valid_sg = subgoal_ptrs < generated_plan_lengths
+        current_subgoals = torch.gather(
+            safe_sequences, 1,
+            torch.minimum(subgoal_ptrs, generated_plan_lengths).unsqueeze(1)
+        ).squeeze(1)
+        current_subgoals = torch.where(valid_sg, current_subgoals, goal_idx_tensor)
+
+        # Exact arrival
+        arrived = (env.current_node == current_subgoals) & valid_sg
+
+        # Soft arrival: 현재 서브골에 1홉 이내 + 다음 타겟에 더 가까움
+        next_ptrs = torch.clamp(subgoal_ptrs + 1, max=safe_sequences.size(1) - 1)
+        next_ptrs_clamped = torch.minimum(next_ptrs, generated_plan_lengths)
+        next_targets = torch.gather(safe_sequences, 1, next_ptrs_clamped.unsqueeze(1)).squeeze(1)
+        next_exists = (subgoal_ptrs + 1) < generated_plan_lengths
+
+        sg_hops = env.hop_matrix[env.current_node, current_subgoals].float()
+        next_hops = env.hop_matrix[env.current_node, next_targets].float()
+        sg_to_next_hops = env.hop_matrix[current_subgoals, next_targets].float()
+
+        soft_arrived = (
+            valid_sg & (~arrived) &
+            (sg_hops <= 1.0) & next_exists &
+            (next_hops < sg_to_next_hops)
         )
-        results.append(result)
-    if measure_time:
-        if env.device.type == "cuda":
-            torch.cuda.synchronize()
-        total_time = (time.perf_counter() - t0) * 1000.0
 
-    # 성공한 경로 중 물리적 거리가 가장 짧은 것 선택
+        advance = arrived | soft_arrived
+        # 포인터 전진
+        subgoal_ptrs = torch.where(advance, subgoal_ptrs + 1, subgoal_ptrs)
+
+        # 타겟 갱신
+        target_ptrs = torch.minimum(subgoal_ptrs, generated_plan_lengths)
+        targets = torch.gather(safe_sequences, 1, target_ptrs.unsqueeze(1)).squeeze(1)
+        final_target_phase = (~(subgoal_ptrs < generated_plan_lengths)).float()
+        env.update_target_features(targets, final_target_phase)
+
+        # ── Worker Forward (배치) ──
+        env_x = env.pyg_data.x
+        worker_input = build_worker_input(env_x)
+        edge_attr_w = select_edge_attr(env.pyg_data.edge_attr)
+
+        scores, h, c, _ = worker.predict_next_hop(
+            worker_input, env.pyg_data.edge_index,
+            h, c, env.pyg_data.batch,
+            detach_spatial=False, edge_attr=edge_attr_w,
+        )
+
+        # ── 행동 선택 (Greedy for eval, 다양성은 Manager Plan에서 나옴) ──
+        # scores shape: [N*V, 1] → reshape to per-instance
+        scores_flat = scores.squeeze(-1)  # [N*V]
+        num_total_nodes = scores_flat.size(0) // batch_size
+        scores_2d = scores_flat.view(batch_size, num_total_nodes)  # [N, V]
+
+        mask_2d = env.get_mask()  # [N, V]
+        scores_2d = scores_2d.masked_fill(~mask_2d.bool(), float("-inf"))
+
+        # 비활성 인스턴스는 아무 노드나 (어차피 무시됨)
+        safe_scores = scores_2d.clone()
+        safe_scores[~torch.isfinite(safe_scores)] = -1e9
+        actions = torch.argmax(safe_scores, dim=-1)  # [N]
+
+        # 활성 인스턴스만 스텝 실행
+        env.step(actions)
+        step_counts += active_mask.long()
+
+        # 경로 기록
+        current_nodes = env.current_node.tolist()
+        for i in range(batch_size):
+            if active_mask[i]:
+                all_paths[i].append(current_nodes[i])
+
+    # ── 최종 Goal 도달 체크 ──
+    at_goal_final = (env.current_node == goal_idx_tensor) & active_mask
+    success_mask = success_mask | at_goal_final
+
+    # ─── Phase 3: 결과 집계 & 최적 경로 선택 ───
+    if measure_time and device.type == "cuda":
+        torch.cuda.synchronize()
+    total_time = (time.perf_counter() - t0_total) * 1000.0 if measure_time else 0.0
+
+    optimal_dist = float(env.apsp_matrix[start_idx, goal_idx].item())
+    results: List[Dict[str, Any]] = []
+
+    for i in range(batch_size):
+        path = all_paths[i]
+        success = bool(success_mask[i].item())
+
+        path_distance = sum(
+            float(env.apsp_matrix[path[j], path[j + 1]].item())
+            for j in range(len(path) - 1)
+        ) if len(path) > 1 else 0.0
+
+        dist_plr = path_distance / max(optimal_dist, 1e-6) if optimal_dist > 0 and success else float("inf")
+        final_dist = float(env.apsp_matrix[path[-1], goal_idx].item())
+        progress = 1.0 - (final_dist / optimal_dist) if optimal_dist > 0 else 0.0
+
+        # Plan 파싱
+        plan_raw = sequences[i].tolist()
+        plan_subgoals = []
+        for token in plan_raw:
+            if token == num_nodes or token < 0:
+                break
+            if token < num_nodes:
+                plan_subgoals.append(int(token))
+
+        results.append({
+            "start": start_idx,
+            "goal": goal_idx,
+            "success": success,
+            "path": path,
+            "actual_steps": len(path) - 1,
+            "optimal_dist": optimal_dist,
+            "path_distance": path_distance,
+            "path_length_ratio": dist_plr,
+            "progress": progress,
+            "plan_subgoals": plan_subgoals,
+        })
+
+    # 최적 경로 선택
     successes = [r for r in results if r["success"]]
     if successes:
         best = min(successes, key=lambda r: r.get("path_distance", float("inf")))
     else:
-        # 전부 실패 시 progress가 높은 것 반환
         best = max(results, key=lambda r: r.get("progress", 0.0))
 
-    # 메타 정보 추가
+    # 메타 정보
     best["num_samples"] = num_samples
     best["num_successes"] = len(successes)
     best["sampling_success_rate"] = len(successes) / num_samples * 100.0

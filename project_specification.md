@@ -759,7 +759,7 @@ def _calculate_physics(self, length_km: float, status: str, damage: float)
     *   `wkr_aux_start/end = 0.20 / 0.05`
 5.  **Trainer Dispatch**
     *   `ManagerStageTrainer`
-    *   `WorkerStageTrainer`
+    *   `WorkerNavTrainer`
     *   `DOMOTrainer`
 6.  **`trainer.train(args.episodes)` 실행**
 
@@ -788,9 +788,9 @@ def _calculate_physics(self, length_km: float, status: str, damage: float)
 *   **`ManagerStageTrainer`**
     *   Worker freeze
     *   sparse warm-start + plan-only score + auxiliary CE로 Manager 학습
-*   **`WorkerStageTrainer`**
+*   **`WorkerNavTrainer`**
     *   Manager freeze
-    *   clean/perturbed/manager-sampled sparse plan + expert next-hop supervision으로 Worker 학습
+    *   A* 기반 Hidden Checkpoint를 따라 Worker를 네비게이션 시키는 독립적 집중 훈련
 *   **`DOMOTrainer`**
     *   joint stage와 disaster stage의 공통 trainer
     *   실제 rollout reward + manager/worker auxiliary loss를 함께 사용

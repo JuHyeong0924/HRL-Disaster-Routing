@@ -25,6 +25,10 @@ class WorkerNavTrainer(DOMOTrainer):
         self.mgr_opt = None
         self.mgr_scheduler = None
 
+        # [Critical Fix] DOMOTrainer.__init__에서 Joint Stage용으로 Worker를 동결(requires_grad=False)함.
+        # Worker Stage에서는 Worker가 학습 대상이므로 반드시 다시 활성화해야 함.
+        for param in self.worker.parameters():
+            param.requires_grad_(True)
         self.wkr_opt = optim.Adam(self.worker.parameters(), lr=self.config.lr)
         self.wkr_scheduler = None
 
@@ -419,7 +423,12 @@ class WorkerNavTrainer(DOMOTrainer):
         valid_masks = []
         aux_losses = []
 
-        path_traces = [[int(node)] for node in self.env.current_node.detach().cpu().tolist()]
+        # [Perf] path_traces는 디버그 에피소드에서만 수집 (매 스텝 GPU→CPU 동기화 제거)
+        _collect_path = self._collect_debug_this_episode
+        if _collect_path:
+            path_traces = [[int(node)] for node in self.env.current_node.detach().cpu().tolist()]
+        else:
+            path_traces = [[] for _ in range(batch_size)]
 
         gamma = float(self.reward_cfg["GAMMA_PBRS"])
         pbrs_scale = float(self.reward_cfg["POTENTIAL_SCALE"])
@@ -428,18 +437,33 @@ class WorkerNavTrainer(DOMOTrainer):
         fail_penalty = float(self.reward_cfg["FAIL_PENALTY"])
         goal_reward = float(self.reward_cfg["GOAL_REWARD"])
 
+        # [VRAM Fix] GATv2 encoder는 항상 detach(spatial freeze)하여 LSTM+Scorer+Critic만 학습.
+        # 이유: GATv2 3레이어 × 400스텝 BPTT는 ~100GB VRAM 필요 → 24GB 4090에서 불가능.
+        #       SL pretrained GATv2 가중치는 이미 충분히 좋으므로, 노드 임베딩 품질 유지.
+        is_joint_stage = True  # Worker Stage에서도 spatial detach 적용
+        
+        # [Perf] edge_attr는 스텝마다 되풀이되지 않으므로 루프 밖에서 1회만 계산
+        _cached_edge_attr = self._select_edge_attr(self.env.pyg_data.edge_attr)
+        
+        # [VRAM Fix] Truncated BPTT: N스텝마다 LSTM 상태를 detach하여 연산 그래프 길이를 제한
+        # 400스텝 전체 BPTT는 ~100GB VRAM 필요 → tbptt_len=20이면 ~6GB로 축소
+        _tbptt_len = int(getattr(self.config, "tbptt_len", 20))
+        _step_counter = 0
+        
         for _ in range(self.max_steps):
             active = ~done
             if not bool(active.any()):
                 break
 
+            # [VRAM Fix] Truncated BPTT: N스텝마다 h,c를 detach하여 이전 그래프 해제
+            _step_counter += 1
+            if _step_counter % _tbptt_len == 0:
+                h = h.detach()
+                c = c.detach()
+
             current_nodes = self.env.current_node.clone()
             worker_input = self._build_worker_input()
-            edge_attr = self._select_edge_attr(self.env.pyg_data.edge_attr)
-            # [Memory/Perf] Worker 단독 학습(stage='worker') 시에는 VRAM이 충분하므로 GATv2까지 포함한 End-to-End BPTT 학습을 진행.
-            # 하지만 Manager/Worker가 동시 학습되는 Joint(stage='joint') 단계에서는 VRAM이 매우 부족하므로 공간 인코더(GATv2)의 그래디언트를 차단하여 메모리 방어.
-            is_joint_stage = getattr(self.config, "stage", "worker") == "joint"
-            
+
             scores, h_next, c_next, value_pred = self.worker.predict_next_hop(
                 worker_input,
                 self.env.pyg_data.edge_index,
@@ -447,7 +471,7 @@ class WorkerNavTrainer(DOMOTrainer):
                 c,
                 self.env.pyg_data.batch,
                 detach_spatial=is_joint_stage, 
-                edge_attr=edge_attr,
+                edge_attr=_cached_edge_attr,
             )
             # inactive 에이전트의 LSTM 상태는 detach하여 불필요한 연산 그래프 VRAM 누적 방지
             h = torch.where(active.unsqueeze(1), h_next, h.detach())
@@ -499,30 +523,24 @@ class WorkerNavTrainer(DOMOTrainer):
                 * self.goal_neighbor_miss_penalty
             )
 
-            # [Perf] checkpoint hit 판정을 텐서 벡터 연산으로 일괄 처리
-            # 기존 Python for-loop + .item() 제거 → GPU-CPU 동기화 제거
+            # [Perf] checkpoint hit 판정: bool() GPU 동기화 없이 무조건 실행 (empty mask는 비용 없음)
             if self.checkpoint_hit_radius >= 0:
                 ptr_valid = active & (checkpoint_ptrs < checkpoint_counts_long)
-                if bool(ptr_valid.any()):
-                    # 현재 포인터가 가리키는 체크포인트 노드를 일괄 추출
-                    safe_ptrs = checkpoint_ptrs.clamp(max=_max_ckpt - 1)
-                    current_ckpt = ckpt_tensor[batch_indices, safe_ptrs]
-                    # 정확 히트 판정
-                    exact_hit = ptr_valid & (next_nodes == current_ckpt)
-                    # 반경 히트 판정 (checkpoint_hit_radius > 0 일 때)
-                    if self.checkpoint_hit_radius > 0:
-                        hop_dist = self.env.hop_matrix[next_nodes, current_ckpt]
-                        radius_hit = ptr_valid & (~exact_hit) & (
-                            hop_dist <= float(self.checkpoint_hit_radius)
-                        )
-                        hit_mask = exact_hit | radius_hit
-                    else:
-                        hit_mask = exact_hit
-                    if bool(hit_mask.any()):
-                        reward = reward + hit_mask.float() * hit_bonus_tensor
-                        checkpoint_ptrs = checkpoint_ptrs + hit_mask.long()
-                        checkpoint_hits = checkpoint_hits + hit_mask.float()
-                        checkpoint_has_any_hit = checkpoint_has_any_hit | hit_mask
+                safe_ptrs = checkpoint_ptrs.clamp(max=_max_ckpt - 1)
+                current_ckpt = ckpt_tensor[batch_indices, safe_ptrs]
+                exact_hit = ptr_valid & (next_nodes == current_ckpt)
+                if self.checkpoint_hit_radius > 0:
+                    hop_dist = self.env.hop_matrix[next_nodes, current_ckpt]
+                    radius_hit = ptr_valid & (~exact_hit) & (
+                        hop_dist <= float(self.checkpoint_hit_radius)
+                    )
+                    hit_mask = exact_hit | radius_hit
+                else:
+                    hit_mask = exact_hit
+                reward = reward + hit_mask.float() * hit_bonus_tensor
+                checkpoint_ptrs = checkpoint_ptrs + hit_mask.long()
+                checkpoint_hits = checkpoint_hits + hit_mask.float()
+                checkpoint_has_any_hit = checkpoint_has_any_hit | hit_mask
 
             reached_goal = active & (next_nodes == goal_targets)
             reward = reward + reached_goal.float() * goal_reward
@@ -555,38 +573,37 @@ class WorkerNavTrainer(DOMOTrainer):
             )
             stagnation_reset_on_best_goal_improve += improved.float()
 
+            # [Perf] bool(any()) GPU 동기화 제거: torch.where는 빈 마스크에도 비용이 거의 없음
             goal4_reset_now = (
                 active
                 & (best_goal_hops <= 4.0)
                 & (~goal4_patience_granted)
             )
-            if bool(goal4_reset_now.any()):
-                stagnation_steps = torch.where(
-                    goal4_reset_now,
-                    torch.zeros_like(stagnation_steps),
-                    stagnation_steps,
-                )
-                stagnation_patience_budget = torch.where(
-                    goal4_reset_now,
-                    stagnation_patience_budget + self.near_goal_patience_bonus,
-                    stagnation_patience_budget,
-                )
-                goal4_patience_granted |= goal4_reset_now
-                stagnation_reset_goal4 += goal4_reset_now.float()
+            stagnation_steps = torch.where(
+                goal4_reset_now,
+                torch.zeros_like(stagnation_steps),
+                stagnation_steps,
+            )
+            stagnation_patience_budget = torch.where(
+                goal4_reset_now,
+                stagnation_patience_budget + self.near_goal_patience_bonus,
+                stagnation_patience_budget,
+            )
+            goal4_patience_granted |= goal4_reset_now
+            stagnation_reset_goal4 += goal4_reset_now.float()
 
             goal2_reset_now = (
                 active
                 & (best_goal_hops <= 2.0)
                 & (~goal2_patience_granted)
             )
-            if bool(goal2_reset_now.any()):
-                stagnation_steps = torch.where(
-                    goal2_reset_now,
-                    torch.zeros_like(stagnation_steps),
-                    stagnation_steps,
-                )
-                goal2_patience_granted |= goal2_reset_now
-                stagnation_reset_goal2 += goal2_reset_now.float()
+            stagnation_steps = torch.where(
+                goal2_reset_now,
+                torch.zeros_like(stagnation_steps),
+                stagnation_steps,
+            )
+            goal2_patience_granted |= goal2_reset_now
+            stagnation_reset_goal2 += goal2_reset_now.float()
 
             loop_fail_now = active & (self.env.visit_count[batch_indices, next_nodes] > self.loop_limit)
             stagnation_now = active & (stagnation_steps >= stagnation_patience_budget)
@@ -600,10 +617,11 @@ class WorkerNavTrainer(DOMOTrainer):
             step_counts = step_counts + active.float()
 
             expert_next = self.env.weighted_next_hop_matrix[current_nodes, goal_targets]
-            # [Perf] .item() N회 → .tolist() 1회로 GPU-CPU 동기화 감소
-            _next_cpu = next_nodes.detach().cpu().tolist()
-            for batch_idx in range(batch_size):
-                path_traces[batch_idx].append(_next_cpu[batch_idx])
+            # [Perf] 디버그 에피소드에서만 path_traces 수집 (GPU→CPU 동기화 제거)
+            if _collect_path:
+                _next_cpu = next_nodes.detach().cpu().tolist()
+                for batch_idx in range(batch_size):
+                    path_traces[batch_idx].append(_next_cpu[batch_idx])
 
             ce_mask = active & (expert_next >= 0)
             if bool(ce_mask.any()):
@@ -744,12 +762,12 @@ class WorkerNavTrainer(DOMOTrainer):
 
         sample_payload = {
             "episode": int(ep),
-            "start_node": int(path_traces[0][0]),
+            "start_node": int(path_traces[0][0]) if _collect_path and path_traces[0] else -1,
             "goal_node": int(goal_targets[0].item()),
             "teacher_path": teacher_paths[0],
             "hidden_checkpoints": hidden_lists[0],
             "checkpoint_hits": int(checkpoint_hits[0].item()),
-            "path_trace": path_traces[0],
+            "path_trace": path_traces[0] if _collect_path else [],
             "success": bool(success[0].item()),
             "final_goal_distance": float(final_goal_dist[0].item()),
         }
@@ -891,7 +909,7 @@ class WorkerNavTrainer(DOMOTrainer):
                     grad = diag.get("worker_grad_pre", 0.0)
                     
                     debug_str = (
-                        f"📊 [EP {ep+1:5d}] W_Ent: {ent:.3f} | V_Loss: {v_loss:.3f} | Grad: {grad:.2f} | ExplVar: {expl_var:.2f} | "
+                        f"📊 [EP {ep+1:5d}] W_Ent: {ent:.3f} | V_Loss: {v_loss:.3f} | Grad: {grad:.4f} | ExplVar: {expl_var:.2f} | "
                         f"Hop_Dist: {hop_dist:.1f} | Prog: {prog:.1f}% | EMA: {success_ema:.1f}%"
                     )
                     sys.stderr.write(f"DEBUG_UPDATE|{debug_str}\n")

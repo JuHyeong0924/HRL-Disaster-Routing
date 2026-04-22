@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv
-from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 class WorkerLSTM(nn.Module):
     def __init__(self, node_dim: int = 9, hidden_dim: int = 256, num_layers: int = 3, 
@@ -107,29 +106,22 @@ class WorkerLSTM(nn.Module):
                     h = self.layer_norms[i](h)
             h = h.detach()  # gradient 그래프에서 완전 분리
         else:
-            # SL 학습: gradient checkpointing + Residual
+            # RL / SL 학습: End-to-End 직접 역전파 (속도 우선, VRAM ~13GiB 소모)
             h = x
+            
             # 첫 번째 레이어
             h_residual = self.input_proj(h)
-            h = grad_checkpoint(
-                lambda inp, ei, ea, _c=self.convs[0]: F.dropout(F.elu(_c(inp, ei, edge_attr=ea)), 
-                                                                 p=self.dropout, training=self.training),
-                h, edge_index, edge_attr,
-                use_reentrant=False
-            )
-            h = h + h_residual  # ① Residual with projection
+            h = self.convs[0](h, edge_index, edge_attr=edge_attr)
+            h = F.dropout(F.elu(h), p=self.dropout, training=self.training)
+            h = h + h_residual
             h = self.layer_norms[0](h)
             
             # 나머지 레이어
             for i in range(1, self.num_layers):
                 h_residual = h
-                h = grad_checkpoint(
-                    lambda inp, ei, ea, _c=self.convs[i]: F.dropout(F.elu(_c(inp, ei, edge_attr=ea)), 
-                                                                     p=self.dropout, training=self.training),
-                    h, edge_index, edge_attr,
-                    use_reentrant=False
-                )
-                h = h + h_residual  # ① Skip Connection
+                h = self.convs[i](h, edge_index, edge_attr=edge_attr)
+                h = F.dropout(F.elu(h), p=self.dropout, training=self.training)
+                h = h + h_residual
                 h = self.layer_norms[i](h)
         
         # === Temporal Memory (LSTM) — gradient 유지 ===

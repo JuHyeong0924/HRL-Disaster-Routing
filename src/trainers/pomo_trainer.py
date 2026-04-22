@@ -87,7 +87,7 @@ class DOMOTrainer:
         self.wkr_aux_end = float(getattr(config, 'wkr_aux_end', 0.05))
         self.mgr_lr_scale = float(getattr(config, 'mgr_lr_scale', 0.7))
         self.mgr_eta_min_scale = float(getattr(config, 'mgr_eta_min_scale', 0.1))
-        self.stage = str(getattr(config, 'stage', 'joint'))
+        self.stage = str(getattr(config, 'stage', 'alignment'))
         self.ret_ema_mean = None
         self.ret_ema_std = None
         self._handoff_target_warned = False
@@ -133,15 +133,16 @@ class DOMOTrainer:
         if self.debug_mode:
             self._init_debug_outputs()
         
-        # [Fix 2026-03-15] 단조 감소 스케줄러 (WarmRestart는 주기적 LR 스파이크로 지식 파괴)
-        self.mgr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.mgr_opt, T_max=episodes, eta_min=self.config.lr * self.mgr_eta_min_scale
+        # Alignment용 LR: CLI --lr 인자를 그대로 사용
+        alignment_lr = self.config.lr * self.mgr_lr_scale
+        for pg in self.mgr_opt.param_groups:
+            pg['lr'] = alignment_lr
+        self.mgr_scheduler = optim.lr_scheduler.LambdaLR(
+            self.mgr_opt, lr_lambda=lambda _: 1.0  # Constant LR
         )
-        self.wkr_scheduler = None  # 언프리즈 시점에 설정
+        self.wkr_scheduler = None
         
         avg_reward = 0
-        wkr_unfreeze_progress = 0.50  # 전체 에피소드의 50% 시점에서 동결 해제
-        wkr_unfreeze_ep = int(episodes * wkr_unfreeze_progress)
         pbar = tqdm(range(episodes), desc="RL", ncols=100)
         
         # 학습 곡선 기록용
@@ -152,38 +153,17 @@ class DOMOTrainer:
         success_ema = 0  # Exponential Moving Average
         
         for ep in pbar:
-            # [Fix: Micro Fine-Tuning] 진척도 50% 시점에 Worker 잠금 해제
-            if ep == wkr_unfreeze_ep:
-                # [Fix 2026-04-20] OOM 방지: Worker Unfreeze 전 메모리 확보
-                # Why: Worker의 LSTM/Scorer/Critic 역전파에 필요한 activations이
-                #      매 스텝마다 누적되어 기존 48 POMO로는 24GB GPU 메모리를 초과함.
-                self._save_unified_checkpoint(
-                    "pre_unfreeze.pt", ep,
-                    metric=success_ema, metric_name="success_ema",
-                )
-                torch.cuda.empty_cache()
-                # [Fix 2026-04-20] POMO 16으로 축소: 32에서도 OOM 발생
-                # Why: Worker LSTM (최대 170스텝) activations + Manager Aux CE가
-                #      32 POMO에서도 24GB를 초과함. 16이면 충분한 여유 확보.
-                prev_pomo = self.num_pomo
-                self.num_pomo = 24
-                pbar.write(
-                    f"[Ep {ep}] Worker Unfreeze: num_pomo {prev_pomo} → {self.num_pomo}, "
-                    f"CUDA cache cleared, checkpoint saved."
-                )
-                for p in self.worker.parameters():
-                    p.requires_grad_(True)
-                wkr_lr_ft = 1e-5  # 마이크로 파인튜닝 학습률
-                self.wkr_opt = optim.Adam(self.worker.parameters(), lr=wkr_lr_ft)
-                self.wkr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                    self.wkr_opt, T_max=max(episodes - ep, 1), eta_min=wkr_lr_ft * 0.1
-                )
-                
+            # [Design 2026-04-21] Worker는 전체 Joint 단계에서 동결 유지 (Frozen Executor)
+            # Why: (1) Worker EMA 90%+ 달성 → 이미 충분한 일반화 능력 확보
+            #      (2) 동결 시 역전파 그래프 미생성 → POMO 48 유지 가능 (vs Unfreeze 시 16)
+            #      (3) Non-stationarity 제거 → Manager의 학습 안정성 극대화
+
             self._collect_debug_this_episode = self._should_collect_debug(ep, episodes)
             self._last_debug_tensors = None
 
-            # [Fix 5] Curriculum Learning 적용
-            curriculum_ratio = min(1.0, ep / (episodes * 0.8))
+            # [Fix 2026-04-21] Curriculum Learning: 난이도 상승 속도 완화 (0.8→0.90)
+            # Why: 커리큘럼이 너무 빠르면 Manager가 적응하기 전에 난이도가 올라감
+            curriculum_ratio = min(1.0, ep / (episodes * 0.90))
             self.env.set_curriculum_ratio(curriculum_ratio)
             
             # 1. Reset Env (Vectorized Batch Reset)
@@ -1844,7 +1824,7 @@ class DOMOTrainer:
         compact_line = (
             f"  📊 SR={summary['success_rate']*100:.1f}% | "
             f"Plan={summary['plan_density_mean']:.3f} | "
-            f"Corr={summary['corridor_mean']*100:.0f}% | "
+            f"Corr={summary['corridor_ratio_mean']*100:.0f}% | "
             f"Under/Over={summary['plan_under_rate']*100:.0f}/{summary['plan_over_rate']*100:.0f}% | "
             f"Hit@1={summary['subgoal_rank1_rate']*100:.0f}%"
         )

@@ -1,15 +1,27 @@
 import argparse
 import os
+import warnings
 from datetime import datetime
 
+# lr_scheduler.step() 순서 경고 억제
+warnings.filterwarnings("ignore", message=".*lr_scheduler.step.*optimizer.step.*")
+
 import torch
+import torch.backends.cudnn as cudnn
+import torch.multiprocessing as mp
+
+# [Speed Optimization] RTX 4090 (Ada) 및 고정된 입력 형태를 위한 하드웨어 극한 속도 튜닝
+# 1. cuDNN Benchmark: 첫 스텝 수행 시 최적의 CUDA 커널을 찾아 고정
+cudnn.benchmark = True
+# 2. TF32 활성화: 행렬 곱셈 속도 최대 3배 폭증 (정밀도 손실 체감 불가)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 from src.envs.disaster_env import DisasterEnv
 from src.models.manager import GraphTransformerManager
 from src.models.worker import WorkerLSTM
 from src.trainers.worker_nav_trainer import WorkerNavTrainer
 from src.trainers.manager_stage_trainer import ManagerStageTrainer  # [Refactor: Task 1]
-from src.trainers.worker_stage_trainer import WorkerStageTrainer  # [Refactor: Task 1]
 from src.trainers.pomo_trainer import DOMOTrainer  # [Refactor: Task 1]
 
 
@@ -136,7 +148,7 @@ def _build_config(args, loaded_checkpoint_paths, stage_override=None):
     stage_base = {
         'manager': os.path.join('logs', 'rl_manager_stage'),
         'worker': os.path.join('logs', 'rl_worker_stage'),
-        'joint': os.path.join('logs', 'rl_joint_stage'),
+        'alignment': os.path.join('logs', 'rl_alignment_stage'),
     }.get(effective_stage, os.path.join('logs', 'rl_finetune'))
     save_dir = os.path.join(stage_base, run_label)
     return Config(
@@ -202,10 +214,14 @@ def _init_env_and_models(args):
     manager = GraphTransformerManager(node_dim=4, hidden_dim=args.hidden_dim, dropout=0.2, edge_dim=1).to(device)
     worker = WorkerLSTM(node_dim=9, hidden_dim=args.hidden_dim, edge_dim=1).to(device)
 
-    # 배치 크기 고정 적용 (VRAM 스케일러 제거됨)
-    args.num_pomo = int(args.num_pomo) if str(args.num_pomo).isdigit() else 48
-    print(f"📐 고정된 배치 크기(POMO): {args.num_pomo}")
-
+    # 단계별 배치 크기 (개별 학습은 64, Joint는 OOM 방지를 위해 절반으로 고정)
+    raw_pomo = str(args.num_pomo)
+    base_pomo = int(raw_pomo) if raw_pomo.isdigit() and raw_pomo != "auto" else 64
+    
+    # [Design 2026-04-21] Joint 단계에서도 Worker 동결으로 POMO 축소 불필요
+    args.num_pomo = int(base_pomo)
+        
+    print(f"📐 고정된 배치 크기(POMO): {args.num_pomo} (Stage: {args.stage})")
     return env, manager, worker, device
 
 
@@ -254,15 +270,15 @@ def _run_single_stage(args, env, manager, worker, device, stage: str,
         # Manager: SL pretrained로 시작
         if not _load_manager_checkpoint(sl_ckpt, manager, device, loaded_checkpoint_paths):
             print("⚠️ SL manager checkpoint not found.")
-    elif stage == "joint":
+    elif stage == "alignment":
         # Worker: worker_stage best → fallback SL
         if not _load_worker_checkpoint(wkr_stage_ckpt, worker, device, loaded_checkpoint_paths):
             if not _load_worker_checkpoint(sl_ckpt, worker, device, loaded_checkpoint_paths):
-                print("⚠️ No worker checkpoint for joint stage.")
+                print("⚠️ No worker checkpoint for alignment stage.")
         # Manager: manager_stage best → fallback SL
         if not _load_manager_checkpoint(mgr_stage_ckpt, manager, device, loaded_checkpoint_paths):
             if not _load_manager_checkpoint(sl_ckpt, manager, device, loaded_checkpoint_paths):
-                print("⚠️ No manager checkpoint for joint stage.")
+                print("⚠️ No manager checkpoint for alignment stage.")
 
     config = _build_config(args, loaded_checkpoint_paths, stage_override=stage)
 
@@ -272,7 +288,7 @@ def _run_single_stage(args, env, manager, worker, device, stage: str,
     elif stage == "worker":
         # WorkerNavTrainer를 Worker stage의 기본 Trainer로 사용
         trainer = WorkerNavTrainer(env, manager, worker, config)
-    elif stage == "joint":
+    elif stage == "alignment":
         trainer = DOMOTrainer(env, manager, worker, config)
     else:
         trainer = WorkerNavTrainer(env, manager, worker, config)
@@ -299,15 +315,15 @@ def _run_parallel_phase1(args) -> None:
         return
 
     worker_eps = args.episodes
-    manager_eps = args.episodes * 2  # Manager는 2배 에피소드
-    joint_eps = args.episodes
+    manager_eps = args.episodes * 4  # Manager는 4배 에피소드 (Worker보다 ~7.6배 빠르므로 GPU 유휴 최소화)
+    alignment_eps = args.episodes
 
     print(f"\n{'='*60}")
-    print("🔀 Phase 1 Parallel: Worker(GPU 0) ∥ Manager(GPU 1) → Joint")
+    print("🔀 Phase 1 Parallel: Worker(GPU 0) ∥ Manager(GPU 1) → Alignment")
     print(f"{'='*60}")
-    print(f"  Worker:  {worker_eps:,} eps on GPU 0")
-    print(f"  Manager: {manager_eps:,} eps on GPU 1")
-    print(f"  Joint:   {joint_eps:,} eps (완료 후)")
+    print(f"  Worker:     {worker_eps:,} eps on GPU 0")
+    print(f"  Manager:    {manager_eps:,} eps on GPU 1")
+    print(f"  Alignment:  {alignment_eps:,} eps (완료 후)")
     print()
 
     # 공통 인자 구성
@@ -317,7 +333,6 @@ def _run_parallel_phase1(args) -> None:
         "--data", args.data,
         "--hidden_dim", str(args.hidden_dim),
         "--lr", str(args.lr),
-        "--num_pomo", str(args.num_pomo),
     ]
     if args.debug:
         base_args.append("--debug")
@@ -326,14 +341,21 @@ def _run_parallel_phase1(args) -> None:
     worker_cmd = base_args + [
         "--stage", "worker",
         "--episodes", str(worker_eps),
+        "--num_pomo", str(args.num_pomo),
         "--disable_tqdm",
     ]
     worker_env = {**os.environ, "CUDA_VISIBLE_DEVICES": "0"}
 
     # Manager subprocess (GPU 1)
+    # [Fix] 사용자 요청: Manager의 POMO 크기를 1.5배(예: 48 * 1.5 = 72)로 상향 조정하여 VRAM을 적절히 활용
+    if args.num_pomo == "auto":
+        manager_pomo = "auto"
+    else:
+        manager_pomo = int(float(args.num_pomo) * 1.5)
     manager_cmd = base_args + [
         "--stage", "manager",
         "--episodes", str(manager_eps),
+        "--num_pomo", str(manager_pomo),
         "--disable_tqdm",
     ]
     manager_env = {**os.environ, "CUDA_VISIBLE_DEVICES": "1"}
@@ -393,9 +415,10 @@ def _run_parallel_phase1(args) -> None:
                 except Exception:
                     pass
             else:
-                # 3. pbar.write() 제거 (터미널 렌더링 보호)
-                # 서브프로세스의 기타 에러/경고는 UI를 깨지 않도록 파일에만 기록합니다.
-                pass 
+                # 3. 에러 추적 보호 기법
+                # 서브프로세스의 기타 에러/경고(예: OOM Traceback)는 터미널을 깨지 않도록 파일에 기록
+                with open(f"logs/{task_name.lower()}_error.log", "a", encoding="utf-8") as f:
+                    f.write(line)
                 
         pbar.close()
 
@@ -416,37 +439,39 @@ def _run_parallel_phase1(args) -> None:
     print(f"\n✅ Manager 완료 (exit code: {manager_rc})")
 
     if worker_rc != 0 or manager_rc != 0:
-        print("❌ Worker 또는 Manager 학습이 실패했습니다. Joint를 건너뜁니다.")
+        print("❌ Worker 또는 Manager 학습이 실패했습니다. Alignment를 건너뜁니다.")
         return
 
-    # Joint 실행 (GPU 0)
+    # Alignment 실행 (GPU 0)
     print(f"\n{'='*60}")
-    print(f"🔗 Joint Stage 시작 ({joint_eps:,} eps on GPU 0)")
+    print(f"🔗 Alignment Stage 시작 ({alignment_eps:,} eps on GPU 0)")
     print(f"{'='*60}\n")
 
-    joint_cmd = base_args + [
-        "--stage", "joint",
-        "--episodes", str(joint_eps),
+    alignment_pomo = int(float(args.num_pomo) * 1.5)  # Worker 동결 → VRAM 여유
+    alignment_cmd = base_args + [
+        "--stage", "alignment",
+        "--episodes", str(alignment_eps),
+        "--num_pomo", str(alignment_pomo),
     ]
-    joint_env = {**os.environ, "CUDA_VISIBLE_DEVICES": "0"}
-    joint_rc = subprocess.call(
-        joint_cmd, env=joint_env,
+    alignment_env = {**os.environ, "CUDA_VISIBLE_DEVICES": "0"}
+    alignment_rc = subprocess.call(
+        alignment_cmd, env=alignment_env,
         cwd=os.getcwd(),
     )
 
-    if joint_rc == 0:
+    if alignment_rc == 0:
         print(f"\n{'='*60}")
         print("🎉 Phase 1 Parallel 전체 학습 완료!")
         print(f"{'='*60}")
     else:
-        print(f"\n❌ Joint 학습 실패 (exit code: {joint_rc})")
+        print(f"\n❌ Alignment 학습 실패 (exit code: {alignment_rc})")
 
 
 def train_rl(args):
     if args.disaster:
         raise ValueError(
             "--disaster is legacy / unsupported. "
-            "Use --stage phase1 for worker→manager→joint pipeline."
+            "Use --stage phase1 for worker→manager→alignment pipeline."
         )
 
     if args.stage == "phase1_parallel":
@@ -456,19 +481,19 @@ def train_rl(args):
     env, manager, worker, device = _init_env_and_models(args)
 
     if args.stage == "phase1":
-        # Phase 1: worker → manager → joint 자동 순차 실행
+        # Phase 1: worker → manager → alignment 자동 순차 실행
         worker_eps = args.episodes
         manager_eps = args.episodes
-        joint_eps = args.episodes
+        alignment_eps = args.episodes
 
         print(f"\n🎯 Phase 1 자동 순차 실행: 각 Stage별 {args.episodes} episodes (총 {args.episodes * 3} eps)")
-        print(f"   1. Worker:  {worker_eps} eps → logs/rl_worker_stage/")
-        print(f"   2. Manager: {manager_eps} eps → logs/rl_manager_stage/")
-        print(f"   3. Joint:   {joint_eps} eps → logs/rl_joint_stage/")
+        print(f"   1. Worker:    {worker_eps} eps → logs/rl_worker_stage/")
+        print(f"   2. Manager:   {manager_eps} eps → logs/rl_manager_stage/")
+        print(f"   3. Alignment: {alignment_eps} eps → logs/rl_alignment_stage/")
 
         _run_single_stage(args, env, manager, worker, device, "worker", worker_eps)
         _run_single_stage(args, env, manager, worker, device, "manager", manager_eps)
-        _run_single_stage(args, env, manager, worker, device, "joint", joint_eps)
+        _run_single_stage(args, env, manager, worker, device, "alignment", alignment_eps)
 
         print(f"\n{'='*60}")
         print("🎉 Phase 1 전체 학습 완료!")
@@ -488,7 +513,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stage",
         default="phase1",
-        choices=["manager", "worker", "joint", "phase1", "phase1_parallel"],
+        choices=["manager", "worker", "alignment", "phase1", "phase1_parallel"],
         help="학습 단계: phase1(순차), phase1_parallel(Worker∥Manager→Joint)",
     )
     parser.add_argument("--wkr_lr_floor", type=float, default=1e-5,

@@ -1,5 +1,4 @@
 import math
-import math
 
 import torch
 import torch.nn as nn
@@ -211,35 +210,6 @@ class GraphTransformerManager(nn.Module):
         nn.init.xavier_uniform_(self.pointer_query.weight)
         nn.init.xavier_uniform_(self.pointer_key.weight)
 
-    def _compute_lpe(self, edge_index, num_nodes, device):
-        """
-        Compute Laplacian Positional Encoding (LPE)
-        Returns: [num_nodes, k_eig]
-        """
-        from torch_geometric.utils import to_dense_adj, get_laplacian
-        
-        # 1. Compute Normalized Laplacian
-        L_edge_index, L_values = get_laplacian(edge_index, normalization='sym', num_nodes=num_nodes)
-        
-        # If graph is too big for dense eig, we might need sparse eig (lobpcg).
-        # But for 416 nodes, dense is fine.
-        L = to_dense_adj(L_edge_index, edge_attr=L_values, max_num_nodes=num_nodes).squeeze(0) # [N, N]
-        
-        # 2. Eigendecomposition
-        # Use simple eigh for symmetric matrix
-        # Check if L is symmetric (should be)
-        evals, evecs = torch.linalg.eigh(L)
-        
-        # 3. Select k smallest non-trivial eigenvectors
-        max_k = min(self.k_eig, num_nodes)
-        
-        if num_nodes < self.k_eig:
-            padding = torch.zeros(num_nodes, self.k_eig - num_nodes, device=device)
-            pe = torch.cat([evecs[:, :num_nodes], padding], dim=1)
-        else:
-            pe = evecs[:, 1:self.k_eig+1] # Skip 1st trivial (v0) -> Use v1 ~ vk
-        
-        return pe # [N, k]
 
     def encode_graph(self, x, edge_index, batch, edge_attr=None):
         # 1. GATv2 Embedding (Local Topology + Edge Features)
@@ -533,7 +503,16 @@ class GraphTransformerManager(nn.Module):
             if temperature <= 1e-5:
                 next_node_indices = torch.argmax(scores, dim=-1)
             else:
+                # NaN/Inf 방어: 대형 그래프에서 score overflow 방지
+                scores = torch.clamp(scores, min=-1e6, max=1e6)
+                scores[torch.isnan(scores)] = float('-inf')
                 probs = F.softmax(scores / temperature, dim=-1)
+                probs = torch.clamp(probs, min=0.0)
+                probs[torch.isnan(probs)] = 0.0
+                # 전체 행이 0이면 uniform으로 fallback
+                zero_rows = probs.sum(dim=-1) < 1e-8
+                if zero_rows.any():
+                    probs[zero_rows] = 1.0 / probs.size(-1)
                 next_node_indices = torch.multinomial(probs, 1).squeeze(-1)
             
             full_seqs.append(next_node_indices)

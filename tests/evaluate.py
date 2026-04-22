@@ -9,9 +9,15 @@ import random
 import re
 import sys
 import time
+import warnings
 from collections import Counter
 from pathlib import Path
 from typing import Any
+
+# PyTorch nested tensor 프로토타입 경고 억제
+warnings.filterwarnings("ignore", message=".*nested tensors.*prototype.*")
+
+from tqdm import tqdm
 
 import matplotlib
 
@@ -3828,12 +3834,15 @@ def generate_trajectory_metrics_txt(traj_info: dict[str, Any], output_dir: Path,
 
 
 def evaluate_all_methods(flat_worker, joint_worker, manager, env, num_episodes: int, num_samples: int, seed: int) -> dict:
+    import networkx as nx
+    # 모든 메서드가 동일한 OD 쌍 사용 (공정한 비교)
     pairs = core.generate_od_pairs(env, num_episodes, min_hops=2, seed=seed)
     results = {}
 
+    # ── A* 벤치마크 ──
     print(f"\n  🔷 A* 벤치마크 평가 중...")
     astar_results, astar_times = [], []
-    for s, g in pairs:
+    for s, g in tqdm(pairs, desc="  A*", ncols=80, leave=False):
         t0 = time.perf_counter()
         try:
             raw_s = [k for k, v in env.node_mapping.items() if v == s][0]
@@ -3841,7 +3850,9 @@ def evaluate_all_methods(flat_worker, joint_worker, manager, env, num_episodes: 
             nx_path = nx.dijkstra_path(env.map_core.graph, raw_s, raw_g, weight="length")
             mapped_path = [env.node_mapping[n] for n in nx_path]
             success = True
-        except Exception:
+        except Exception as e:
+            if not astar_results:  # 첫 실패만 출력
+                print(f"\n  ⚠️ A* 실패 디버그: s={s}, g={g}, error={e}")
             mapped_path = [s]
             success = False
         t1 = time.perf_counter()
@@ -3854,30 +3865,68 @@ def evaluate_all_methods(flat_worker, joint_worker, manager, env, num_episodes: 
     astar_sr = sum(1 for r in astar_results if r["success"]) / len(astar_results) * 100
     astar_plrs = [r["path_length_ratio"] for r in astar_results if r["success"] and math.isfinite(r["path_length_ratio"])]
     results["A*"] = {"success_rate": astar_sr, "path_length_ratio": float(np.mean(astar_plrs)) if astar_plrs else float("inf"), "inference_latency_ms": float(np.mean(astar_times))}
+    print(f"  ✅ A*: SR={astar_sr:.1f}%")
 
+    # ── Flat RL (동일 pairs 사용) ──
     print(f"\n  🔶 Flat RL 평가 중...")
-    flat_eval = core.evaluate_worker_batch(flat_worker, env, len(pairs), temperature=0.0, label="Flat RL", seed=seed, min_hops=2)
-    results["Flat RL"] = {"success_rate": flat_eval["success_rate"], "path_length_ratio": flat_eval["path_length_ratio"], "inference_latency_ms": flat_eval["inference_latency_ms"]}
+    flat_worker.eval()
+    flat_results_list = []
+    pbar_flat = tqdm(pairs, desc="  Flat RL", ncols=80, leave=False)
+    for s, g in pbar_flat:
+        result = core.run_worker_rollout(flat_worker, env, s, g, temperature=0.0, measure_time=True)
+        flat_results_list.append(result)
+        sr = sum(1 for r in flat_results_list if r["success"]) / len(flat_results_list) * 100
+        pbar_flat.set_postfix(SR=f"{sr:.1f}%")
+    
+    flat_successes = [r for r in flat_results_list if r["success"]]
+    flat_sr = len(flat_successes) / len(flat_results_list) * 100.0
+    flat_plrs = [r["path_length_ratio"] for r in flat_successes if math.isfinite(r["path_length_ratio"])]
+    results["Flat RL"] = {
+        "success_rate": flat_sr,
+        "path_length_ratio": float(np.mean(flat_plrs)) if flat_plrs else float("inf"),
+        "inference_latency_ms": float(np.mean([r["inference_time_ms"] for r in flat_results_list])),
+    }
+    print(f"  ✅ Flat RL: SR={flat_sr:.1f}%")
 
+    # ── HRL Greedy (동일 pairs 사용) ──
     print(f"\n  🟢 HRL (Greedy) 평가 중...")
-    hrl_greedy_eval = core.evaluate_joint_batch(joint_worker, manager, env, len(pairs), temperature=0.0, mgr_temperature=0.0, label="HRL Greedy", seed=seed, min_hops=2)
-    results["HRL (Greedy)"] = {"success_rate": hrl_greedy_eval["success_rate"], "path_length_ratio": hrl_greedy_eval["path_length_ratio"], "inference_latency_ms": hrl_greedy_eval["inference_latency_ms"]}
+    joint_worker.eval()
+    manager.eval()
+    hrl_results_list = []
+    pbar_hrl = tqdm(pairs, desc="  HRL Greedy", ncols=80, leave=False)
+    for s, g in pbar_hrl:
+        result = core.run_joint_rollout(joint_worker, manager, env, s, g, temperature=0.0, mgr_temperature=0.0, measure_time=True)
+        hrl_results_list.append(result)
+        sr = sum(1 for r in hrl_results_list if r["success"]) / len(hrl_results_list) * 100
+        pbar_hrl.set_postfix(SR=f"{sr:.1f}%")
+    
+    hrl_successes = [r for r in hrl_results_list if r["success"]]
+    hrl_sr = len(hrl_successes) / len(hrl_results_list) * 100.0
+    hrl_plrs = [r["path_length_ratio"] for r in hrl_successes if math.isfinite(r["path_length_ratio"])]
+    results["HRL (Greedy)"] = {
+        "success_rate": hrl_sr,
+        "path_length_ratio": float(np.mean(hrl_plrs)) if hrl_plrs else float("inf"),
+        "inference_latency_ms": float(np.mean([r["inference_time_ms"] for r in hrl_results_list])),
+    }
+    print(f"  ✅ HRL Greedy: SR={hrl_sr:.1f}%")
 
+    # ── HRL Multi-Sampling (동일 pairs 사용) ──
     print(f"\n  🔴 HRL (Multi-Sampling) 평가 중...")
     ms_successes = 0
     ms_plrs, ms_times = [], []
-    for ep, (s, g) in enumerate(pairs):
+    pbar = tqdm(enumerate(pairs), total=len(pairs), desc="  HRL-MS", ncols=80)
+    for ep, (s, g) in pbar:
         ms_result = core.run_joint_rollout_multisampling(joint_worker, manager, env, s, g, num_samples=num_samples, temperature=core.DEFAULT_SAMPLE_TEMP, measure_time=True)
         if ms_result["success"]:
             ms_successes += 1
             if math.isfinite(ms_result["path_length_ratio"]):
                 ms_plrs.append(ms_result["path_length_ratio"])
         ms_times.append(ms_result.get("total_sampling_time_ms", 0.0))
-        if (ep + 1) % 50 == 0:
-            print(f"     [{ep+1}/{len(pairs)}] SR={(ms_successes / (ep + 1) * 100):.1f}%")
+        pbar.set_postfix(SR=f"{ms_successes / (ep + 1) * 100:.1f}%")
     
     ms_sr = ms_successes / len(pairs) * 100
     results["HRL (Sampling)"] = {"success_rate": ms_sr, "path_length_ratio": float(np.mean(ms_plrs)) if ms_plrs else float("inf"), "inference_latency_ms": float(np.mean(ms_times))}
+    print(f"  ✅ HRL Sampling: SR={ms_sr:.1f}%")
 
     return results
 
