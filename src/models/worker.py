@@ -9,13 +9,14 @@ class WorkerLSTM(nn.Module):
                  dropout: float = 0.2, edge_dim: int = 5, num_scorer_heads: int = 4):
         """
         Worker: Local Navigation with Memory.
-        [v4] 아키텍처 및 State 전면 개편:
-          ① Node State: 8-Dim (is_curr, is_subgoal, is_final, hop_to_subgoal, hop_to_final, global_heading_x, global_heading_y, time_to_go)
-          ② GraphNorm: GATv2 내부 공변량 편이 방어 및 Over-smoothing 억제
-          ③ Single-head Scorer: 다중공선성 및 오버헤드 제거를 위해 단일 헤드로 다이어트
+        [v4.1] 아키텍처 및 State 개편:
+          ① Node State (7-Dim): is_curr, is_subgoal, is_final, hop_to_subgoal, hop_to_final, global_heading_x, global_heading_y
+             (불필요하게 복제되던 time_to_go 제거)
+          ② Global State: time_to_go는 GATv2 통과 후 LSTM 입력에 직접 병합하여 효율성 극대화
+          ③ GraphNorm 및 Single-head Scorer 적용 (최적화)
         
         Args:
-            node_dim: 노드 피처 차원 (8)
+            node_dim: 노드 피처 차원 (7)
             hidden_dim: 은닉층 차원
             num_layers: GATv2 레이어 수
             dropout: Dropout 비율
@@ -44,8 +45,8 @@ class WorkerLSTM(nn.Module):
         # 레이어별 GraphNorm (Residual 후 안정화, Over-smoothing 방지)
         self.graph_norms = nn.ModuleList([GraphNorm(hidden_dim) for _ in range(num_layers)])
             
-        # 2. Temporal Memory (LSTM)
-        self.lstm = nn.LSTMCell(hidden_dim, hidden_dim)
+        # 2. Temporal Memory (LSTM) - time_to_go(1-Dim) 추가 병합
+        self.lstm = nn.LSTMCell(hidden_dim + 1, hidden_dim)
         
         # 3. Decision Head: Single-head Scorer (다이어트)
         self.num_scorer_heads = 1
@@ -68,19 +69,22 @@ class WorkerLSTM(nn.Module):
         
     def predict_next_hop(self, x: torch.Tensor, edge_index: torch.Tensor, 
                          h_state: torch.Tensor, c_state: torch.Tensor, 
-                         batch: torch.Tensor, neighbors_mask=None, 
+                         batch: torch.Tensor, time_to_go: torch.Tensor,
+                         neighbors_mask=None, 
                          detach_spatial: bool = False, edge_attr: torch.Tensor = None):
         """
-        Single step prediction with batch support.
+        단일 스텝 추론 (Autoregressive or RL Rollout)
         
         Args:
-            x: 노드 피처 [B*N, node_dim]
-            edge_index: 엣지 인덱스 [2, E]
-            h_state: LSTM hidden state [B, H]
-            c_state: LSTM cell state [B, H]
-            batch: 배치 인덱스 [B*N]
-            detach_spatial: True이면 GATv2 출력을 detach (RL 학습 시 VRAM 절약)
-            edge_attr: ③ 엣지 피처 [E, edge_dim] (None이면 edge feature 미사용)
+            x: [N, 7] 노드 피처
+            edge_index: [2, E] 엣지 인덱스
+            h_state: [Batch, hidden_dim]
+            c_state: [Batch, hidden_dim]
+            batch: [N] 각 노드의 그래프 소속 인덱스
+            time_to_go: [Batch, 1] 남은 시간 비율 (Global Feature)
+            neighbors_mask: (Optional) 방문 불가능한 노드 마스킹
+            detach_spatial: 역전파를 GNN에서 끊을지 여부
+            edge_attr: [E, edge_dim] (None이면 edge feature 미사용)
         """
         if x.size(1) < self.node_dim:
             pad = torch.zeros(x.size(0), self.node_dim - x.size(1), device=x.device, dtype=x.dtype)
@@ -148,7 +152,9 @@ class WorkerLSTM(nn.Module):
         else:
              curr_emb = curr_emb_raw
 
-        h_next, c_next = self.lstm(curr_emb, (h_state, c_state))
+        # [v4.1] time_to_go를 Global Feature로 병합
+        curr_emb_with_time = torch.cat([curr_emb, time_to_go], dim=1)  # [Batch, hidden_dim + 1]
+        h_next, c_next = self.lstm(curr_emb_with_time, (h_state, c_state))
         
         # Value Prediction (Critic)
         value = self.critic(h_next)

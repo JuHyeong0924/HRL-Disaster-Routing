@@ -1272,7 +1272,7 @@ def train_sl(args):
                         # === 3. 컴팩트 GNN 입력 조립 (v4 Architecture) ===
                         compact_coords = node_coords_per_graph[active_idx].reshape(K * num_nodes_per_graph, 2)
                         
-                        worker_in = torch.zeros((K * num_nodes_per_graph, 8), device=device_wkr)
+                        worker_in = torch.zeros((K * num_nodes_per_graph, 7), device=device_wkr)
                         
                         # 0: is_curr
                         worker_in[cached_offsets + curr_nodes_k, 0] = 1.0  
@@ -1307,9 +1307,9 @@ def train_sl(args):
                         norm_final = diff_final.norm(dim=1, keepdim=True).clamp(min=1e-6)
                         worker_in[:, 5:7] = diff_final / norm_final
                         
-                        # 7: time_to_go (남은 스텝 비율)
+                        # 7: time_to_go (남은 스텝 비율) -> Global Feature로 분리
                         time_to_go_val = 1.0 - (float(step) / max(max_seq_len, 1))
-                        worker_in[:, 7] = time_to_go_val
+                        time_to_go_tensor = torch.full((K, 1), time_to_go_val, device=device_wkr)
                     
                         # === 4. 활성 은닉 상태 슬라이싱 & Forward ===
                         h_active = h[active_idx]  # [K, H]
@@ -1317,6 +1317,7 @@ def train_sl(args):
                     
                         scores, h_next_k, c_next_k, _ = worker.predict_next_hop(
                             worker_in, cached_edge_index, h_active, c_active, cached_batch_vec,
+                            time_to_go=time_to_go_tensor,
                             edge_attr=cached_edge_attr
                         )
                     
@@ -1476,7 +1477,7 @@ def train_sl(args):
                             # === 3. 컴팩트 GNN 입력 (v4 Architecture) ===
                             compact_coords = node_coords_per_graph[active_idx].reshape(K * num_nodes_per_graph, 2)
                         
-                            worker_in = torch.zeros((K * num_nodes_per_graph, 8), device=device_wkr)
+                            worker_in = torch.zeros((K * num_nodes_per_graph, 7), device=device_wkr)
                             worker_in[cached_offsets + curr_nodes_k, 0] = 1.0
                             worker_in[cached_offsets + tgt_nodes_k, 1] = 1.0
                             
@@ -1507,9 +1508,9 @@ def train_sl(args):
                             norm_final = diff_final.norm(dim=1, keepdim=True).clamp(min=1e-6)
                             worker_in[:, 5:7] = diff_final / norm_final
                             
-                            # 7: time_to_go
+                            # 7: time_to_go -> Global Feature로 분리
                             time_to_go_val = 1.0 - (float(step) / max(max_seq_len, 1))
-                            worker_in[:, 7] = time_to_go_val
+                            time_to_go_tensor = torch.full((K, 1), time_to_go_val, device=device_wkr)
                         
                             # === 4. Forward ===
                             h_active = h[active_idx]
@@ -1517,6 +1518,7 @@ def train_sl(args):
                         
                             scores, h_next_k, c_next_k, _ = worker.predict_next_hop(
                                 worker_in, cached_edge_index, h_active, c_active, cached_batch_vec,
+                                time_to_go=time_to_go_tensor,
                                 edge_attr=cached_edge_attr
                             )
                         
