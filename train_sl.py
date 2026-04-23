@@ -173,7 +173,7 @@ def train_sl(args):
     ).to(device_mgr)
     
     worker = WorkerLSTM(
-        node_dim=8,  # [v3] [is_curr, is_tgt, net_dist, dir_x, dir_y, is_final, hop_dist, time_pct]
+        node_dim=7,  # [v4.1] [is_curr, is_tgt, is_final, hop_sub, hop_final, head_x, head_y]
         hidden_dim=args.hidden_dim,
         edge_dim=3
     ).to(device_wkr)
@@ -1041,6 +1041,8 @@ def train_sl(args):
             manager.eval()
             mgr_val_loss = 0
             mgr_val_batches = 0
+            mgr_val_correct = 0
+            mgr_val_total = 0
             with torch.no_grad():
                 # Manager Validation
                 mgr_val_iter = tqdm(mgr_val_loader, desc=f"  Mgr Val Ep{epoch}", leave=False, position=2, dynamic_ncols=True)
@@ -1103,6 +1105,12 @@ def train_sl(args):
                     if real_node_mask.sum() > 0:
                         # [Fix 5] EOS 토큰을 제외한 순수 공간 노드에 대해서만 log_softmax 적용
                         logits_nodes = pointer_logits[..., :-1]
+                        
+                        # === Accuracy 계산 추가 ===
+                        preds = logits_nodes.view(-1, N_max)[real_node_mask].argmax(dim=-1)
+                        mgr_val_correct += (preds == targets_flat[real_node_mask]).sum().item()
+                        mgr_val_total += real_node_mask.sum().item()
+                        
                         log_probs_nodes = F.log_softmax(logits_nodes, dim=-1)
                     
                         real_mask_2d = (final_targets < N_max) & (final_targets >= 0)
@@ -1123,7 +1131,12 @@ def train_sl(args):
                     mgr_val_loss += loss.item()
                     mgr_val_batches += 1
                     
-                    mgr_val_iter.set_postfix({'loss': f"{mgr_val_loss/max(1, mgr_val_batches):.4f}"})
+                    mgr_val_acc = 100 * mgr_val_correct / max(1, mgr_val_total)
+                    mgr_val_iter.set_postfix({
+                        'loss': f"{mgr_val_loss/max(1, mgr_val_batches):.4f}", 
+                        'lr': f"{optimizer_mgr.param_groups[0]['lr']:.2e}", 
+                        'acc': f"{mgr_val_acc:.1f}%"
+                    })
             
             mgr_val = mgr_val_loss/max(1, mgr_val_batches)
             # === Manager Early Stopping 체크 ===
@@ -1141,7 +1154,11 @@ def train_sl(args):
             history['mgr_val_loss'].append(mgr_val)
             mgr_scheduler.step(mgr_val) # ReduceLROnPlateau needs metric
             current_lr_mgr = optimizer_mgr.param_groups[0]['lr']
-            mgr_pbar.set_postfix({'loss': f"{mgr_val:.4f}", 'lr': f"{current_lr_mgr:.2e}"})
+            mgr_pbar.set_postfix({
+                'loss': f"{mgr_val:.4f}", 
+                'lr': f"{current_lr_mgr:.2e}", 
+                'acc': f"{mgr_val_acc:.1f}%"
+            })
             mgr_pbar.update(1)
             # === Manager Early Stopping: 전체 학습 종료 ===
             if mgr_es_counter >= MANAGER_ES_PATIENCE:
@@ -1162,7 +1179,9 @@ def train_sl(args):
             # [DAgger] TF Ratio 감소: 0.3까지 감소 (원래 경로 감독 유지)
             tf_ratio = max(0.3, 1.0 - 1.5 * (epoch - 1) / wkr_epochs)
             window_size = 5  # 다중 스텝 언롤링(Multi-step Unrolling) 윈도우 크기
-        
+            
+            wkr_acc = 0.0
+            wkr_val_acc = 0.0
             if not wkr_frozen:
                 worker.train()
                 wkr_loss = 0
@@ -1170,7 +1189,7 @@ def train_sl(args):
                 wkr_correct = 0
                 wkr_total_steps = 0
             
-                wkr_batch_iter = tqdm(wkr_loader, desc=f"  Worker Ep{epoch}", leave=False, position=2, dynamic_ncols=True)
+                wkr_batch_iter = tqdm(wkr_loader, desc=f"  Worker Ep{epoch}", leave=False, position=3, dynamic_ncols=True)
                 batch_idx = 0
                 for batch in wkr_batch_iter:
                     batch = batch.to(device_wkr)
@@ -1382,11 +1401,12 @@ def train_sl(args):
                         del worker_in, scores, h_next_k, c_next_k, h_new, c_new, scores_view, step_loss
                         
                     wkr_acc = 100 * wkr_correct / max(1, wkr_total_steps)
+                    wkr_batches += (max_seq_len / window_size)  # Approximate batches
                     batch_idx += 1
                     wkr_batch_iter.set_postfix({
                         'loss': f"{wkr_loss/max(1, wkr_batches):.4f}",
-                        'acc': f"{wkr_acc:.1f}%",
-                        'seq': f"{max_seq_len}"
+                        'lr': f"{wkr_opt.param_groups[0]['lr']:.2e}",
+                        'acc': f"{wkr_acc:.1f}%"
                     })
                 wkr_pbar.set_postfix({
                     'loss': f"{wkr_loss/max(1, wkr_batches):.4f}",
@@ -1403,10 +1423,12 @@ def train_sl(args):
             worker.eval()
             wkr_val_loss = 0
             wkr_val_batches = 0
+            wkr_val_correct = 0
+            wkr_val_total = 0
             with torch.no_grad():
                 # Worker Validation (매 에포크)
                 if not wkr_frozen:
-                    wkr_val_iter = tqdm(wkr_val_loader, desc=f"  Worker Val Ep{epoch}", leave=False, position=2, dynamic_ncols=True)
+                    wkr_val_iter = tqdm(wkr_val_loader, desc=f"  Worker Val Ep{epoch}", leave=False, position=3, dynamic_ncols=True)
                     for batch in wkr_val_iter:
                         batch = batch.to(device_wkr)
                     
@@ -1529,6 +1551,12 @@ def train_sl(args):
                             # === 6. 손실 계산: Heuristic-Guided SL (Validation) ===
                             scores_view = scores.view(K, num_nodes_per_graph)
                             ce_loss = F.cross_entropy(scores_view, target_labels_k)
+                            
+                            # === Accuracy 계산 추가 ===
+                            pred_k = scores_view.argmax(dim=1)
+                            wkr_val_correct += (pred_k == target_labels_k).sum().item()
+                            wkr_val_total += K
+                            
                             dist_to_target = apsp_device_wkr[:, tgt_nodes_k].T / max_dist
                             wkr_soft_labels = F.softmax(-dist_to_target / 0.1, dim=-1)
                             log_probs = F.log_softmax(scores_view, dim=-1)
@@ -1538,7 +1566,12 @@ def train_sl(args):
                             wkr_val_loss += step_loss.item()
                             wkr_val_batches += 1
                             
-                        wkr_val_iter.set_postfix({'loss': f"{wkr_val_loss/max(1, wkr_val_batches):.4f}"})
+                        wkr_val_acc = 100 * wkr_val_correct / max(1, wkr_val_total)
+                        wkr_val_iter.set_postfix({
+                            'loss': f"{wkr_val_loss/max(1, wkr_val_batches):.4f}", 
+                            'lr': f"{wkr_opt.param_groups[0]['lr']:.2e}", 
+                            'acc': f"{wkr_val_acc:.1f}%"
+                        })
             
                     # [Fix #4] 유효 변수만 해제 (h_list, c_list는 이전 코드 잔해)
                     pass
@@ -1573,7 +1606,11 @@ def train_sl(args):
                 wkr_scheduler.step()
         
             current_lr_wkr = wkr_opt.param_groups[0]['lr']
-            wkr_pbar.set_postfix({'loss': f"{best_wkr_val if wkr_frozen else wkr_val_loss/max(1, wkr_val_batches):.4f}", 'lr': f"{current_lr_wkr:.2e}"})
+            wkr_pbar.set_postfix({
+                'loss': f"{best_wkr_val if wkr_frozen else wkr_val_loss/max(1, wkr_val_batches):.4f}", 
+                'lr': f"{current_lr_wkr:.2e}", 
+                'acc': f"{wkr_val_acc if not wkr_frozen else wkr_acc:.1f}%"
+            })
             wkr_pbar.update(1)
             if wkr_frozen:
                 tqdm.write(" Worker frozen, stopping thread.")
@@ -1595,8 +1632,21 @@ def train_sl(args):
         run_sequential_pipeline()
         print("\n=== Sequential Training Finished ===", flush=True)
 
+    # === [안전망] 평가 전 Final Weights 조기 저장 ===
+    checkpoint_data = {
+        'manager_state': manager.state_dict(),
+        'worker_state': worker.state_dict(),
+        'max_dist': max_dist,
+        'num_nodes': num_nodes,
+        'epoch': args.epochs
+    }
+    torch.save(checkpoint_data, os.path.join(save_dir, "model_sl_final.pt"))
+    print(f"💾 [Safe Save] Saved models to {save_dir}/model_sl_final.pt before evaluation.", flush=True)
+
     # === Accuracy Evaluation ===
     tqdm.write("\n📊 Evaluating Model Accuracy...")
+    # [Fix] 병렬 학습 시 Worker가 cuda:1에 있으므로 평가 전 cuda:0으로 통일
+    worker.to(device)
     manager.eval()
     worker.eval()
     
@@ -1660,11 +1710,11 @@ def train_sl(args):
             num_nodes = x_raw.size(0)
             
             # Autoregressive evaluation
-            # [v3] edge_attr 정규화: 루프 밖에서 1회만 수행
+            # [v4.1] Global Z-score 정규화: 루프 밖에서 1회만 수행
             _eval_ea = pyg_data.edge_attr[:, [0, 7, 8]].to(device)
-            _ea_min = _eval_ea.min(dim=0, keepdim=True)[0]
-            _ea_max = _eval_ea.max(dim=0, keepdim=True)[0]
-            _eval_ea = (_eval_ea - _ea_min) / (_ea_max - _ea_min).clamp(min=1e-8)
+            _ea_mean = _eval_ea.mean(dim=0, keepdim=True)
+            _ea_std = _eval_ea.std(dim=0, keepdim=True).clamp(min=1e-8)
+            _eval_ea = (_eval_ea - _ea_mean) / _ea_std
             
             curr_node_idx = c_seq[0].item()
             
@@ -1672,41 +1722,43 @@ def train_sl(args):
                 tgt_node_idx = t_seq[step].item()
                 target_label = n_seq[step].item()
                 
-                flags = torch.zeros(num_nodes, 2, device=device)
-                flags[curr_node_idx, 0] = 1.0
-                flags[tgt_node_idx, 1] = 1.0
+                final_node_idx = c_seq[-1].item()
+                worker_in = torch.zeros((num_nodes, 7), device=device)
                 
-                if hasattr(wkr_dataset, 'apsp_matrix'):
-                    dist_map = wkr_dataset.apsp_matrix[tgt_node_idx].to(device)
-                    net_dist = (dist_map / wkr_dataset.max_dist).unsqueeze(1)
-                else:
-                    net_dist = torch.zeros(num_nodes, 1, device=device)
-                    
-                target_pos = node_coords[tgt_node_idx].unsqueeze(0)
-                direction = target_pos - node_coords
-                norm = direction.norm(dim=1, keepdim=True).clamp(min=1e-8)
-                direction = direction / norm
+                # 0: is_curr
+                worker_in[curr_node_idx, 0] = 1.0
+                # 1: is_subgoal
+                worker_in[tgt_node_idx, 1] = 1.0
+                # 2: is_final_goal
+                worker_in[final_node_idx, 2] = 1.0
                 
-                # is_final_target_phase: 1.0 if this step's subgoal is the final target
-                is_final = torch.full((num_nodes, 1), float(step == seq_len - 1), device=device)
-                
-                # hop_dist
                 if hasattr(wkr_dataset, 'hop_matrix'):
                     if not hasattr(wkr_dataset, '_cached_max_h'):
                         _hm = wkr_dataset.hop_matrix
                         wkr_dataset._cached_max_h = float(_hm[_hm < float('inf')].max().item()) if _hm.numel() > 0 else 50.0
                         wkr_dataset._cached_hm_dev = _hm.to(device)
-                    hop_dists = wkr_dataset._cached_hm_dev[tgt_node_idx]
-                    hop_dist_feat = torch.clamp(hop_dists.float() / wkr_dataset._cached_max_h, 0.0, 1.0).unsqueeze(1)
-                else:
-                    hop_dist_feat = torch.zeros(num_nodes, 1, device=device)
+                    hop_to_sub = wkr_dataset._cached_hm_dev[:, tgt_node_idx]
+                    hop_to_final = wkr_dataset._cached_hm_dev[:, final_node_idx]
                     
-                # [v3] x,y 제거, time_pct 추가
-                time_pct_feat = torch.full((num_nodes, 1), float(step) / max(seq_len, 1), device=device)
-                worker_in = torch.cat([flags, net_dist, direction, is_final, hop_dist_feat, time_pct_feat], dim=1)
+                    # 3: hop_to_subgoal
+                    worker_in[:, 3] = torch.clamp(hop_to_sub.float() / wkr_dataset._cached_max_h, 0.0, 1.0)
+                    # 4: hop_to_final
+                    worker_in[:, 4] = torch.clamp(hop_to_final.float() / wkr_dataset._cached_max_h, 0.0, 1.0)
+                
+                # 5, 6: global_heading_x, y
+                target_pos = node_coords[final_node_idx].unsqueeze(0)
+                direction = target_pos - node_coords
+                norm = direction.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                worker_in[:, 5:7] = direction / norm
+                
+                # Global Context
+                time_to_go = torch.tensor([[1.0 - (step / max(seq_len, 1))]], device=device)
                 
                 # edge_dim=3: [length, capacity, speed] (정규화 완료)
-                scores, h, c, _ = worker.predict_next_hop(worker_in, edge_index, h, c, batch_vec, edge_attr=_eval_ea)
+                scores, h, c, _ = worker.predict_next_hop(
+                    worker_in, edge_index, h, c, batch_vec, 
+                    time_to_go=time_to_go, edge_attr=_eval_ea
+                )
                 pred = scores.argmax().item()
                 
                 if pred == target_label:
@@ -1805,8 +1857,8 @@ def train_sl(args):
             hid = torch.zeros(1, args.hidden_dim, device=device)
             cell = torch.zeros(1, args.hidden_dim, device=device)
             
-            # [v3] x,y 제거: 좌표 할당 없음. time_pct는 스텝별 갱신
-            worker_in_sim = torch.zeros((num_nodes, 8), device=device)
+            # [v4.1] worker_in_sim 7-Dim 할당
+            worker_in_sim = torch.zeros((num_nodes, 7), device=device)
             
             for step in range(max_steps):
                 if current_node == goal_node:
@@ -1825,41 +1877,46 @@ def train_sl(args):
                 else:
                     subgoal = goal_idx
                 
-                # [Fix C] In-place 업데이트 (새 텐서 할당 없음)
+                # [Fix C] In-place 업데이트
                 curr_idx = env.node_mapping[current_node]
                 
-                # [v3] 인덱스 시프트: x,y 제거로 is_current(0), is_target(1), is_final(5)
-                worker_in_sim[:, 0:2].zero_()
-                worker_in_sim[:, 5] = 0.0
+                worker_in_sim.zero_()
+                
+                # 0: is_curr
                 worker_in_sim[curr_idx, 0] = 1.0
+                # 1: is_subgoal
                 if subgoal < num_nodes:
                     worker_in_sim[subgoal, 1] = 1.0
-                if subgoal == goal_idx:
-                    worker_in_sim[:, 5] = 1.0
+                # 2: is_final_goal
+                worker_in_sim[goal_idx, 2] = 1.0
                 
-                # Network Distance (Normalized) → col 2
-                worker_in_sim[:, 2] = apsp_device[:, subgoal] / max_dist
-                
-                # Direction Vector → col 3:5
-                target_pos = node_coords_device[subgoal]
-                diff = target_pos - node_coords_device
-                dist_euc = torch.norm(diff, dim=1, keepdim=True) + 1e-6
-                worker_in_sim[:, 3:5] = diff / dist_euc
-                
-                # hop_dist → col 6
+                # hop_dist
                 if hasattr(env, 'hop_matrix'):
                     if not hasattr(env, '_cached_max_h'):
                         _hm = env.hop_matrix
                         env._cached_max_h = float(_hm[_hm < float('inf')].max().item()) if _hm.numel() > 0 else 50.0
                         env._cached_hm_dev = _hm.to(device)
-                    hop_dists_sim = env._cached_hm_dev[subgoal]
-                    worker_in_sim[:, 6] = torch.clamp(hop_dists_sim.float() / env._cached_max_h, 0.0, 1.0)
+                    hop_to_sub = env._cached_hm_dev[subgoal]
+                    hop_to_final = env._cached_hm_dev[goal_idx]
+                    # 3: hop_to_subgoal
+                    worker_in_sim[:, 3] = torch.clamp(hop_to_sub.float() / env._cached_max_h, 0.0, 1.0)
+                    # 4: hop_to_final
+                    worker_in_sim[:, 4] = torch.clamp(hop_to_final.float() / env._cached_max_h, 0.0, 1.0)
                 
-                # [v3] time_pct → col 7
-                worker_in_sim[:, 7] = float(step) / float(max_steps)
+                # 5, 6: global_heading_x, y
+                target_pos = node_coords_device[goal_idx].unsqueeze(0)
+                diff = target_pos - node_coords_device
+                dist_euc = torch.norm(diff, dim=1, keepdim=True) + 1e-6
+                worker_in_sim[:, 5:7] = diff / dist_euc
+                
+                # Global Context
+                time_to_go_sim = torch.tensor([[1.0 - (step / max_steps)]], device=device)
                 
                 # Worker 예측 (predict_next_hop API 사용)
-                scores, hid, cell, _ = worker.predict_next_hop(worker_in_sim, edge_index_device, hid, cell, batch_vec_sim, edge_attr=edge_attr_device)
+                scores, hid, cell, _ = worker.predict_next_hop(
+                    worker_in_sim, edge_index_device, hid, cell, batch_vec_sim, 
+                    time_to_go=time_to_go_sim, edge_attr=edge_attr_device
+                )
                 
                 # 이웃 노드 중에서만 선택
                 neighbors = list(env.map_core.graph.neighbors(current_node))

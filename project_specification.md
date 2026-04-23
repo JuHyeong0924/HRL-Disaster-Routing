@@ -1441,12 +1441,6 @@ Manager는 글로벌 경로 계획을 수행하며, 이를 **마르코프 결정
 
 ### 3.2. Agent Parameters
 - **Manager (Graph Transformer Manager)**:
-  - **Type**: Topology-Aware Graph Transformer (Encoder-Decoder)
-  - **Input**:
-    - `x`: Node Features [N, 4] (x, y, is_start, is_goal)
-    - `edge_index`: Graph Connectivity (Adjacency)
-  - **Encoder (Topology-Aware)**:
-- **Manager (Graph Transformer Manager)**:
   - **Type**: Hybrid Graph Transformer (GAT + Global Transformer)
   - **Input**:
     - `x`: Node Features [N, 4] (x, y, is_start, is_goal) (Normalized)
@@ -1766,16 +1760,19 @@ compute_path_overlap(worker_path, optimal_path) -> Dict
 - **Module Target**: `src/models/worker.py`, `train_sl.py`, `src/trainers/worker_nav_trainer.py`
 - **핵심 목표**: 특정 맵에 과적합(Overfitting)되는 문제를 해결하고, POMDP 한계(방향 감각 상실)를 극복하기 위해 Node/Edge Feature를 전면 재설계.
 
-### 11.1 Node Feature 개편 (v4 State: 8-Dim)
+### 11.1 Node Feature 개편 (v4.1 State: 7-Dim)
 - **제거된 피처**: `net_dist`, `dir_x`, `dir_y` (유클리드 방향 및 국소 거리)
-- **신규 8-Dim 구조**:
+- **신규 7-Dim 구조**:
   - `0`: `is_curr` (현재 위치)
   - `1`: `is_subgoal` (Manager가 할당한 목표 노드)
   - `2`: `is_final_goal` (에피소드의 최종 도착 노드)
   - `3`: `hop_to_subgoal` (각 노드에서 subgoal까지의 정규화된 홉 거리)
   - `4`: `hop_to_final` (각 노드에서 최종 도착지까지의 정규화된 홉 거리)
   - `5, 6`: `global_heading_x, y` (각 노드에서 최종 도착지를 향하는 유클리드 방향 단위 벡터)
-  - `7`: `time_to_go` (1.0 - t/T, 스텝 진행률 역산)
+- **Global Context Feature 분리 (`time_to_go`)**:
+  - 기존 8번째 노드 피처였던 `time_to_go` (1.0 - t/T)를 노드 피처에서 완전 분리.
+  - 불필요하게 모든 노드에 중복 복제되어 GNN 연산 오버헤드를 발생시키는 구조적 비효율성을 해결.
+  - GNN 처리 후 단일 Global Vector (`[Batch, 1]`) 형태로 도출하여 LSTM 입력(`curr_emb`)에 직접 병합.
 - **기대 효과**: 에이전트가 맵의 절대 좌표나 형태에 얽매이지 않고, "최종 목적지 방향성"과 "서브골까지의 위상학적 거리"를 기반으로 최적화된 경로를 선택 (Zero-shot Generalization 향상).
 
 ### 11.2 GNN 아키텍처 다이어트 (GraphNorm & Single-head)
