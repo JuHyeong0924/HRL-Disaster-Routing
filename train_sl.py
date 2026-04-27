@@ -1638,7 +1638,11 @@ def train_sl(args):
         'worker_state': worker.state_dict(),
         'max_dist': max_dist,
         'num_nodes': num_nodes,
-        'epoch': args.epochs
+        'epoch': args.epochs,
+        'history': history,  # 학습 곡선 사후 생성용
+        'best_mgr_val': best_mgr_val,
+        'best_wkr_val': best_wkr_val,
+        'wkr_frozen': wkr_frozen,
     }
     torch.save(checkpoint_data, os.path.join(save_dir, "model_sl_final.pt"))
     print(f"💾 [Safe Save] Saved models to {save_dir}/model_sl_final.pt before evaluation.", flush=True)
