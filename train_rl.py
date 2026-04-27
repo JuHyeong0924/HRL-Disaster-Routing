@@ -24,6 +24,18 @@ from src.trainers.worker_nav_trainer import WorkerNavTrainer
 from src.trainers.manager_stage_trainer import ManagerStageTrainer  # [Refactor: Task 1]
 from src.trainers.pomo_trainer import DOMOTrainer  # [Refactor: Task 1]
 
+# Ablation Study 설정 로드
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tests'))
+try:
+    from ablation_configs import get_ablation_config, get_worker_kwargs
+except ImportError:
+    # tests/ablation_configs.py가 없으면 기본값 사용
+    def get_ablation_config(ablation_id: str) -> dict:
+        return {}
+    def get_worker_kwargs(ablation_id: str, base_hidden_dim: int = 256) -> dict:
+        return {"node_dim": 7, "hidden_dim": base_hidden_dim, "num_layers": 3, "edge_dim": 3}
+
 
 class Config:
     def __init__(self, **kwargs):
@@ -142,9 +154,13 @@ def _load_worker_checkpoint(path, worker, device, loaded_paths):
 def _build_config(args, loaded_checkpoint_paths, stage_override=None):
     # stage_override: phase1 순차 실행 시 각 단계별 stage 지정용
     effective_stage = stage_override or args.stage
-    # 타임스탬프 서브폴더 생성: logs/<stage>/<YYYY-MM-DD_HHMM>_<stage>_pomo<N>/
+    # 타임스탬프 서브폴더 생성: logs/<stage>/<YYYY-MM-DD_HHMM>_<stage>_pomo<N>[_<ablation>]/
     timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
-    run_label = f"{timestamp}_{effective_stage}_pomo{args.num_pomo}"
+    # [Ablation] 실험 ID를 폴더명에 포함하여 동시 실행 시 충돌 방지
+    ablation_suffix = ""
+    if hasattr(args, 'ablation') and args.ablation.upper() != "BASELINE":
+        ablation_suffix = f"_{args.ablation.upper()}"
+    run_label = f"{timestamp}_{effective_stage}_pomo{args.num_pomo}{ablation_suffix}"
     stage_base = {
         'manager': os.path.join('logs', 'rl_manager_stage'),
         'worker': os.path.join('logs', 'rl_worker_stage'),
@@ -178,6 +194,7 @@ def _build_config(args, loaded_checkpoint_paths, stage_override=None):
         wkr_aux_mid=0.17,
         wkr_aux_end=0.12,
         wkr_lr_floor=getattr(args, "wkr_lr_floor", 1e-5),  # [Refactor: Task 5] 최소 학습률 상향
+        ablation_config=getattr(args, "_ablation_config", {}),  # [Ablation] 실험 설정 전달
         goal_hop_bonus_8=0.75,
         goal_hop_bonus_4=1.0,
         goal_hop_bonus_2=1.25,
@@ -212,8 +229,22 @@ def _init_env_and_models(args):
 
     # edge_dim=3: [length, capacity, speed] → 인덱스 [0, 7, 8]
     manager = GraphTransformerManager(node_dim=4, hidden_dim=args.hidden_dim, dropout=0.2, edge_dim=3).to(device)
-    # [v3] node_dim=8: x,y 제거 + time_pct 추가 → cross-map 일반화 지원
-    worker = WorkerLSTM(node_dim=8, hidden_dim=args.hidden_dim, edge_dim=3).to(device)
+    # [v4.1] Worker 생성: ablation에 따라 node_dim/hidden_dim/num_layers 변경
+    ablation_id = getattr(args, 'ablation', 'BASELINE').upper()
+    ablation_cfg = get_ablation_config(ablation_id)
+    worker_kw = get_worker_kwargs(ablation_id, base_hidden_dim=args.hidden_dim)
+    args._ablation_config = ablation_cfg  # Config에 전달하기 위해 args에 저장
+    
+    worker = WorkerLSTM(
+        node_dim=worker_kw["node_dim"],
+        hidden_dim=worker_kw["hidden_dim"],
+        num_layers=worker_kw["num_layers"],
+        edge_dim=worker_kw["edge_dim"],
+        ablation_config=ablation_cfg,
+    ).to(device)
+    print(f"🧪 Ablation: {ablation_id} | {ablation_cfg.get('description', 'Baseline')}")
+    print(f"   Worker: node_dim={worker_kw['node_dim']}, hidden_dim={worker_kw['hidden_dim']}, "
+          f"num_layers={worker_kw['num_layers']}, use_lstm={ablation_cfg.get('use_lstm', True)}")
 
     # 단계별 배치 크기 (개별 학습은 64, Joint는 OOM 방지를 위해 절반으로 고정)
     raw_pomo = str(args.num_pomo)
@@ -532,6 +563,8 @@ if __name__ == "__main__":
         help="디버그 모드: 주기적으로 단계별 지표를 상세 로그로 출력",
     )
     parser.add_argument("--disable_tqdm", action="store_true", help="내부 tqdm 비활성화 및 stdin 보고")
+    parser.add_argument("--ablation", type=str, default="BASELINE",
+                        help="Ablation 실험 ID (BASELINE, A1~A7, S1~S5, R1~R5)")
     parser.add_argument(
         "--force_joint",
         action="store_true",
