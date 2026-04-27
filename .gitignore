@@ -1,6 +1,11 @@
-# === 학습 로그 및 체크포인트 (SL pretrain만 추적) ===
-logs/rl_joint_stage/
-logs/cache/
+# === 학습 로그 및 체크포인트 ===
+logs/
+data/
+
+# === Ablation Study 결과 (대용량, 로컬 전용) ===
+tests/ablation_results/
+tests/ablation_run.log
+nohup.out
 
 # === 논문 산출물 (로컬 생성, 재생성 가능) ===
 tests/paper_figures/
@@ -8,6 +13,7 @@ tests/paper_figures/
 # === Python ===
 __pycache__/
 *.py[cod]
+*.pyc
 *.egg-info/
 dist/
 build/
@@ -36,9 +42,3 @@ desktop.ini
 # === 기타 ===
 *.log
 *.tmp
-
-# Large data files
-data/
-logs/
-__pycache__/
-*.pyc

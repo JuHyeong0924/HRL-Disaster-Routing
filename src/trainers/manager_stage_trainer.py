@@ -201,6 +201,10 @@ class ManagerStageTrainer(DOMOTrainer):
         pbar = tqdm(range(episodes), desc="MgrStage", ncols=100, disable=tqdm_disabled)
         warmstart_episodes = max(1, int(round(episodes * self.sparse_warmstart_ratio)))
 
+        # [Gradient Accumulation] REINFORCE 고분산 억제를 위한 가상 배치 확대
+        ACCUM_STEPS = 4
+        self.mgr_opt.zero_grad()
+
         for ep in pbar:
             self._collect_debug_this_episode = self._should_collect_debug(ep, episodes)
             curriculum_ratio = min(1.0, ep / max(episodes * 0.8, 1.0))
@@ -222,7 +226,7 @@ class ManagerStageTrainer(DOMOTrainer):
             x_mgr_in = self.env.pyg_data.x[:, :4]
             edge_index = self.env.pyg_data.edge_index
             batch_vec = self.env.pyg_data.batch
-            ea = self.env.pyg_data.edge_attr[:, 0:1]  # Phase 1: length만 사용
+            ea = self.env.pyg_data.edge_attr[:, [0, 7, 8]]  # [length, capacity, speed]
 
             temperature = max(0.5, 1.5 - curriculum_ratio)
             sequences, _ = self.manager.generate(
@@ -385,18 +389,22 @@ class ManagerStageTrainer(DOMOTrainer):
 
             loss = rl_weight * policy_loss + aux_weight * aux_ce_loss + entropy_bonus
 
-            self.mgr_opt.zero_grad()
+            # [Gradient Accumulation] Loss를 ACCUM_STEPS로 나눠서 누적
+            loss = loss / ACCUM_STEPS
             if loss.requires_grad:
                 loss.backward()
-                # [Fix 2026-04-20] 웜스타트(SL only)에서는 5.0, RL 투입 후에는 10.0
-                # Why: Advantage 클리핑이 없는 순수 SL에서 10.0은 SL 가중치를 파괴함
-                effective_grad_norm = 10.0 if rl_weight > 0.0 else 5.0
-                mgr_preclip_norm = float(
-                    torch.nn.utils.clip_grad_norm_(self.manager.parameters(), max_norm=effective_grad_norm)
-                )
-                self.mgr_opt.step()
+                mgr_preclip_norm = 0.0
+
+                # ACCUM_STEPS 마다 가중치 업데이트
+                if (ep + 1) % ACCUM_STEPS == 0:
+                    effective_grad_norm = 10.0 if rl_weight > 0.0 else 5.0
+                    mgr_preclip_norm = float(
+                        torch.nn.utils.clip_grad_norm_(self.manager.parameters(), max_norm=effective_grad_norm)
+                    )
+                    self.mgr_opt.step()
+                    self.mgr_opt.zero_grad()  # 업데이트 후 gradient 초기화
             else:
-                mgr_preclip_norm = -1.0 # 0.0과 구별하기 위해 -1로 기록 (requires_grad=False 감지용)
+                mgr_preclip_norm = -1.0
             self.mgr_scheduler.step()
 
             quality_rate = (

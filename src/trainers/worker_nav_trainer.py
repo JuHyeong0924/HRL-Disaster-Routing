@@ -119,6 +119,9 @@ class WorkerNavTrainer(DOMOTrainer):
             }
         )
 
+        # [Ablation] 실험 설정 로드
+        self.ablation_config = getattr(config, "ablation_config", {})
+
         self._neighbor_lists = [
             torch.where(self.env.adj_matrix[node_idx])[0].tolist()
             for node_idx in range(self.env.num_nodes)
@@ -143,16 +146,37 @@ class WorkerNavTrainer(DOMOTrainer):
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
     @staticmethod
-    def _select_edge_attr(edge_attr):
-        """Phase 1: length(인덱스 0)만 사용. A*/APSP 학습 신호와 일치하는 유일한 피처."""
+    def _select_edge_attr(edge_attr: torch.Tensor) -> torch.Tensor:
+        """엣지 피처 선택 + Min-Max 정규화.
+        
+        [v3] 정규화 추가: length/capacity/speed의 스케일 불일치로 인한
+        GATv2 attention 편향을 방지. 각 피처를 [0, 1] 범위로 정규화.
+        """
         if edge_attr is None:
             return None
         if edge_attr.size(1) == 0:
             return None
-        # Phase 1: length만 사용 (edge_dim=1)
-        return edge_attr[:, 0:1]
+        # edge_dim=3: [length, capacity, speed] (인덱스 0, 7, 8)
+        selected = edge_attr[:, [0, 7, 8]]
+        # Min-Max 정규화: 각 피처를 [0, 1] 범위로 스케일링
+        feat_min = selected.min(dim=0, keepdim=True)[0]
+        feat_max = selected.max(dim=0, keepdim=True)[0]
+        scale = (feat_max - feat_min).clamp(min=1e-8)  # 0-division 방지
+        return (selected - feat_min) / scale
 
-    def _build_worker_input(self):
+    def _build_worker_input(self, time_pct: float = 0.0) -> torch.Tensor:
+        """환경 x(10채널)에서 Worker 입력으로 변환.
+        
+        [v4.1 변경]
+        - x,y 절대좌표 제거: cross-map 일반화를 위해 맵 종속 피처 배제
+        - time_pct는 Node Feature에서 분리 → Global Feature로 predict_next_hop에 직접 전달
+        
+        Env X: [x(0), y(1), is_curr(2), is_tgt(3), visit(4), dist(5),
+                dir_x(6), dir_y(7), is_final(8), hop_dist(9)]
+        
+        Baseline 입력 (7-Dim): [is_curr, is_tgt, net_dist, dir_x, dir_y, is_final, hop_dist]
+        State Ablation 시 일부 열이 제거/선택됨.
+        """
         x = self.env.pyg_data.x
         if x.size(1) < 10:
             pad = torch.zeros(
@@ -163,9 +187,21 @@ class WorkerNavTrainer(DOMOTrainer):
             )
             x = torch.cat([x, pad], dim=1)
             self.env.pyg_data.x = x
-        # Env X: [x, y, is_curr(2), is_tgt(3), visit(4), dist(5), dir_x(6), dir_y(7), is_final_target_phase(8), hop_dist(9)]
-        # visit 제외 -> [x, y, is_curr, is_tgt, dist, dir_x, dir_y, is_final, hop] (9 channels)
-        return torch.cat([x[:, :4], x[:, 5:]], dim=1)
+        # x,y(0,1) 제거, visit(4) 제거 → [is_curr(2), is_tgt(3), dist(5), dir(6,7), final(8), hop(9)]
+        spatial = torch.cat([x[:, 2:4], x[:, 5:]], dim=1)  # [N, 7]
+        
+        # [Ablation] State 열 선택/제거
+        if "state_keep_cols" in self.ablation_config:
+            # S5: 지정된 열만 유지 (예: [0, 1, 6] → is_curr, is_tgt, hop_dist)
+            cols = self.ablation_config["state_keep_cols"]
+            spatial = spatial[:, cols]
+        elif "state_remove_cols" in self.ablation_config:
+            # S1/S2/S4: 지정된 열을 제거
+            remove = set(self.ablation_config["state_remove_cols"])
+            keep = [i for i in range(spatial.size(1)) if i not in remove]
+            spatial = spatial[:, keep]
+        
+        return spatial
 
     def _hidden_bonus_weight(self, episode_idx):
         if int(episode_idx) < self.guidance_schedule_ep_1:
@@ -359,6 +395,11 @@ class WorkerNavTrainer(DOMOTrainer):
 
         per_hit_bonus = self._hidden_bonus_weight(ep)
         aux_weight = self._worker_aux_weight(ep)
+        # [Ablation] R3: checkpoint bonus 강제 0 / R4: aux CE 강제 0
+        if self.ablation_config.get("disable_checkpoint_bonus", False) or self.ablation_config.get("simplified_reward", False):
+            per_hit_bonus = 0.0
+        if self.ablation_config.get("disable_aux_ce", False) or self.ablation_config.get("simplified_reward", False):
+            aux_weight = 0.0
         cap_tensor = torch.full((batch_size,), self.total_hidden_bonus_cap, device=self.device)
         hit_bonus_tensor = torch.where(
             checkpoint_counts > 0,
@@ -369,8 +410,10 @@ class WorkerNavTrainer(DOMOTrainer):
             torch.zeros_like(checkpoint_counts),
         )
 
-        h = torch.zeros(batch_size, self.worker.lstm.hidden_size, device=self.device)
-        c = torch.zeros(batch_size, self.worker.lstm.hidden_size, device=self.device)
+        # [A5] LSTM 제거 시 hidden_size 참조를 worker.hidden_dim으로 대체
+        _hidden_size = self.worker.hidden_dim
+        h = torch.zeros(batch_size, _hidden_size, device=self.device)
+        c = torch.zeros(batch_size, _hidden_size, device=self.device)
         done = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         success = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         loop_fail = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
@@ -435,12 +478,19 @@ class WorkerNavTrainer(DOMOTrainer):
         step_penalty = float(self.reward_cfg["BASE_STEP_PENALTY"])
         revisit_penalty_scale = float(self.reward_cfg["LOOP_PENALTY_SCALE"])
         fail_penalty = float(self.reward_cfg["FAIL_PENALTY"])
+        
+        # [Ablation] Reward 토글
+        _abl = self.ablation_config
+        if _abl.get("disable_pbrs", False) or _abl.get("simplified_reward", False):
+            pbrs_scale = 0.0
+        if _abl.get("simplified_reward", False):
+            revisit_penalty_scale = 0.0
+            fail_penalty = 0.0
         goal_reward = float(self.reward_cfg["GOAL_REWARD"])
 
-        # [VRAM Fix] GATv2 encoder는 항상 detach(spatial freeze)하여 LSTM+Scorer+Critic만 학습.
-        # 이유: GATv2 3레이어 × 400스텝 BPTT는 ~100GB VRAM 필요 → 24GB 4090에서 불가능.
-        #       SL pretrained GATv2 가중치는 이미 충분히 좋으므로, 노드 임베딩 품질 유지.
-        is_joint_stage = True  # Worker Stage에서도 spatial detach 적용
+        # [v3] GATv2 encoder detach 여부: config 기반 (기본: True)
+        # Why: GATv2 3레이어 × 400스텝 BPTT는 ~100GB VRAM 필요 → 24GB 4090에서 불가능
+        detach_spatial = bool(getattr(self.config, "detach_spatial", True))
         
         # [Perf] edge_attr는 스텝마다 되풀이되지 않으므로 루프 밖에서 1회만 계산
         _cached_edge_attr = self._select_edge_attr(self.env.pyg_data.edge_attr)
@@ -462,7 +512,14 @@ class WorkerNavTrainer(DOMOTrainer):
                 c = c.detach()
 
             current_nodes = self.env.current_node.clone()
-            worker_input = self._build_worker_input()
+            # [v3] time_pct: 현재 스텝 / 최대 스텝 → 에이전트가 마감 시간 인지
+            time_pct = float(_step_counter) / float(self.max_steps)
+            worker_input = self._build_worker_input(time_pct=time_pct)
+            # [v4.1] time_to_go를 Global Feature로 분리 전달 (S3 ablation: None으로 전달)
+            if self.ablation_config.get("remove_time_to_go", False):
+                time_to_go = None
+            else:
+                time_to_go = torch.full((batch_size, 1), 1.0 - time_pct, device=self.device)
 
             scores, h_next, c_next, value_pred = self.worker.predict_next_hop(
                 worker_input,
@@ -470,7 +527,8 @@ class WorkerNavTrainer(DOMOTrainer):
                 h,
                 c,
                 self.env.pyg_data.batch,
-                detach_spatial=is_joint_stage, 
+                time_to_go=time_to_go,
+                detach_spatial=detach_spatial, 
                 edge_attr=_cached_edge_attr,
             )
             # inactive 에이전트의 LSTM 상태는 detach하여 불필요한 연산 그래프 VRAM 누적 방지
@@ -517,11 +575,13 @@ class WorkerNavTrainer(DOMOTrainer):
 
             revisit_count = self.env.visit_count[batch_indices, next_nodes].float() - 1.0
             reward = reward - revisit_penalty_scale * revisit_count.clamp(min=0.0)
-            reward = reward + goal_neighbor_chosen.float() * self.goal_neighbor_action_bonus
-            reward = reward - (
-                (goal_neighbor_now & (~goal_neighbor_chosen)).float()
-                * self.goal_neighbor_miss_penalty
-            )
+            # [Ablation] R5(simplified_reward): neighbor 보너스/페널티도 제거
+            if not _abl.get("simplified_reward", False):
+                reward = reward + goal_neighbor_chosen.float() * self.goal_neighbor_action_bonus
+                reward = reward - (
+                    (goal_neighbor_now & (~goal_neighbor_chosen)).float()
+                    * self.goal_neighbor_miss_penalty
+                )
 
             # [Perf] checkpoint hit 판정: bool() GPU 동기화 없이 무조건 실행 (empty mask는 비용 없음)
             if self.checkpoint_hit_radius >= 0:
@@ -538,6 +598,9 @@ class WorkerNavTrainer(DOMOTrainer):
                 else:
                     hit_mask = exact_hit
                 reward = reward + hit_mask.float() * hit_bonus_tensor
+                # [Ablation] R3: checkpoint bonus를 0으로 강제
+                if _abl.get("disable_checkpoint_bonus", False) or _abl.get("simplified_reward", False):
+                    pass  # hit_bonus_tensor가 이미 0이 아니므로 보상은 위에서 더해졌지만, config 단에서 per_hit_bonus=0으로 처리
                 checkpoint_ptrs = checkpoint_ptrs + hit_mask.long()
                 checkpoint_hits = checkpoint_hits + hit_mask.float()
                 checkpoint_has_any_hit = checkpoint_has_any_hit | hit_mask
@@ -548,9 +611,11 @@ class WorkerNavTrainer(DOMOTrainer):
             threshold_8_now = active & (goal_hops_after <= 8.0) & (~goal_threshold_hit_8)
             threshold_4_now = active & (goal_hops_after <= 4.0) & (~goal_threshold_hit_4)
             threshold_2_now = active & (goal_hops_after <= 2.0) & (~goal_threshold_hit_2)
-            reward = reward + threshold_8_now.float() * self.goal_hop_bonus_8
-            reward = reward + threshold_4_now.float() * self.goal_hop_bonus_4
-            reward = reward + threshold_2_now.float() * self.goal_hop_bonus_2
+            # [Ablation] R2/R5: Hop Threshold Bonus 제거
+            if not (_abl.get("disable_hop_bonus", False) or _abl.get("simplified_reward", False)):
+                reward = reward + threshold_8_now.float() * self.goal_hop_bonus_8
+                reward = reward + threshold_4_now.float() * self.goal_hop_bonus_4
+                reward = reward + threshold_2_now.float() * self.goal_hop_bonus_2
             goal_threshold_hit_8 |= threshold_8_now
             goal_threshold_hit_4 |= threshold_4_now
             goal_threshold_hit_2 |= threshold_2_now
@@ -559,8 +624,10 @@ class WorkerNavTrainer(DOMOTrainer):
             regression_now = had_best4_before & active & (goal_hops_after > goal_hops_before)
             regression_large = regression_now & (goal_hops_after >= (best_goal_hops + 2.0))
             regression_small = regression_now & (~regression_large)
-            reward = reward - regression_small.float() * self.goal_regression_penalty_small
-            reward = reward - regression_large.float() * self.goal_regression_penalty_large
+            # [Ablation] R5: regression penalty도 제거
+            if not _abl.get("simplified_reward", False):
+                reward = reward - regression_small.float() * self.goal_regression_penalty_small
+                reward = reward - regression_large.float() * self.goal_regression_penalty_large
             goal_regression_after_best4_hit |= regression_now
 
             improved = goal_dist_after < (best_goal_dist - 1e-6)
@@ -857,6 +924,10 @@ class WorkerNavTrainer(DOMOTrainer):
         }
         success_ema = 0.0
 
+        # [Gradient Accumulation] REINFORCE 고분산 억제를 위한 가상 배치 확대
+        ACCUM_STEPS = 4
+        self.wkr_opt.zero_grad(set_to_none=True)
+
         tqdm_disabled = getattr(self.config, 'disable_tqdm', False)
         pbar = tqdm(range(episodes), desc="Worker", dynamic_ncols=True, disable=tqdm_disabled)
         for ep in pbar:
@@ -867,23 +938,27 @@ class WorkerNavTrainer(DOMOTrainer):
 
             total_loss, diag = self._execute_goal_conditioned_rollout(ep, episodes)
 
-            self.wkr_opt.zero_grad(set_to_none=True)
-            
-            if getattr(total_loss, 'requires_grad', False):
-                total_loss.backward()
-            else:
-                # 활성 스텝이 0인 코너케이스: backward 생략
-                pass
-            grad_pre = self._compute_grad_norm(self.worker.parameters())
-            grad_post = grad_pre
-            clip_hit = 0.0
-            if self.wkr_max_grad_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(self.worker.parameters(), self.wkr_max_grad_norm)
-                grad_post = self._compute_grad_norm(self.worker.parameters())
-                clip_hit = 100.0 if grad_pre > self.wkr_max_grad_norm + 1e-8 else 0.0
-            self.wkr_opt.step()
-            self.wkr_scheduler.step()
+            # [Gradient Accumulation] Loss를 ACCUM_STEPS로 나눠서 누적
+            scaled_loss = total_loss / ACCUM_STEPS
 
+            if getattr(scaled_loss, 'requires_grad', False):
+                scaled_loss.backward()
+            
+            grad_pre = 0.0
+            grad_post = 0.0
+            clip_hit = 0.0
+            
+            # ACCUM_STEPS 마다 가중치 업데이트
+            if (ep + 1) % ACCUM_STEPS == 0:
+                grad_pre = self._compute_grad_norm(self.worker.parameters())
+                grad_post = grad_pre
+                if self.wkr_max_grad_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(self.worker.parameters(), self.wkr_max_grad_norm)
+                    grad_post = self._compute_grad_norm(self.worker.parameters())
+                    clip_hit = 100.0 if grad_pre > self.wkr_max_grad_norm + 1e-8 else 0.0
+                self.wkr_opt.step()
+                self.wkr_opt.zero_grad(set_to_none=True)  # 업데이트 후 gradient 초기화
+            self.wkr_scheduler.step()
             diag["worker_grad_pre"] = float(grad_pre)
             diag["worker_grad_post"] = float(grad_post)
             diag["worker_grad_clip_hit"] = float(clip_hit)
@@ -898,25 +973,29 @@ class WorkerNavTrainer(DOMOTrainer):
                 import sys
                 info_str = f"Loss={total_loss.item():.2f}, Succ={diag['success_rate']:.1f}%, EMA={success_ema:.1f}%, Rw={reward_mean:.2f}, Len={diag['path_length_mean']:.1f}"
                 sys.stderr.write(f"PROGRESS_UPDATE|{ep + 1}|{info_str}\n")
-                
-                # [주기적 디버그 로그 설정] 200 에피소드마다 자세한 지표 IPC 전송
-                if (ep + 1) % 200 == 0:
-                    ent = diag.get("worker_entropy", 0.0)
-                    v_loss = diag.get("worker_critic_loss", 0.0)
-                    expl_var = diag.get("critic_explained_variance", 0.0)
-                    hop_dist = diag.get("teacher_path_hops_mean", 0.0)  # 시작점 기준 목표까지의 평균 홉
-                    prog = diag.get("progress_mean", 0.0)
-                    grad = diag.get("worker_grad_pre", 0.0)
-                    
-                    debug_str = (
-                        f"📊 [EP {ep+1:5d}] W_Ent: {ent:.3f} | V_Loss: {v_loss:.3f} | Grad: {grad:.4f} | ExplVar: {expl_var:.2f} | "
-                        f"Hop_Dist: {hop_dist:.1f} | Prog: {prog:.1f}% | EMA: {success_ema:.1f}%"
-                    )
-                    sys.stderr.write(f"DEBUG_UPDATE|{debug_str}\n")
-                
                 sys.stderr.flush()
             else:
                 pbar.set_postfix_str(f"Loss={total_loss.item():.2f}, Succ={diag['success_rate']:.1f}%, EMA={success_ema:.1f}%, Rw={reward_mean:.2f}, Len={diag['path_length_mean']:.1f}")
+
+            # [Fix] 200 에피소드마다 자세한 지표 출력 (disable_tqdm 여부와 무관하게 항상 실행)
+            if (ep + 1) % 200 == 0:
+                ent = diag.get("worker_entropy", 0.0)
+                v_loss = diag.get("worker_critic_loss", 0.0)
+                expl_var = diag.get("critic_explained_variance", 0.0)
+                hop_dist = diag.get("teacher_path_hops_mean", 0.0)
+                prog = diag.get("progress_mean", 0.0)
+                grad = diag.get("worker_grad_pre", 0.0)
+
+                debug_str = (
+                    f"📊 [EP {ep+1:5d}] W_Ent: {ent:.3f} | V_Loss: {v_loss:.3f} | Grad: {grad:.4f} | ExplVar: {expl_var:.2f} | "
+                    f"Hop_Dist: {hop_dist:.1f} | Prog: {prog:.1f}% | EMA: {success_ema:.1f}%"
+                )
+                if getattr(self.config, 'disable_tqdm', False):
+                    import sys
+                    sys.stderr.write(f"DEBUG_UPDATE|{debug_str}\n")
+                    sys.stderr.flush()
+                else:
+                    pbar.write(debug_str)
 
             # _plot_rl_curves는 0~1 범위를 가정하므로 % → 비율로 변환 저장
             rl_history["success_rates"].append(success_ema / 100.0)

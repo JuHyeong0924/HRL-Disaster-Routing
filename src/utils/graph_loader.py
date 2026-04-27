@@ -70,11 +70,12 @@ class GraphLoader:
                 u = self.node_mapping[u_orig]
                 v = self.node_mapping[v_orig]
                 
-                length = float(parts[3])
+                capacity = float(parts[2]) if len(parts) > 2 else 0.0
+                length = float(parts[3]) if len(parts) > 3 else 0.0
                 fft = float(parts[4]) if len(parts) > 4 else length
                 
                 if not self.graph.has_edge(u, v):
-                    self.graph.add_edge(u, v, weight=length, length=length, travel_time=fft)
+                    self.graph.add_edge(u, v, weight=length, length=length, travel_time=fft, capacity=capacity)
                     
     def get_pyg_data(self):
         """
@@ -102,12 +103,13 @@ class GraphLoader:
             edges.append([u, v])
             edges.append([v, u])
             
-            # Edge Feature: [length, damage, is_closed, is_danger, speed]
-            # Phase 1 (정상 도로): damage=0, is_closed=0, is_danger=0, speed=정상
+            # Edge Feature: [length, damage, expected_time, energy_cost, is_closed, has_building, is_danger, capacity, speed]
+            # Phase 1 (정상 도로): 모두 0, length, cap, speed만 값 존재
             l = data['length']
             tt = data.get('travel_time', l)  # travel_time이 없으면 length 사용
+            cap = data.get('capacity', 0.0)
             speed = l / max(tt, 1e-6)  # 속도 = 거리 / 시간
-            feat = [l, 0.0, 0.0, 0.0, speed]  # 5D: 정상 상태
+            feat = [l, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cap, speed]  # 9D: 정상 상태
             edge_attrs.append(feat)
             edge_attrs.append(feat)  # 양방향 동일
             
