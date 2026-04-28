@@ -63,9 +63,14 @@ class HRLWorkerTrainer:
             p.requires_grad_(True)
 
     def _run_single_episode(self) -> dict:
-        """단일 에피소드 실행 후 loss를 반환 (backward 수행하지 않음)."""
-        state = self.env.reset(batch_size=1)  # [1, N, 4]
-        state_np = state[0].numpy()  # [N, 4]
+        """단일 에피소드 실행 후 loss를 반환 (backward 수행하지 않음).
+        
+        [Fix] CPU-GPU 핑퐁 제거: state 텐서를 GPU에 유지하여 불필요한 동기화 방지.
+        [Fix] Returns 정규화 삭제: 절대 보상 척도 보존으로 Critic 학습 안정화.
+        """
+        state = self.env.reset(batch_size=1)  # [1, N, 4] CPU 텐서
+        # GPU로 한 번만 올리고 이후 GPU에서 유지
+        state_gpu = state[0].to(self.device)  # [N, 4]
         
         log_probs = []
         values = []
@@ -73,12 +78,11 @@ class HRLWorkerTrainer:
         done = False
 
         while not done:
-            state_tensor = torch.FloatTensor(state_np).to(self.device)
-            mask_tensor = self.env.get_action_mask_batch()[0].to(self.device)  # [N]
+            mask_gpu = self.env.get_action_mask_batch()[0].to(self.device)  # [N]
 
             probs, value, _ = self.worker(
-                state_tensor, self.edge_index,
-                batch=None, neighbors_mask=mask_tensor,
+                state_gpu, self.edge_index,
+                batch=None, neighbors_mask=mask_gpu,
             )
 
             dist = Categorical(probs)
@@ -93,25 +97,28 @@ class HRLWorkerTrainer:
             values.append(value.squeeze())
             rewards.append(reward_t[0].item())
             done = done_t[0].item()
-            state_np = next_state[0].numpy()
+            # CPU→GPU 변환은 여기서 한 번만 발생 (env 출력이 CPU 텐서)
+            state_gpu = next_state[0].to(self.device)
 
         info = infos[0]
 
-        # Returns 계산
+        # Returns 계산 (Monte Carlo)
         returns = []
         R = 0.0
         for r in reversed(rewards):
             R = r + self.gamma * R
             returns.insert(0, R)
         returns_t = torch.tensor(returns, dtype=torch.float32, device=self.device)
-        if len(returns_t) > 1:
-            returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
+        
+        # [Fix] 단일 에피소드 내 정규화 삭제 — 절대 보상 척도를 보존하여
+        # Critic이 성공(+50) vs 실패(-10)의 가치 차이를 정확히 학습하도록 함.
+        # Advantage는 순수 TD-Error(Return - Value)로만 계산.
 
         # Loss 계산 (backward는 호출하지 않음)
         policy_loss = torch.tensor(0.0, device=self.device)
         value_loss = torch.tensor(0.0, device=self.device)
         for lp, val, ret in zip(log_probs, values, returns_t):
-            advantage = ret.item() - val.item()
+            advantage = ret - val.detach()  # 정규화 없이 순수 TD-Error
             policy_loss = policy_loss + (-lp * advantage)
             value_loss = value_loss + nn.functional.mse_loss(val, ret.detach())
 
