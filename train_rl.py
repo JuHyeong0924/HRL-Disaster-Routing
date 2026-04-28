@@ -18,11 +18,12 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 from src.envs.disaster_env import DisasterEnv
-from src.models.manager import GraphTransformerManager
-from src.models.worker import WorkerLSTM
+from src.models.node_manager import GraphTransformerManager
+from src.models.worker import Worker
 from src.trainers.worker_nav_trainer import WorkerNavTrainer
 from src.trainers.manager_stage_trainer import ManagerStageTrainer  # [Refactor: Task 1]
 from src.trainers.pomo_trainer import DOMOTrainer  # [Refactor: Task 1]
+from src.trainers.worker_trainer import HRLWorkerTrainer  # [HRL Phase 1]
 
 # Ablation Study 설정 로드
 import sys
@@ -210,14 +211,23 @@ def _build_config(args, loaded_checkpoint_paths, stage_override=None):
     )
 
 
+from src.envs.hrl_env import HRLZoneEnv
+
 def _init_env_and_models(args):
     """환경, 모델, 디바이스 초기화 (공용)."""
     print("Initializing Environment...")
-    env = DisasterEnv(
-        f"data/{args.map}_node.tntp",
-        f"data/{args.map}_net.tntp",
-        enable_disaster=False,
-    )
+    if args.stage == "worker":
+        # Phase 1: Worker 검증용 HRLZoneEnv 사용
+        env = HRLZoneEnv(
+            f"data/{args.map}_node.tntp",
+            f"data/{args.map}_net.tntp",
+        )
+    else:
+        env = DisasterEnv(
+            f"data/{args.map}_node.tntp",
+            f"data/{args.map}_net.tntp",
+            enable_disaster=False,
+        )
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -227,24 +237,16 @@ def _init_env_and_models(args):
         print("⚠️ GPU NOT DETECTED! Training will be slow on CPU.")
     print(f"Active Device: {device}")
 
-    # edge_dim=3: [length, capacity, speed] → 인덱스 [0, 7, 8]
     manager = GraphTransformerManager(node_dim=4, hidden_dim=args.hidden_dim, dropout=0.2, edge_dim=3).to(device)
-    # [v4.1] Worker 생성: ablation에 따라 node_dim/hidden_dim/num_layers 변경
-    ablation_id = getattr(args, 'ablation', 'BASELINE').upper()
-    ablation_cfg = get_ablation_config(ablation_id)
-    worker_kw = get_worker_kwargs(ablation_id, base_hidden_dim=args.hidden_dim)
-    args._ablation_config = ablation_cfg  # Config에 전달하기 위해 args에 저장
     
-    worker = WorkerLSTM(
-        node_dim=worker_kw["node_dim"],
-        hidden_dim=worker_kw["hidden_dim"],
-        num_layers=worker_kw["num_layers"],
-        edge_dim=worker_kw["edge_dim"],
-        ablation_config=ablation_cfg,
+    # [Fixed] Worker 생성: 4-Dim HRL Worker로 고정
+    worker = Worker(
+        node_dim=4,
+        hidden_dim=args.hidden_dim,
+        num_layers=2,
+        dropout=0.2,
     ).to(device)
-    print(f"🧪 Ablation: {ablation_id} | {ablation_cfg.get('description', 'Baseline')}")
-    print(f"   Worker: node_dim={worker_kw['node_dim']}, hidden_dim={worker_kw['hidden_dim']}, "
-          f"num_layers={worker_kw['num_layers']}, use_lstm={ablation_cfg.get('use_lstm', True)}")
+    print(f"   Worker (Fixed): node_dim=4, hidden_dim={args.hidden_dim}, num_layers=2")
 
     # 단계별 배치 크기 (개별 학습은 64, Joint는 OOM 방지를 위해 절반으로 고정)
     raw_pomo = str(args.num_pomo)
@@ -289,11 +291,8 @@ def _run_single_stage(args, env, manager, worker, device, stage: str,
     wkr_stage_ckpt = _get_latest_ckpt(os.path.join("logs", "rl_worker_stage"), "best.pt")
 
     if stage == "worker":
-        # SL pretrained worker/manager 로드
-        if not _load_worker_checkpoint(sl_ckpt, worker, device, loaded_checkpoint_paths):
-            print("⚠️ SL worker checkpoint not found. Starting from scratch.")
-        if not _load_manager_checkpoint(sl_ckpt, manager, device, loaded_checkpoint_paths):
-            print("⚠️ SL manager checkpoint not found.")
+        # [HRL Phase 1] Worker는 scratch에서 시작 (4-Dim 구조 변경으로 SL 체크포인트 비호환)
+        print("📋 HRL Phase 1: Worker를 scratch에서 학습합니다. (SL 체크포인트 미사용)")
     elif stage == "manager":
         # Worker: worker_stage best → fallback SL
         if not _load_worker_checkpoint(wkr_stage_ckpt, worker, device, loaded_checkpoint_paths):
@@ -318,8 +317,8 @@ def _run_single_stage(args, env, manager, worker, device, stage: str,
     if stage == "manager":
         trainer = ManagerStageTrainer(env, manager, worker, config)
     elif stage == "worker":
-        # WorkerNavTrainer를 Worker stage의 기본 Trainer로 사용
-        trainer = WorkerNavTrainer(env, manager, worker, config)
+        # [HRL Phase 1] HRLZoneEnv + Worker 전용 Trainer 사용
+        trainer = HRLWorkerTrainer(env, manager, worker, config)
     elif stage == "alignment":
         trainer = DOMOTrainer(env, manager, worker, config)
     else:
