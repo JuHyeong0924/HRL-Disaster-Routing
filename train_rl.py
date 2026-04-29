@@ -161,7 +161,7 @@ def _build_config(args, loaded_checkpoint_paths, stage_override=None):
     ablation_suffix = ""
     if hasattr(args, 'ablation') and args.ablation.upper() != "BASELINE":
         ablation_suffix = f"_{args.ablation.upper()}"
-    run_label = f"{timestamp}_{effective_stage}_pomo{args.num_pomo}{ablation_suffix}"
+    run_label = f"{timestamp}_{effective_stage}_B{args.batch_size}{ablation_suffix}"
     stage_base = {
         'manager': os.path.join('logs', 'rl_manager_stage'),
         'worker': os.path.join('logs', 'rl_worker_stage'),
@@ -170,7 +170,7 @@ def _build_config(args, loaded_checkpoint_paths, stage_override=None):
     save_dir = os.path.join(stage_base, run_label)
     return Config(
         lr=args.lr,
-        num_pomo=args.num_pomo,
+        num_pomo=args.batch_size,
         episodes=args.episodes,
         save_dir=save_dir,
         stage=effective_stage,
@@ -196,6 +196,12 @@ def _build_config(args, loaded_checkpoint_paths, stage_override=None):
         wkr_aux_end=0.12,
         wkr_lr_floor=getattr(args, "wkr_lr_floor", 1e-5),  # [Refactor: Task 5] 최소 학습률 상향
         ablation_config=getattr(args, "_ablation_config", {}),  # [Ablation] 실험 설정 전달
+        # [HRL Phase 1] Worker Ablation 플래그 — CLI → Config → HRLWorkerTrainer 전달
+        use_gae=getattr(args, "use_gae", False),
+        gae_lambda=getattr(args, "gae_lambda", 0.95),
+        entropy_coeff=getattr(args, "entropy_coeff", 0.0),
+        use_cosine_lr=getattr(args, "use_cosine_lr", False),
+        zone_progress_reward=getattr(args, "zone_progress_reward", False),
         goal_hop_bonus_8=0.75,
         goal_hop_bonus_4=1.0,
         goal_hop_bonus_2=1.25,
@@ -222,6 +228,8 @@ def _init_env_and_models(args):
             f"data/{args.map}_node.tntp",
             f"data/{args.map}_net.tntp",
         )
+        # [Ablation] P0: Zone 전환 중간 보상 플래그 전달
+        env.zone_progress_reward = getattr(args, 'zone_progress_reward', False)
     else:
         env = DisasterEnv(
             f"data/{args.map}_node.tntp",
@@ -239,23 +247,26 @@ def _init_env_and_models(args):
 
     manager = GraphTransformerManager(node_dim=4, hidden_dim=args.hidden_dim, dropout=0.2, edge_dim=3).to(device)
     
-    # [Fixed] Worker 생성: 4-Dim HRL Worker로 고정
+    # [Fixed] Worker 생성: 4-Dim HRL Worker로 고정 (Gradient Checkpointing 활성)
+    use_ckpt = args.stage == "worker"  # Worker 학습 시 VRAM 절약을 위해 Checkpointing 활성
     worker = Worker(
         node_dim=4,
         hidden_dim=args.hidden_dim,
         num_layers=2,
         dropout=0.2,
+        use_checkpoint=use_ckpt,
     ).to(device)
-    print(f"   Worker (Fixed): node_dim=4, hidden_dim={args.hidden_dim}, num_layers=2")
+    print(f"   Worker (Fixed): node_dim=4, hidden_dim={args.hidden_dim}, num_layers=2, use_checkpoint={use_ckpt}")
 
-    # 단계별 배치 크기 (개별 학습은 64, Joint는 OOM 방지를 위해 절반으로 고정)
-    raw_pomo = str(args.num_pomo)
-    base_pomo = int(raw_pomo) if raw_pomo.isdigit() and raw_pomo != "auto" else 64
-    
-    # [Design 2026-04-21] Joint 단계에서도 Worker 동결으로 POMO 축소 불필요
-    args.num_pomo = int(base_pomo)
-        
-    print(f"📐 고정된 배치 크기(POMO): {args.num_pomo} (Stage: {args.stage})")
+    # --steps → --episodes 변환 (steps 우선)
+    if args.steps is not None:
+        args.episodes = args.steps * args.batch_size
+        print(f"📐 배치={args.batch_size}, 스텝={args.steps} → 총 에피소드={args.episodes}")
+    elif args.episodes is None:
+        args.episodes = 5000  # 기본값
+        print(f"📐 배치={args.batch_size}, 에피소드={args.episodes} → 스텝={args.episodes // args.batch_size}")
+    else:
+        print(f"📐 배치={args.batch_size}, 에피소드={args.episodes} → 스텝={args.episodes // args.batch_size}")
     return env, manager, worker, device
 
 
@@ -372,21 +383,21 @@ def _run_parallel_phase1(args) -> None:
     worker_cmd = base_args + [
         "--stage", "worker",
         "--episodes", str(worker_eps),
-        "--num_pomo", str(args.num_pomo),
+        "--batch_size", str(args.batch_size),
         "--disable_tqdm",
     ]
     worker_env = {**os.environ, "CUDA_VISIBLE_DEVICES": "0"}
 
     # Manager subprocess (GPU 1)
     # [Fix] 사용자 요청: Manager의 POMO 크기를 1.5배(예: 48 * 1.5 = 72)로 상향 조정하여 VRAM을 적절히 활용
-    if args.num_pomo == "auto":
+    if str(args.batch_size) == "auto":
         manager_pomo = "auto"
     else:
-        manager_pomo = int(float(args.num_pomo) * 1.5)
+        manager_pomo = int(float(args.batch_size) * 1.5)
     manager_cmd = base_args + [
         "--stage", "manager",
         "--episodes", str(manager_eps),
-        "--num_pomo", str(manager_pomo),
+        "--batch_size", str(manager_pomo),
         "--disable_tqdm",
     ]
     manager_env = {**os.environ, "CUDA_VISIBLE_DEVICES": "1"}
@@ -478,7 +489,7 @@ def _run_parallel_phase1(args) -> None:
     print(f"🔗 Alignment Stage 시작 ({alignment_eps:,} eps on GPU 0)")
     print(f"{'='*60}\n")
 
-    alignment_pomo = int(float(args.num_pomo) * 1.5)  # Worker 동결 → VRAM 여유
+    alignment_pomo = int(float(args.batch_size) * 1.5)  # Worker 동결 → VRAM 여유
     alignment_cmd = base_args + [
         "--stage", "alignment",
         "--episodes", str(alignment_eps),
@@ -538,9 +549,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--map", default="Anaheim")
     parser.add_argument("--data", default="data", help="Data Directory")
-    parser.add_argument("--episodes", type=int, default=5000)
-    parser.add_argument("--num_pomo", default="auto",
-                        help="POMO 병렬 시뮬레이션 수 (auto: VRAM 한도 내 최대 자동 탐색)")
+    parser.add_argument("--episodes", type=int, default=None,
+                        help="총 에피소드 수 (--steps 미지정 시 사용, 기본 5000)")
+    parser.add_argument("--steps", type=int, default=None,
+                        help="총 gradient 업데이트 스텝 수 (지정 시 --episodes보다 우선)")
+    parser.add_argument("--batch_size", "--num_pomo", type=int, default=16,
+                        help="배치 크기: 스텝당 동시 실행 에피소드 수 (기본 16)")
     parser.add_argument(
         "--stage",
         default="phase1",
@@ -569,4 +583,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Legacy flag. Unsupported in APTE branch.",
     )
+    # [HRL Ablation] Phase 1 Worker 실험 플래그
+    parser.add_argument("--zone_progress_reward", action="store_true",
+                        help="[P0] Zone 전환 시 중간 보상 부여")
+    parser.add_argument("--use_gae", action="store_true",
+                        help="[P1] GAE(λ) Advantage 사용")
+    parser.add_argument("--entropy_coeff", type=float, default=0.0,
+                        help="[P1] Entropy Bonus 계수 (0이면 비활성)")
+    parser.add_argument("--use_cosine_lr", action="store_true",
+                        help="[P2] Cosine LR Scheduler 사용")
     train_rl(parser.parse_args())

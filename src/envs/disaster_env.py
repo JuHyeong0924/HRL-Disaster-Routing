@@ -732,14 +732,20 @@ class DisasterEnv:
         # But we don't track prev_node tensors easily here without history.
         # Actually simplest is: Zero out col 2, then scatter 1.
         
-        self.pyg_data.x[:, 2] = 0.0 # Clear current
+        # [Fix] Out-of-place 재할당: detach_spatial=False 시 Autograd In-place 오류 방지
+        new_x = self.pyg_data.x.clone()
+        new_x[:, 2] = 0.0  # Clear current
         # Flattened index for scatter: batch_idx * num_nodes + node_idx
         flat_curr_idx = batch_indices * self.num_nodes + self.current_node
-        self.pyg_data.x[flat_curr_idx, 2] = 1.0
+        new_x[flat_curr_idx, 2] = 1.0
         
         # 2. Update visit_count (Col 4)
-        # We can just update the specific values
-        self.pyg_data.x[:, 4] = self.visit_count.view(-1)
+        new_visit = self.visit_count.clone()
+        new_visit[batch_indices, next_node_idx] = new_visit[batch_indices, next_node_idx] + 1.0
+        self.visit_count = new_visit
+        new_x[:, 4] = self.visit_count.view(-1)
+        
+        self.pyg_data.x = new_x
         
         if not hasattr(self, 'history'): self.history = []
         self.history.append(next_node_idx)

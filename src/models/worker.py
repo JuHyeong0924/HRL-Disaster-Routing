@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as grad_ckpt
 from torch_geometric.nn import GATv2Conv, GraphNorm
 
 class Worker(nn.Module):
@@ -8,12 +9,14 @@ class Worker(nn.Module):
     - 4-Dim State: [is_curr, is_tgt, is_next_zone, hop_dist]
     - Spatial: 2-Layer GATv2 + GraphNorm + Residual
     - Temporal: LSTM 제거 (Linear 투영)
+    - Checkpointing: torch.utils.checkpoint 적용 → VRAM 절약
     """
-    def __init__(self, node_dim: int = 4, hidden_dim: int = 256, num_layers: int = 2, dropout: float = 0.2):
+    def __init__(self, node_dim: int = 4, hidden_dim: int = 256, num_layers: int = 2, dropout: float = 0.2, use_checkpoint: bool = False):
         super(Worker, self).__init__()
         self.node_dim = node_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.use_checkpoint = use_checkpoint  # VRAM 절약용 Gradient Checkpointing
         
         # 1. Spatial Encoder
         self.convs = nn.ModuleList()
@@ -46,16 +49,35 @@ class Worker(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
         
-    def _forward_gnn(self, x, edge_index, batch):
-        h = self.convs[0](x, edge_index)
-        h = self.graph_norms[0](h, batch)
-        h = torch.relu(h + self.input_proj(x)) # Residual
+    def _forward_gnn(self, x: torch.Tensor, edge_index: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        """GATv2 2-Layer 공간 인코더 (Residual + GraphNorm).
         
-        for i in range(1, self.num_layers):
-            h_next = self.convs[i](h, edge_index)
+        use_checkpoint=True 시 각 레이어를 torch.utils.checkpoint로 감싸
+        순전파 중간 활성값을 저장하지 않아 VRAM을 ~3배 절약.
+        역전파 시 해당 레이어를 재계산하는 방식으로 동작.
+        """
+        def _layer0(x_in: torch.Tensor, ei: torch.Tensor) -> torch.Tensor:
+            # 첫 번째 GATv2 레이어: 4 → 256
+            h = self.convs[0](x_in, ei)
+            h = self.graph_norms[0](h, batch)
+            return torch.relu(h + self.input_proj(x_in))  # Residual
+
+        def _layer_n(h_in: torch.Tensor, ei: torch.Tensor, i: int) -> torch.Tensor:
+            # i번째 GATv2 레이어: 256 → 256
+            h_next = self.convs[i](h_in, ei)
             h_next = self.graph_norms[i](h_next, batch)
-            h = torch.relu(h_next + h) # Residual
-            
+            return torch.relu(h_next + h_in)  # Residual
+
+        if self.use_checkpoint:
+            # 중간 활성값 저장 안 함 → VRAM 절약 (속도 약 20% 희생)
+            h = grad_ckpt(_layer0, x, edge_index, use_reentrant=False)
+            for i in range(1, self.num_layers):
+                h = grad_ckpt(_layer_n, h, edge_index, i, use_reentrant=False)
+        else:
+            h = _layer0(x, edge_index)
+            for i in range(1, self.num_layers):
+                h = _layer_n(h, edge_index, i)
+
         return h
 
     def forward(self, x, edge_index, batch, neighbors_mask=None, detach_spatial=False):

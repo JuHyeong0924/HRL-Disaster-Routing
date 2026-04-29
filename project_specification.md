@@ -100,16 +100,21 @@ Phase 1 Worker 전용. Gradient Accumulation 기반 REINFORCE.
 - `self.accum_batch`: `config.num_pomo` (기본 16) — K개 에피소드 gradient 누적
 - `self.edge_index`: `[2, E]` (정적, GPU 캐싱)
 - Manager는 `eval()` + `requires_grad_(False)` 동결
+- **Ablation 플래그**:
+  - `self.use_gae`: GAE(λ) 적용 여부 (기본 `False`)
+  - `self.entropy_coeff`: Entropy Bonus 계수 (기본 `0.0`)
+  - `self.use_cosine_lr`: Cosine LR Scheduler (기본 `False`)
 
 #### `_run_single_episode() -> dict`
 - 단일 에피소드 실행 → `{'loss', 'reward', 'success', 'path_len'}` 반환
-- Loss 계산: `policy_loss + value_loss` (backward 미호출)
+- Advantage: `use_gae=True`이면 GAE(λ), 아니면 MC Return - Value
+- Loss: `policy_loss + value_loss - entropy_coeff * entropy`
 
 #### `train(episodes: int) -> None`
 - 매 에피소드마다 `_run_single_episode()` 실행
 - `loss / K`로 스케일링 후 `backward()` 호출 (gradient 누적)
 - K개마다 `optimizer.step()` + `zero_grad()`
-- Best/Final 체크포인트 자동 저장
+- Best/Final 체크포인트 + `runtime_config.json` 자동 저장
 
 ### 3.2. `WorkerNavTrainer` (`src/trainers/worker_nav_trainer.py`)
 레거시 7-Dim Worker 학습용. POMO + PBRS + Hidden Checkpoint.

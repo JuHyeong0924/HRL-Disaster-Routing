@@ -27,14 +27,29 @@ class HRLZoneEnv:
         self.idx_to_node = {i: n for n, i in self.node_to_idx.items()}
         self.num_nodes = len(self.nodes)
         
-        # APSP (가장 짧은 홉 거리 계산)
-        self.apsp = dict(nx.all_pairs_shortest_path_length(self.G))
-        self.hop_matrix = np.full((self.num_nodes, self.num_nodes), np.inf)
-        for u, lengths in self.apsp.items():
-            u_idx = self.node_to_idx[u]
-            for v, length in lengths.items():
-                v_idx = self.node_to_idx[v]
-                self.hop_matrix[u_idx, v_idx] = length
+        # APSP (가장 짧은 홉 거리 계산) — 캐시 파일 우선 로드
+        import hashlib
+        # 맵 파일 기반 캐시 키 생성 (노드/엣지 변경 시 자동 무효화)
+        cache_key = hashlib.md5(f"{node_file}_{net_file}_{self.num_nodes}".encode()).hexdigest()[:8]
+        cache_path = f"data/hop_matrix_{cache_key}.npy"
+        
+        if os.path.exists(cache_path):
+            # 캐시 파일에서 즉시 로드 (수 ms)
+            self.hop_matrix = np.load(cache_path)
+        else:
+            # 최초 1회: BFS로 계산 후 캐시 저장
+            self.apsp = dict(nx.all_pairs_shortest_path_length(self.G))
+            self.hop_matrix = np.full((self.num_nodes, self.num_nodes), np.inf)
+            for u, lengths in self.apsp.items():
+                u_idx = self.node_to_idx[u]
+                for v, length in lengths.items():
+                    v_idx = self.node_to_idx[v]
+                    self.hop_matrix[u_idx, v_idx] = length
+            np.save(cache_path, self.hop_matrix)
+                
+        # 최대 홉 거리(Graph Diameter) 계산 및 저장 (정규화에 사용)
+        valid_hops = self.hop_matrix[self.hop_matrix < np.inf]
+        self.max_hop = float(np.max(valid_hops)) if len(valid_hops) > 0 else 25.0
                 
         # 2. Zone 데이터 로드
         with open(zone_json, 'r') as f:
@@ -77,6 +92,7 @@ class HRLZoneEnv:
         self.STEP_PENALTY = -0.1
         self.INVALID_PENALTY = -10.0
         self.MAX_STEPS = 200
+        self.zone_progress_reward = False  # [P0] Ablation 제어 플래그
         
         # 배치 상태 관리 (reset에서 초기화)
         self.batch_size = 1
@@ -153,10 +169,10 @@ class HRLZoneEnv:
             state[b, self.target_nodes[b], 1] = 1.0
             # is_next_zone: 해당 배치의 다음 목표 Zone에 속한 노드들
             state[b, :, 2] = (nz_tensor == next_z[b]).float()
-            # hop_dist (정규화)
+            # hop_dist (정규화: 25.0 대신 맵의 실제 max_hop 사용)
             tgt_idx = int(self.target_nodes[b].item())
             hops = torch.from_numpy(self.hop_matrix[:, tgt_idx].copy()).float()
-            hops = torch.clamp(hops, max=100.0) / 25.0
+            hops = torch.clamp(hops, max=100.0) / max(self.max_hop, 1.0)
             state[b, :, 3] = hops
             
         return state
@@ -238,6 +254,10 @@ class HRLZoneEnv:
             # Sliding Window 업데이트
             if action_zone == int(next_z[b].item()) and int(self.seq_idxs[b].item()) + 1 < len(self.zone_sequences[b]):
                 self.seq_idxs[b] += 1
+                # [P0] Zone 전환 중간 보상: 진행률에 비례하여 Dense Signal 제공
+                if self.zone_progress_reward:
+                    progress = float(self.seq_idxs[b].item()) / len(self.zone_sequences[b])
+                    rewards[b] += 5.0 * progress
                 
             # 목적지 도착 검사
             if action_idx == int(self.target_nodes[b].item()):

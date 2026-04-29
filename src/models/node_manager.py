@@ -323,7 +323,8 @@ class GraphTransformerManager(nn.Module):
             dec_input = sos
             
         seq_len = dec_input.size(1)
-        dec_input = dec_input + self.pos_emb[:, :seq_len, :]
+        # [Fix] Positional Encoding 제거: VRP의 Permutation Invariant 특성 보존
+        # 절대 위치 인코딩은 A* 출력 순서에 과적합(Order Bias)을 유발함
         tgt_mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device) * float('-inf'), diagonal=1)
         
         # [Fix Warning] Use Float Mask for Memory Key Padding Mask too
@@ -374,8 +375,8 @@ class GraphTransformerManager(nn.Module):
         EOS_INDEX = memory.size(1) 
         
         for k in range(max_len):
-            # Pos Emb
-            curr_input = curr_emb + self.pos_emb[:, k:k+1, :]
+            # [Fix] Positional Encoding 제거: Permutation Invariant 특성 보존
+            curr_input = curr_emb
             
             # [Fix Warning] Float Mask
             padding_mask_float = torch.zeros(memory_mask_extended.size(), device=x.device, dtype=torch.float)
