@@ -224,12 +224,29 @@ def _init_env_and_models(args):
     print("Initializing Environment...")
     if args.stage == "worker":
         # Phase 1: Worker 검증용 HRLZoneEnv 사용
+        # 맵별 Zone 파일 자동 탐색: data/node_to_zone_{map}_k*.json 우선, 없으면 기본 k30
+        import glob
+        zone_json = 'data/node_to_zone_k30.json'  # 기본값 (Anaheim 호환)
+        zone_graph_json = 'data/zone_graph_k30.json'
+        map_zone_files = glob.glob(f"data/node_to_zone_{args.map}_k*.json")
+        if map_zone_files:
+            zone_json = sorted(map_zone_files)[-1]  # 가장 큰 K 사용
+            k_val = zone_json.split('_k')[-1].replace('.json', '')
+            zone_graph_json = f"data/zone_graph_{args.map}_k{k_val}.json"
+            print(f"   Zone 파일: {zone_json} (맵별 자동 탐색)")
+        # [v3 Ablation] masking_mode, use_pbrs 환경 변인 전달
         env = HRLZoneEnv(
             f"data/{args.map}_node.tntp",
             f"data/{args.map}_net.tntp",
+            zone_json=zone_json,
+            zone_graph_json=zone_graph_json,
+            masking_mode=getattr(args, 'masking_mode', 'hard'),
+            use_pbrs=getattr(args, 'use_pbrs', False),
+            subgoal_mode=getattr(args, 'subgoal_mode', 'default'),
         )
         # [Ablation] P0: Zone 전환 중간 보상 플래그 전달
         env.zone_progress_reward = getattr(args, 'zone_progress_reward', False)
+        print(f"   Env: masking_mode={env.masking_mode}, use_pbrs={env.use_pbrs}, subgoal_mode={getattr(args, 'subgoal_mode', 'default')}")
     else:
         env = DisasterEnv(
             f"data/{args.map}_node.tntp",
@@ -247,16 +264,21 @@ def _init_env_and_models(args):
 
     manager = GraphTransformerManager(node_dim=4, hidden_dim=args.hidden_dim, dropout=0.2, edge_dim=3).to(device)
     
-    # [Fixed] Worker 생성: 4-Dim HRL Worker로 고정 (Gradient Checkpointing 활성)
-    use_ckpt = args.stage == "worker"  # Worker 학습 시 VRAM 절약을 위해 Checkpointing 활성
+    # [v3 Ablation] Worker 생성: num_layers를 CLI에서 동적 제어
+    use_ckpt = args.stage == "worker"
+    num_layers = getattr(args, 'num_layers', 2)
+    use_jk_net = getattr(args, 'use_jk_net', False)
+    use_edge_attr = getattr(args, 'use_edge_attr', False)
     worker = Worker(
         node_dim=4,
         hidden_dim=args.hidden_dim,
-        num_layers=2,
+        num_layers=num_layers,
         dropout=0.2,
         use_checkpoint=use_ckpt,
+        use_jk_net=use_jk_net,
+        use_edge_attr=use_edge_attr,
     ).to(device)
-    print(f"   Worker (Fixed): node_dim=4, hidden_dim={args.hidden_dim}, num_layers=2, use_checkpoint={use_ckpt}")
+    print(f"   Worker: node_dim=4, hidden_dim={args.hidden_dim}, num_layers={num_layers}, use_jk_net={use_jk_net}, use_edge_attr={use_edge_attr}, use_checkpoint={use_ckpt}")
 
     # --steps → --episodes 변환 (steps 우선)
     if args.steps is not None:
@@ -592,4 +614,19 @@ if __name__ == "__main__":
                         help="[P1] Entropy Bonus 계수 (0이면 비활성)")
     parser.add_argument("--use_cosine_lr", action="store_true",
                         help="[P2] Cosine LR Scheduler 사용")
+    # [v3 Ablation] 환경/모델 변인 제어
+    parser.add_argument("--masking_mode", type=str, default="hard",
+                        choices=["hard", "hard_full_seq", "soft_curr_next", "soft_flex"],
+                        help="Action Masking 모드 (hard/hard_full_seq/soft_curr_next/soft_flex)")
+    parser.add_argument("--use_pbrs", action="store_true",
+                        help="hop_dist 기반 PBRS Dense Reward 활성")
+    parser.add_argument("--num_layers", type=int, default=2,
+                        help="GATv2 레이어 수 (1~4)")
+    parser.add_argument("--use_jk_net", action="store_true",
+                        help="[v4] JK-Net (Jumping Knowledge) 활성")
+    parser.add_argument("--use_edge_attr", action="store_true",
+                        help="[v4] Edge-Conditioned MP (Edge Features) 활성")
+    parser.add_argument("--subgoal_mode", type=str, default="zone",
+                        choices=["zone", "node"],
+                        help="[Part2] Manager Subgoal 모드 (zone / node)")
     train_rl(parser.parse_args())

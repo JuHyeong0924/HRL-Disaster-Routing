@@ -38,14 +38,34 @@ class HRLWorkerTrainer:
         # Gradient Accumulation 배치 크기
         self.accum_batch = getattr(config, 'num_pomo', 16)
 
-        # 정적 edge_index (단일 그래프, 양방향)
+        # 정적 edge_index (단일 그래프, 양방향) 및 edge_attr 추출
         edge_list = []
-        for u, v in env.G.edges():
-            edge_list.append((env.node_to_idx[u], env.node_to_idx[v]))
-        edge_list_bidir = edge_list + [(v, u) for u, v in edge_list]
-        self.edge_index = torch.tensor(
-            edge_list_bidir, dtype=torch.long
-        ).t().to(self.device)
+        edge_attr_list = []
+        for u, v, data in env.G.edges(data=True):
+            ui = env.node_to_idx[u]
+            vi = env.node_to_idx[v]
+            
+            cap = data.get('capacity', 0.0)
+            length = data.get('length', 0.0)
+            speed = data.get('speed', 0.0)
+            feat = [length, cap, speed]
+            
+            edge_list.append((ui, vi))
+            edge_attr_list.append(feat)
+            
+            # 양방향 추가
+            edge_list.append((vi, ui))
+            edge_attr_list.append(feat)
+            
+        self.edge_index = torch.tensor(edge_list, dtype=torch.long).t().to(self.device)
+        self.edge_attr = torch.tensor(edge_attr_list, dtype=torch.float32).to(self.device)
+        
+        # Min-Max 정규화: 각 피처를 [0, 1] 범위로 스케일링
+        if self.edge_attr.size(0) > 0:
+            feat_min = self.edge_attr.min(dim=0, keepdim=True)[0]
+            feat_max = self.edge_attr.max(dim=0, keepdim=True)[0]
+            scale = (feat_max - feat_min).clamp(min=1e-8)
+            self.edge_attr = (self.edge_attr - feat_min) / scale
 
         # 옵티마이저
         self.lr = getattr(config, 'lr', 3e-4)
@@ -148,9 +168,10 @@ class HRLWorkerTrainer:
             A = len(active)
             ai = torch.arange(A, device=self.device).repeat_interleave(N)
             aei = torch.cat([self.edge_index + i * N for i in range(A)], dim=1)
+            ae_attr = self.edge_attr.repeat(A, 1)
 
             probs_all, values_all, _ = self.worker(
-                x_flat, aei, batch=ai, neighbors_mask=mask_flat,
+                x_flat, aei, batch=ai, neighbors_mask=mask_flat, edge_attr=ae_attr
             )  # probs_all: [|A|*N], values_all: [|A|, 1]
 
             # 각 활성 에피소드별 행동 샘플링
