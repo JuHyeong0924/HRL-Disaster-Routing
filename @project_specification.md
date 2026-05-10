@@ -51,3 +51,8 @@
 ## 3. Subgoal Mode (Planned)
 - 향후 Zone 단위와 Node 단위의 Subgoal 방식을 스위칭할 수 있도록 `HRLZoneEnv`에 `subgoal_mode` (Zone / Node) 플래그 추가 예정.
 - PBRS Reward 대상이 "최종 목적지"에서 "현재 할당된 Subgoal"로 전환되는 로직이 구현될 예정.
+
+---
+
+## 4. Hardware Optimization
+- **CPU Threads**: 스레드 병목 및 컨텍스트 스위칭 오버헤드 방지를 위해 파이썬 프로세스당 PyTorch CPU 스레드 사용량을 8개로 하드코딩 적용 (`torch.set_num_threads(8)`, `OMP_NUM_THREADS="8"`). 병렬 학습 시 총 16코어 수준을 안정적으로 점유.

@@ -10,6 +10,10 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.multiprocessing as mp
 
+# [Hardcoded CPU Threads] 최적의 컨텍스트 스위칭 효율을 위해 프로세스당 8개 코어 할당
+torch.set_num_threads(8)
+os.environ["OMP_NUM_THREADS"] = "8"
+
 # [Speed Optimization] RTX 4090 (Ada) 및 고정된 입력 형태를 위한 하드웨어 극한 속도 튜닝
 # 1. cuDNN Benchmark: 첫 스텝 수행 시 최적의 CUDA 커널을 찾아 고정
 cudnn.benchmark = True
