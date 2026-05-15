@@ -24,6 +24,25 @@ DEFAULT_MANAGER_DECODE_BIAS_CFG = {
     'directional_cos_margin': -0.25,
 }
 
+# [Ablation] 마스킹/바이어스 제어 config — generate()/forward() 공통
+# Why: Ablation Study에서 각 bias를 개별 on/off하여 최적 조합 탐색
+DEFAULT_MANAGER_MASK_CFG = {
+    # Hard Masking (Action Space 구조적 제한)
+    'enable_visited_mask': True,       # 이미 선택한 노드 차단
+    'enable_khop_mask': True,          # K-hop 이내만 허용
+    'khop_K': 10,                      # K-hop 반경 (ablation 대상)
+    # Soft Bias (기존 Decode Bias — generate()에서만 적용)
+    'enable_radius_mask': True,        # r_min~r_max 반경 제한
+    'enable_directional_bias': True,   # 방향 코사인 페널티
+    'enable_corridor_bonus': True,     # 최단 경로 인근 가산
+    'enable_progress_bonus': True,     # 목적지 접근 가산
+    'enable_detour_penalty': True,     # 우회 감점
+    'enable_nonprogress_penalty': True,# 비진전 감점
+    'enable_eos_control': True,        # EOS 조기/지연 제어
+    # Bias 강도 스케일링 (0.0이면 soft bias 전체 비활성)
+    'bias_scale': 1.0,
+}
+
 
 def compute_manager_decode_bias(
     apsp_matrix,
@@ -152,6 +171,9 @@ class GraphTransformerManager(nn.Module):
         self.hidden_dim = hidden_dim
         self.heads = heads
         
+        # [Ablation] 마스킹 config — generate()/forward() 공통
+        self.mask_cfg = dict(DEFAULT_MANAGER_MASK_CFG)
+        
         # [Constants]
         self.PAD_TOKEN = -100
         self.EOS_TOKEN = -2 # Placeholder, actual EOS is dynamic (N)
@@ -210,6 +232,28 @@ class GraphTransformerManager(nn.Module):
         nn.init.xavier_uniform_(self.pointer_query.weight)
         nn.init.xavier_uniform_(self.pointer_key.weight)
 
+    def _apply_khop_mask(self, scores: torch.Tensor, current_indices: torch.Tensor,
+                         hop_matrix: torch.Tensor, K: int = 10) -> torch.Tensor:
+        """K-hop 이내 노드만 선택 가능하도록 마스킹 — forward()/generate() 공통.
+        
+        Why: Python for-loop 없이 배치 전체를 텐서 연산으로 동시 처리.
+             기존 generate() 내 per-sample bias 계산 루프를 완전 대체.
+        
+        Args:
+            scores: [B, N+1] logits (마지막 인덱스 = EOS)
+            current_indices: [B] 현재 위치 노드 인덱스
+            hop_matrix: [N, N] APSP hop 행렬
+            K: hop 제한값
+        Returns:
+            scores: [B, N+1] 마스킹 적용된 logits
+        """
+        N = hop_matrix.size(0)
+        # [B, N] — 각 배치의 현재 위치에서 모든 노드까지 hop 거리
+        hop_dists = hop_matrix[current_indices]  # [B, N]
+        # K-hop 초과 노드를 -inf로 마스킹 (EOS 인덱스는 건드리지 않음)
+        invalid = (hop_dists > K) | ~torch.isfinite(hop_dists)
+        scores[:, :N].masked_fill_(invalid, float('-inf'))
+        return scores
 
     def encode_graph(self, x, edge_index, batch, edge_attr=None):
         # 1. GATv2 Embedding (Local Topology + Edge Features)
@@ -356,7 +400,18 @@ class GraphTransformerManager(nn.Module):
         return attn_logits # [B, L, N+1] (Last index is EOS)
 
     @torch.no_grad()
-    def generate(self, x, edge_index, batch, valid_tokens=None, max_len=20, temperature=1.0, apsp_matrix=None, node_positions=None, edge_attr=None):
+    def generate(self, x, edge_index, batch, valid_tokens=None, max_len=20,
+                 temperature=1.0, apsp_matrix=None, node_positions=None,
+                 edge_attr=None, hop_matrix=None, start_indices=None, goal_indices=None):
+        """Subgoal 시퀀스 생성 — Ablation config 기반 마스킹/바이어스 적용.
+        
+        Args:
+            hop_matrix: [N, N] APSP hop 행렬 (K-hop 마스킹용, apsp_matrix와 동일 가능)
+            apsp_matrix: [N, N] APSP 행렬 (기존 soft bias용, 하위 호환)
+            node_positions: [N, 2] 노드 좌표 (directional bias용)
+        """
+        mcfg = self.mask_cfg  # Ablation config 참조
+        
         memory, memory_mask = self.encode_graph(x, edge_index, batch, edge_attr=edge_attr)
         batch_size = memory.size(0)
         
@@ -368,157 +423,201 @@ class GraphTransformerManager(nn.Module):
         
         curr_emb = self.sos_emb.expand(batch_size, -1, -1)
         full_seqs = []
-        visited_mask = torch.zeros_like(memory_mask_extended, dtype=torch.bool) # [B, N+1]
+        visited_mask = torch.zeros_like(memory_mask_extended, dtype=torch.bool)
         finished_mask = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
         
-        # N is the index of EOS
-        EOS_INDEX = memory.size(1) 
+        EOS_INDEX = memory.size(1)
+        
+        # [Ablation] hop_matrix 결정: 명시적 전달 > apsp_matrix fallback
+        effective_hop_matrix = hop_matrix if hop_matrix is not None else apsp_matrix
+        
+        # [벡터화 준비] start/goal 인덱스를 배치 전체에서 한 번에 추출
+        # x_dense의 구조가 동적으로 변할 수 있으므로 가급적 인자로 전달받은 값을 사용
+        if start_indices is None or goal_indices is None:
+            if effective_hop_matrix is not None:
+                from torch_geometric.utils import to_dense_batch
+                x_dense, _ = to_dense_batch(x, batch)  # [B, N_max, F]
+                # Fallback: 기존 S0 방식의 구조를 가정 (node_dim=4 이상)
+                if x_dense.size(-1) >= 4:
+                    start_indices = x_dense[:, :, 2].argmax(dim=1) if start_indices is None else start_indices
+                    goal_indices = x_dense[:, :, 3].argmax(dim=1) if goal_indices is None else goal_indices
+                else:
+                    # S1, S2와 같이 [is_curr, is_tgt]가 앞단에 있는 경우
+                    start_indices = x_dense[:, :, 0].argmax(dim=1) if start_indices is None else start_indices
+                    goal_indices = x_dense[:, :, 1].argmax(dim=1) if goal_indices is None else goal_indices
+        
+        # [Ablation] soft bias 활성화 여부 판단 (하나라도 켜져있으면 for-loop 필요)
+        any_soft_bias = mcfg.get('bias_scale', 1.0) > 0 and any([
+            mcfg.get('enable_radius_mask', False),
+            mcfg.get('enable_directional_bias', False),
+            mcfg.get('enable_corridor_bonus', False),
+            mcfg.get('enable_progress_bonus', False),
+            mcfg.get('enable_detour_penalty', False),
+            mcfg.get('enable_nonprogress_penalty', False),
+            mcfg.get('enable_eos_control', False),
+        ])
         
         for k in range(max_len):
-            # [Fix] Positional Encoding 제거: Permutation Invariant 특성 보존
             curr_input = curr_emb
             
-            # [Fix Warning] Float Mask
+            # Float Mask
             padding_mask_float = torch.zeros(memory_mask_extended.size(), device=x.device, dtype=torch.float)
             padding_mask_float.masked_fill_(~memory_mask_extended, float('-inf'))
             
-            # Decode using Extended Memory
+            # Decode
             out = self.decoder(tgt=curr_input, memory=memory_extended, memory_key_padding_mask=padding_mask_float)
             
-            # [Fix] Explicit Broadcasting (Same as Forward)
-            Q = self.pointer_query(out).unsqueeze(2)        # [B, 1, 1, H]
-            K = self.pointer_key(memory_extended).unsqueeze(1) # [B, 1, N+1, H]
+            # Pointer Attention
+            Q = self.pointer_query(out).unsqueeze(2)
+            K_ptr = self.pointer_key(memory_extended).unsqueeze(1)
+            scores = torch.tanh(Q + K_ptr)
+            scores = torch.matmul(scores, self.pointer_v).squeeze(-1).squeeze(1)
+            if scores.dim() == 3:
+                scores = scores.squeeze(1)
             
-            scores = torch.tanh(Q + K) # [B, 1, N+1, H]
-            scores = torch.matmul(scores, self.pointer_v).squeeze(-1).squeeze(1) # [B, 1, N+1, 1] -> [B, N+1]
-            if scores.dim() == 3: scores = scores.squeeze(1)
-            
-            # Masking
+            # === 구조적 마스킹 (항상 적용) ===
             scores.masked_fill_(~memory_mask_extended, float('-inf'))
             
-            # --- 1. 과거 궤적 (Visited) 마스킹 ---
-            scores.masked_fill_(visited_mask, float('-inf'))
+            # --- 1. Visited 마스킹 ---
+            if mcfg.get('enable_visited_mask', True):
+                scores.masked_fill_(visited_mask, float('-inf'))
             
-            # 아래 마스킹 로직들은 노드 클래스(0 ~ N-1)에만 적용되며, EOS 인덱스(N)에는 영향이 없어야 합니다.
-            # scores shape: [B, N+1]
+            # --- 2. K-hop 마스킹 (벡터화 — for-loop 없음) ---
+            if mcfg.get('enable_khop_mask', True) and effective_hop_matrix is not None:
+                K_hop = mcfg.get('khop_K', 10)
+                if k > 0:
+                    current_indices = next_node_indices
+                else:
+                    current_indices = start_indices
+                # EOS 선택된 배치는 마스킹 건너뜀
+                active = ~finished_mask & (current_indices < EOS_INDEX)
+                if active.any():
+                    active_scores = scores[active]
+                    active_curr = current_indices[active]
+                    active_scores = self._apply_khop_mask(active_scores, active_curr, effective_hop_matrix, K_hop)
+                    # goal 노드는 항상 선택 가능하게 보호
+                    if goal_indices is not None:
+                        active_goals = goal_indices[active]
+                        row_idx = torch.arange(active_scores.size(0), device=x.device)
+                        active_scores[row_idx, active_goals] = scores[active][row_idx, active_goals]
+                    scores[active] = active_scores
             
-            if (apsp_matrix is not None) and (node_positions is not None):
-                # 타겟 노드(목적지) 찾기: x[..., 3] == 1.0
-                # 이 배치의 현재 상태(직전 예측 노드)
+            # --- 3. Soft Bias (기존 Decode Bias — config로 on/off) ---
+            if any_soft_bias and (apsp_matrix is not None) and (node_positions is not None):
                 curr_nodes = next_node_indices if k > 0 else None
+                bias_s = mcfg.get('bias_scale', 1.0)
                 
                 for b_i in range(batch_size):
-                    # 1. 목적지 노드 탐색
-                    # batch == b_i 인 노드들 중 x[i, 3] == 1 인 노드
-                    b_mask = (batch == b_i)
-                    b_x = x[b_mask]
-                    start_idx = torch.argmax(b_x[:, 2]).item()
-                    goal_idx = torch.argmax(b_x[:, 3]).item() # local idx
+                    if finished_mask[b_i]:
+                        continue
                     
-                    # 2. 현재 위치 노드 탐색
-                    if curr_nodes is not None:
-                        c_idx = curr_nodes[b_i].item()
-                    else:
-                        c_idx = torch.argmax(b_x[:, 2]).item()
-                        
-                    # 만약 현재 위치가 EOS라면 건너뜀
+                    start_idx = start_indices[b_i].item()
+                    goal_idx = goal_indices[b_i].item()
+                    
+                    c_idx = curr_nodes[b_i].item() if curr_nodes is not None else start_idx
                     if c_idx == EOS_INDEX:
                         continue
-                        
-                    # --- 2. 동적 segment budget 반경 제어 ---
+                    
                     hops_from_curr = apsp_matrix[c_idx].float()
                     shortest_hops = float(apsp_matrix[start_idx, goal_idx].item())
                     current_goal_hops = float(apsp_matrix[c_idx, goal_idx].item())
-                    # inf 방어: 연결 불가능 노드 쌍인 경우 안전한 기본값 사용
                     if not math.isfinite(shortest_hops):
                         shortest_hops = 1.0
                     if not math.isfinite(current_goal_hops):
                         current_goal_hops = shortest_hops
-                    target_segment_hops = max(float(self.decode_bias_cfg.get('target_segment_hops', 4.5)), 1.0)
-                    k_ref = max(1.0, float(math.ceil(max(shortest_hops, 1.0) / target_segment_hops)))
-                    remaining_slots = max(1.0, k_ref - float(k))
-                    seg_ref = max(current_goal_hops / remaining_slots, 1.0)
-                    r_min = max(2.0, float(math.floor(0.5 * seg_ref)))
-                    r_max = float(math.ceil(1.5 * seg_ref) + 1.0)
-
-                    radius_mask_high = hops_from_curr > r_max
-                    radius_mask_high[goal_idx] = False
-                    scores[b_i, :-1].masked_fill_(radius_mask_high.to(scores.device), float('-inf'))
-
-                    low_hop_penalty = torch.clamp(r_min - hops_from_curr, min=0.0)
-                    low_hop_penalty[goal_idx] = 0.0
-                    scores[b_i, :-1] = scores[b_i, :-1] - (
-                        low_hop_penalty.to(scores.device)
-                        * float(self.decode_bias_cfg.get('radius_low_penalty_scale', 0.75))
-                    )
-
-                    # --- 3. soft directional bias ---
-                    curr_pos = node_positions[c_idx]  # [2]
-                    goal_pos = node_positions[goal_idx] # [2]
                     
-                    target_vec = goal_pos - curr_pos
-                    target_norm = torch.norm(target_vec)
-                    
-                    if target_norm > 1e-5: # 목적지에 이미 도달한게 아니라면
-                        all_vecs = node_positions - curr_pos # [N, 2]
-                        all_norms = torch.norm(all_vecs, dim=1).clamp(min=1e-8)
+                    # --- Radius Masking (soft bias) ---
+                    if mcfg.get('enable_radius_mask', True):
+                        target_segment_hops = max(float(self.decode_bias_cfg.get('target_segment_hops', 4.5)), 1.0)
+                        k_ref = max(1.0, float(math.ceil(max(shortest_hops, 1.0) / target_segment_hops)))
+                        remaining_slots = max(1.0, k_ref - float(k))
+                        seg_ref = max(current_goal_hops / remaining_slots, 1.0)
+                        r_min = max(2.0, float(math.floor(0.5 * seg_ref)))
+                        r_max = float(math.ceil(1.5 * seg_ref) + 1.0)
                         
-                        eps = 1e-8
-                        cos_sim = (all_vecs[:, 0] * target_vec[0] + all_vecs[:, 1] * target_vec[1]) / (all_norms * (target_norm + eps))
-                        corridor_ok = (hops_from_curr + apsp_matrix[:scores.size(1) - 1, goal_idx].float()) <= (current_goal_hops + float(self.decode_bias_cfg.get('corridor_slack', 2.0)))
-                        directional_penalty = torch.clamp(
-                            float(self.decode_bias_cfg.get('directional_cos_margin', -0.25)) - cos_sim,
-                            min=0.0,
+                        radius_mask_high = hops_from_curr > r_max
+                        radius_mask_high[goal_idx] = False
+                        scores[b_i, :-1].masked_fill_(radius_mask_high.to(scores.device), float('-inf'))
+                        
+                        low_hop_penalty = torch.clamp(r_min - hops_from_curr, min=0.0)
+                        low_hop_penalty[goal_idx] = 0.0
+                        scores[b_i, :-1] = scores[b_i, :-1] - (
+                            low_hop_penalty.to(scores.device)
+                            * float(self.decode_bias_cfg.get('radius_low_penalty_scale', 0.75))
+                            * bias_s
                         )
-                        directional_penalty = directional_penalty * float(
-                            self.decode_bias_cfg.get('directional_penalty_scale', 1.25)
+                    
+                    # --- Directional Bias ---
+                    if mcfg.get('enable_directional_bias', True):
+                        curr_pos = node_positions[c_idx]
+                        goal_pos = node_positions[goal_idx]
+                        target_vec = goal_pos - curr_pos
+                        target_norm = torch.norm(target_vec)
+                        
+                        if target_norm > 1e-5:
+                            all_vecs = node_positions - curr_pos
+                            all_norms = torch.norm(all_vecs, dim=1).clamp(min=1e-8)
+                            eps = 1e-8
+                            cos_sim = (all_vecs[:, 0] * target_vec[0] + all_vecs[:, 1] * target_vec[1]) / (all_norms * (target_norm + eps))
+                            corridor_ok = (hops_from_curr + apsp_matrix[:scores.size(1) - 1, goal_idx].float()) <= (current_goal_hops + float(self.decode_bias_cfg.get('corridor_slack', 2.0)))
+                            directional_penalty = torch.clamp(
+                                float(self.decode_bias_cfg.get('directional_cos_margin', -0.25)) - cos_sim,
+                                min=0.0,
+                            )
+                            directional_penalty = directional_penalty * float(
+                                self.decode_bias_cfg.get('directional_penalty_scale', 1.25)
+                            )
+                            directional_penalty = directional_penalty * torch.where(
+                                corridor_ok,
+                                torch.full_like(directional_penalty, 0.35),
+                                torch.ones_like(directional_penalty),
+                            )
+                            directional_penalty[goal_idx] = 0.0
+                            scores[b_i, :-1] = scores[b_i, :-1] - directional_penalty.to(scores.device) * bias_s
+                    
+                    # --- compute_manager_decode_bias (corridor/progress/detour/eos) ---
+                    # 개별 bias on/off는 compute_manager_decode_bias 내부에서 처리할 수도 있지만,
+                    # 현재는 전체를 bias_scale로 스케일링
+                    if any([mcfg.get('enable_corridor_bonus', True),
+                            mcfg.get('enable_progress_bonus', True),
+                            mcfg.get('enable_detour_penalty', True),
+                            mcfg.get('enable_nonprogress_penalty', True),
+                            mcfg.get('enable_eos_control', True)]):
+                        bias_payload = compute_manager_decode_bias(
+                            apsp_matrix=apsp_matrix,
+                            start_idx=start_idx,
+                            current_idx=c_idx,
+                            goal_idx=goal_idx,
+                            eos_index=EOS_INDEX,
+                            cfg=self.decode_bias_cfg,
+                            generated_tokens_so_far=k,
                         )
-                        directional_penalty = directional_penalty * torch.where(
-                            corridor_ok,
-                            torch.full_like(directional_penalty, 0.35),
-                            torch.ones_like(directional_penalty),
-                        )
-                        directional_penalty[goal_idx] = 0.0
-                        scores[b_i, :-1] = scores[b_i, :-1] - directional_penalty.to(scores.device)
-
-                    bias_payload = compute_manager_decode_bias(
-                        apsp_matrix=apsp_matrix,
-                        start_idx=start_idx,
-                        current_idx=c_idx,
-                        goal_idx=goal_idx,
-                        eos_index=EOS_INDEX,
-                        cfg=self.decode_bias_cfg,
-                        generated_tokens_so_far=k,
-                    )
-                    scores[b_i] = scores[b_i] + bias_payload['total_bias'].to(scores.device)
-
+                        scores[b_i] = scores[b_i] + bias_payload['total_bias'].to(scores.device) * bias_s
+            
+            # --- 종료 처리 ---
             if finished_mask.any():
                 scores[finished_mask] = float('-inf')
                 scores[finished_mask, EOS_INDEX] = 0.0
-
-            # SL 데이터에는 빈 계획이 없으므로, 첫 토큰에서 즉시 EOS는 허용하지 않는다.
+            
+            # 첫 토큰에서 즉시 EOS 차단
             if k == 0:
                 scores[:, EOS_INDEX] = float('-inf')
             
-            # Select
+            # === Sampling ===
             if temperature <= 1e-5:
                 next_node_indices = torch.argmax(scores, dim=-1)
             else:
-                # NaN/Inf 방어: 대형 그래프에서 score overflow 방지
                 scores = torch.clamp(scores, min=-1e6, max=1e6)
                 scores[torch.isnan(scores)] = float('-inf')
                 probs = F.softmax(scores / temperature, dim=-1)
                 probs = torch.clamp(probs, min=0.0)
                 probs[torch.isnan(probs)] = 0.0
-                # 전체 행이 0이면 uniform으로 fallback
                 zero_rows = probs.sum(dim=-1) < 1e-8
                 if zero_rows.any():
                     probs[zero_rows] = 1.0 / probs.size(-1)
                 next_node_indices = torch.multinomial(probs, 1).squeeze(-1)
             
             full_seqs.append(next_node_indices)
-            
-            # Check EOS
             is_eos = (next_node_indices == EOS_INDEX)
             
             # Update Visited
@@ -534,12 +633,12 @@ class GraphTransformerManager(nn.Module):
             
             if finished_mask.all():
                 break
-            
+        
         full_seqs = torch.stack(full_seqs, dim=1)
-        eos_mask = (full_seqs == EOS_INDEX)
-        has_eos = eos_mask.any(dim=1)
+        eos_mask_out = (full_seqs == EOS_INDEX)
+        has_eos = eos_mask_out.any(dim=1)
         if has_eos.any():
-            first_eos = eos_mask.float().argmax(dim=1)
+            first_eos = eos_mask_out.float().argmax(dim=1)
             time_idx = torch.arange(full_seqs.size(1), device=x.device).unsqueeze(0)
             pad_after_eos = time_idx > first_eos.unsqueeze(1)
             full_seqs = full_seqs.masked_fill(pad_after_eos & has_eos.unsqueeze(1), self.PAD_TOKEN)

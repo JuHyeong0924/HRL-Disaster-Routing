@@ -22,12 +22,125 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 from src.envs.disaster_env import DisasterEnv
-from src.models.node_manager import GraphTransformerManager
 from src.models.worker import Worker
-from src.trainers.worker_nav_trainer import WorkerNavTrainer
-from src.trainers.manager_stage_trainer import ManagerStageTrainer  # [Refactor: Task 1]
-from src.trainers.pomo_trainer import DOMOTrainer  # [Refactor: Task 1]
 from src.trainers.worker_trainer import HRLWorkerTrainer  # [HRL Phase 1]
+
+# [Manager v2] 비자기회귀 + PPO + PBRS Re-planning
+from src.models.reactive_manager import ReactiveManager
+from src.trainers.manager_ppo_trainer import ManagerPPOTrainer
+from src.envs.hrl_closed_loop_env import HRLClosedLoopEnv
+
+# [Legacy] 기존 Manager/Trainer — legacy 폴더로 이동됨
+from src.models.legacy.node_manager import GraphTransformerManager, DEFAULT_MANAGER_MASK_CFG
+from src.trainers.legacy.worker_nav_trainer import WorkerNavTrainer
+from src.trainers.legacy.manager_stage_trainer import ManagerStageTrainer
+from src.trainers.legacy.pomo_trainer import DOMOTrainer
+
+
+# [Ablation] Bias/Reward preset → config dict 매핑
+def _get_bias_preset_config(preset: str, khop_K: int = 10) -> dict:
+    """bias_preset CLI 인자를 mask_cfg dict로 변환."""
+    cfg = dict(DEFAULT_MANAGER_MASK_CFG)
+    cfg['khop_K'] = khop_K
+    
+    if preset == 'full':
+        pass  # 모든 bias ON (기존 동작)
+    elif preset == 'none':
+        # visited만 ON, 나머지 전부 OFF
+        cfg['enable_khop_mask'] = False
+        cfg['enable_radius_mask'] = False
+        cfg['enable_directional_bias'] = False
+        cfg['enable_corridor_bonus'] = False
+        cfg['enable_progress_bonus'] = False
+        cfg['enable_detour_penalty'] = False
+        cfg['enable_nonprogress_penalty'] = False
+        cfg['enable_eos_control'] = False
+        cfg['bias_scale'] = 0.0
+    elif preset == 'khop_only':
+        # visited + K-hop만 ON
+        cfg['enable_radius_mask'] = False
+        cfg['enable_directional_bias'] = False
+        cfg['enable_corridor_bonus'] = False
+        cfg['enable_progress_bonus'] = False
+        cfg['enable_detour_penalty'] = False
+        cfg['enable_nonprogress_penalty'] = False
+        cfg['enable_eos_control'] = False
+        cfg['bias_scale'] = 0.0
+    elif preset == 'soft_only':
+        # K-hop OFF, soft bias만 ON
+        cfg['enable_khop_mask'] = False
+        cfg['enable_radius_mask'] = False  # radius는 hard에 가까우므로 OFF
+        cfg['enable_directional_bias'] = False  # directional도 OFF
+    return cfg
+
+
+def _get_reward_preset_config(preset: str) -> dict:
+    """reward_preset CLI 인자를 reward ablation config dict로 변환."""
+    cfg = {
+        'enable_r1_pbrs': True,
+        'enable_r2_subgoal': True,
+        'enable_r3_goal': True,
+        'enable_r4_efficiency': True,
+        'enable_r5_milestone': True,
+        'enable_r6_exploration': True,
+        'enable_r7_plan_penalty': True,
+        'enable_p1_time_pressure': True,
+        'enable_p2_loop': True,
+        'enable_p3_fail': True,
+        'subgoal_reward_mode': 'exact',
+        'proximity_K': 10,
+    }
+    
+    if preset == 'full':
+        pass
+    elif preset == 'minimal':
+        cfg['enable_r2_subgoal'] = False
+        cfg['enable_r4_efficiency'] = False
+        cfg['enable_r5_milestone'] = False
+        cfg['enable_r6_exploration'] = False
+        cfg['enable_r7_plan_penalty'] = False
+        cfg['enable_p1_time_pressure'] = False
+    elif preset == 'mid':
+        cfg['enable_r4_efficiency'] = False
+        cfg['enable_r5_milestone'] = False
+        cfg['enable_r6_exploration'] = False
+        cfg['enable_p1_time_pressure'] = False
+    elif preset == 'proximity':
+        cfg['enable_r4_efficiency'] = False
+        cfg['enable_r5_milestone'] = False
+        cfg['enable_r6_exploration'] = False
+        cfg['enable_p1_time_pressure'] = False
+        cfg['subgoal_reward_mode'] = 'proximity'
+    return cfg
+
+def _apply_overrides(cfg: dict, override_str: str) -> None:
+    """'key=value,key=value' 형식의 문자열을 파싱하여 config dict에 적용.
+    
+    Why: preset으로 큰 틀을 잡고, 개별 항목만 세밀하게 조절하는 Ablation용.
+    지원 타입: bool(True/False), int, float, str
+    """
+    if not override_str or not override_str.strip():
+        return
+    for pair in override_str.split(','):
+        pair = pair.strip()
+        if '=' not in pair:
+            print(f"⚠️ Override 무시 (잘못된 형식): {pair}")
+            continue
+        key, val = pair.split('=', 1)
+        key, val = key.strip(), val.strip()
+        if key not in cfg:
+            print(f"⚠️ Override 무시 (알 수 없는 키): {key}")
+            continue
+        # 타입 자동 변환
+        if val.lower() == 'true':
+            cfg[key] = True
+        elif val.lower() == 'false':
+            cfg[key] = False
+        elif val.replace('.', '', 1).replace('-', '', 1).isdigit():
+            cfg[key] = float(val) if '.' in val else int(val)
+        else:
+            cfg[key] = val
+
 
 # Ablation Study 설정 로드
 import sys
@@ -137,7 +250,7 @@ def _extract_manager_state(payload):
 def _load_manager_checkpoint(path, manager, device, loaded_paths):
     if not os.path.exists(path):
         return False
-    payload = torch.load(path, map_location=device)
+    payload = torch.load(path, map_location=device, weights_only=False)
     manager_state = _extract_manager_state(payload)
     _load_state_compat(manager, manager_state, "manager")
     print(f"📦 Loaded manager checkpoint from {path}")
@@ -148,7 +261,7 @@ def _load_manager_checkpoint(path, manager, device, loaded_paths):
 def _load_worker_checkpoint(path, worker, device, loaded_paths):
     if not os.path.exists(path):
         return False
-    payload = torch.load(path, map_location=device)
+    payload = torch.load(path, map_location=device, weights_only=False)
     worker_state = _extract_worker_state(payload)
     _load_state_compat(worker, worker_state, "worker")
     print(f"📦 Loaded worker checkpoint from {path}")
@@ -206,6 +319,10 @@ def _build_config(args, loaded_checkpoint_paths, stage_override=None):
         entropy_coeff=getattr(args, "entropy_coeff", 0.0),
         use_cosine_lr=getattr(args, "use_cosine_lr", False),
         zone_progress_reward=getattr(args, "zone_progress_reward", False),
+        mgr_state_preset=getattr(args, 'mgr_state_preset', 'S0'),
+        # [Ablation] Manager bias/reward preset config
+        bias_mask_cfg=getattr(args, '_bias_mask_cfg', dict(DEFAULT_MANAGER_MASK_CFG)),
+        reward_ablation_cfg=getattr(args, '_reward_ablation_cfg', {}),
         goal_hop_bonus_8=0.75,
         goal_hop_bonus_4=1.0,
         goal_hop_bonus_2=1.25,
@@ -266,7 +383,16 @@ def _init_env_and_models(args):
         print("⚠️ GPU NOT DETECTED! Training will be slow on CPU.")
     print(f"Active Device: {device}")
 
-    manager = GraphTransformerManager(node_dim=4, hidden_dim=args.hidden_dim, dropout=0.2, edge_dim=3).to(device)
+    # [Manager State Ablation] Preset별 Node Dimension 매핑
+    mgr_state_dims = {
+        "S0": 4, "S1": 2, "S2": 3, "S3": 5, "S4": 5, "S5": 5, "S6": 5,
+        "S7": 4, "S8": 5, "S9": 5, "S10": 6, "S11": 6, "S12": 7, "S13": 8
+    }
+    mgr_preset = getattr(args, 'mgr_state_preset', 'S0')
+    mgr_node_dim = mgr_state_dims.get(mgr_preset, 4)
+
+    manager = GraphTransformerManager(node_dim=mgr_node_dim, hidden_dim=args.hidden_dim, dropout=0.2, edge_dim=3).to(device)
+    print(f"   Manager: preset={mgr_preset}, node_dim={mgr_node_dim}, hidden_dim={args.hidden_dim}")
     
     # [v3 Ablation] Worker 생성: num_layers를 CLI에서 동적 제어
     use_ckpt = args.stage == "worker"
@@ -335,9 +461,8 @@ def _run_single_stage(args, env, manager, worker, device, stage: str,
         if not _load_worker_checkpoint(wkr_stage_ckpt, worker, device, loaded_checkpoint_paths):
             if not _load_worker_checkpoint(sl_ckpt, worker, device, loaded_checkpoint_paths):
                 print("⚠️ No worker checkpoint for manager stage.")
-        # Manager: SL pretrained로 시작
-        if not _load_manager_checkpoint(sl_ckpt, manager, device, loaded_checkpoint_paths):
-            print("⚠️ SL manager checkpoint not found.")
+        # Manager: State Ablation으로 인해 SL pretrained를 무시하고 무조건 Scratch에서 시작
+        print("📋 Manager: State Ablation 실험(node_dim 변경)을 위해 SL 체크포인트를 건너뛰고 Scratch에서 학습합니다.")
     elif stage == "alignment":
         # Worker: worker_stage best → fallback SL
         if not _load_worker_checkpoint(wkr_stage_ckpt, worker, device, loaded_checkpoint_paths):
@@ -351,17 +476,51 @@ def _run_single_stage(args, env, manager, worker, device, stage: str,
     config = _build_config(args, loaded_checkpoint_paths, stage_override=stage)
 
     # Stage별 Trainer 분기
-    if stage == "manager":
+    if stage == "manager_v2":
+        # [Manager v2] ReactiveManager + PPO + PBRS Closed-loop
+        node_dim = 4  # S7: is_curr, is_tgt, hop_dist, degree
+        reactive_mgr = ReactiveManager(
+            node_dim=node_dim, hidden_dim=args.hidden_dim,
+            num_layers=args.num_layers, dropout=0.2,
+        ).to(device)
+        print(f"📋 Manager v2: ReactiveManager (node_dim={node_dim}, hidden={args.hidden_dim})")
+        print(f"   파라미터 수: {sum(p.numel() for p in reactive_mgr.parameters()):,}")
+
+        # Worker 체크포인트 로드
+        wkr_ckpt = _get_latest_ckpt(os.path.join('logs', 'rl_worker_stage'), 'best.pt')
+        if wkr_ckpt:
+            _load_worker_checkpoint(wkr_ckpt, worker, device, loaded_checkpoint_paths)
+        else:
+            print("⚠️ Worker 체크포인트 없음. Worker는 랜덤 초기 상태로 사용됩니다.")
+
+        # Closed-loop 환경 생성
+        node_file = f"data/{args.map}_node.tntp"
+        net_file = f"data/{args.map}_net.tntp"
+        cl_env = HRLClosedLoopEnv(
+            node_file=node_file, net_file=net_file,
+            worker=worker, k_hop=5, c_max=8,
+            device=str(device),
+        )
+
+        # PPO Trainer 생성 및 학습
+        config.save_dir = os.path.join('logs', 'rl_manager_v2', config.save_dir.split('/')[-1])
+        os.makedirs(config.save_dir, exist_ok=True)
+        ppo_trainer = ManagerPPOTrainer(cl_env, reactive_mgr, config)
+        ppo_trainer.train(episodes)
+    elif stage == "manager":
         trainer = ManagerStageTrainer(env, manager, worker, config)
+        trainer.train(episodes)
     elif stage == "worker":
         # [HRL Phase 1] HRLZoneEnv + Worker 전용 Trainer 사용
         trainer = HRLWorkerTrainer(env, manager, worker, config)
+        trainer.train(episodes)
     elif stage == "alignment":
         trainer = DOMOTrainer(env, manager, worker, config)
+        trainer.train(episodes)
     else:
         trainer = WorkerNavTrainer(env, manager, worker, config)
+        trainer.train(episodes)
 
-    trainer.train(episodes)
     print(f"\n✅ Stage [{stage.upper()}] 학습 완료!")
     print(f"   저장 위치: {config.save_dir}")
 
@@ -584,8 +743,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stage",
         default="phase1",
-        choices=["manager", "worker", "alignment", "phase1", "phase1_parallel"],
-        help="학습 단계: phase1(순차), phase1_parallel(Worker∥Manager→Joint)",
+        choices=["manager", "manager_v2", "worker", "alignment", "phase1", "phase1_parallel"],
+        help="학습 단계: manager_v2(비자기회귀+PPO), phase1(순차), phase1_parallel(Worker∥Manager→Joint)",
     )
     parser.add_argument("--wkr_lr_floor", type=float, default=1e-5,
                         help="Worker 최소 학습률 (기본 1e-5)")  # [Refactor: Task 5]
@@ -633,4 +792,38 @@ if __name__ == "__main__":
     parser.add_argument("--subgoal_mode", type=str, default="zone",
                         choices=["zone", "node"],
                         help="[Part2] Manager Subgoal 모드 (zone / node)")
-    train_rl(parser.parse_args())
+    # [Manager State Ablation] preset 설정
+    parser.add_argument("--mgr_state_preset", type=str, default="S0",
+                        choices=[f"S{i}" for i in range(14)],
+                        help="Manager State Ablation 14개 실험 프리셋 (S0~S13)")
+    # [Ablation] Manager Decode Bias / Reward preset
+    parser.add_argument("--bias_preset", type=str, default="full",
+                        choices=["full", "none", "khop_only", "soft_only"],
+                        help="Decode bias ablation preset")
+    parser.add_argument("--khop_K", type=int, default=10,
+                        help="K-hop masking radius (bias_preset=khop_only 시 사용)")
+    parser.add_argument("--reward_preset", type=str, default="full",
+                        choices=["full", "minimal", "mid", "proximity"],
+                        help="Reward ablation preset")
+    # [Ablation] 세밀한 Override: preset 위에 개별 항목 덮어쓰기
+    parser.add_argument("--bias_override", type=str, default="",
+                        help="Bias config override (예: enable_corridor_bonus=True,enable_eos_control=False)")
+    parser.add_argument("--reward_override", type=str, default="",
+                        help="Reward config override (예: enable_r6_exploration=True,enable_p3_fail=False)")
+    
+    args = parser.parse_args()
+    # [Ablation] preset → config dict 변환
+    args._bias_mask_cfg = _get_bias_preset_config(args.bias_preset, args.khop_K)
+    args._reward_ablation_cfg = _get_reward_preset_config(args.reward_preset)
+    
+    # [Ablation] Override 적용: key=value 쌍을 파싱하여 config에 반영
+    _apply_overrides(args._bias_mask_cfg, args.bias_override)
+    _apply_overrides(args._reward_ablation_cfg, args.reward_override)
+    
+    # [Ablation] 최종 설정 출력
+    if args.bias_preset != 'full' or args.bias_override:
+        print(f"🔧 Bias Config: preset={args.bias_preset}, override={args.bias_override or 'none'}")
+    if args.reward_preset != 'full' or args.reward_override:
+        print(f"🔧 Reward Config: preset={args.reward_preset}, override={args.reward_override or 'none'}")
+    
+    train_rl(args)

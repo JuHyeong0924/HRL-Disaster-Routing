@@ -141,6 +141,20 @@ class DisasterEnv:
         self.max_hops = float(finite_hops.max().item()) if finite_hops.numel() > 0 else 50.0
         if self.verbose: print(f"✅ APSP Matrix Ready. Max Network Distance: {self.max_dist:.2f} km, Max Hops: {self.max_hops:.0f}")
 
+        # [Ablation] Static 위상 피처 계산 (Degree, Betweenness)
+        if self.verbose: print("📊 Calculating NetworkX Centrality Features...")
+        deg_dict = dict(self.map_core.graph.degree())
+        bet_dict = nx.betweenness_centrality(self.map_core.graph, weight='length')
+        
+        self.degree_tensor = torch.zeros((self.num_nodes, 1), dtype=torch.float, device=self.device)
+        self.betweenness_tensor = torch.zeros((self.num_nodes, 1), dtype=torch.float, device=self.device)
+        
+        max_deg = max(deg_dict.values()) if deg_dict else 1.0
+        for i in range(self.num_nodes):
+            node_id = self.idx_to_node[i]
+            self.degree_tensor[i, 0] = float(deg_dict.get(node_id, 0)) / max(max_deg, 1.0)
+            self.betweenness_tensor[i, 0] = float(bet_dict.get(node_id, 0.0))
+
         # 위치 정보 텐서화 (NumNodes, 2)
         self.pos_tensor = torch.zeros((self.num_nodes, 2), dtype=torch.float, device=self.device)
         for i in range(self.num_nodes):
@@ -535,8 +549,12 @@ class DisasterEnv:
             hop_dists_norm = torch.clamp(hop_dists.float() / self.max_hops, 0.0, 1.0)
             f_hop_dist = hop_dists_norm.view(-1, 1)
 
-            # Concat: [x, y, is_cur, is_tgt, visit, dist, dir_x, dir_y, is_final_target_phase, hop_dist] -> 10 Channels
-            x_feat = torch.cat([x_base, f_robot, f_target, f_visit, f_dist, f_dir, f_final_target, f_hop_dist], dim=1)
+            # Static 위상 피처
+            f_degree = self.degree_tensor.repeat(batch_size, 1)
+            f_betweenness = self.betweenness_tensor.repeat(batch_size, 1)
+
+            # Concat: [x, y, is_cur, is_tgt, visit, dist, dir_x, dir_y, is_final_target_phase, hop_dist, degree, betweenness] -> 12 Channels
+            x_feat = torch.cat([x_base, f_robot, f_target, f_visit, f_dist, f_dir, f_final_target, f_hop_dist, f_degree, f_betweenness], dim=1)
             
             offsets = (torch.arange(batch_size, device=self.device) * self.num_nodes).view(batch_size, 1, 1)
             batch_edge_index = (self.base_edge_index.unsqueeze(0) + offsets).view(2, -1)
@@ -622,10 +640,12 @@ class DisasterEnv:
         final_target_feat = is_final_target_phase.float().unsqueeze(1).expand(-1, self.num_nodes).reshape(-1, 1)
         self.pyg_data.x[:, 8:9] = final_target_feat
 
-        # [Track 1] hop_dist 업데이트 (col 9)
+        # [Track 1] hop_dist 갱신
         hop_dists = self.hop_matrix[new_targets]  # [Batch, N]
         hop_dists_norm = torch.clamp(hop_dists.float() / self.max_hops, 0.0, 1.0)
         self.pyg_data.x[:, 9] = hop_dists_norm.view(-1)
+        
+        # Static 위상 피처 (Col 10: degree, Col 11: betweenness)는 변경되지 않으므로 갱신 불필요.
 
     def step(self, next_node_idx):
         # 1. Update Energy (SOC)

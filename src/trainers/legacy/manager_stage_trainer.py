@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch_geometric.utils import to_dense_batch
 from tqdm import tqdm
 
-from src.trainers.pomo_trainer import DOMOTrainer
+from src.trainers.legacy.pomo_trainer import DOMOTrainer
 
 
 class ManagerStageTrainer(DOMOTrainer):
@@ -223,7 +223,7 @@ class ManagerStageTrainer(DOMOTrainer):
 
             s0 = self.env.current_node[0].item()
             g0 = self.env.target_node[0].item()
-            x_mgr_in = self.env.pyg_data.x[:, :4]
+            x_mgr_in = self._get_mgr_x_in()
             edge_index = self.env.pyg_data.edge_index
             batch_vec = self.env.pyg_data.batch
             ea = self.env.pyg_data.edge_attr[:, [0, 7, 8]]  # [length, capacity, speed]
@@ -238,6 +238,8 @@ class ManagerStageTrainer(DOMOTrainer):
                 apsp_matrix=self.env.hop_matrix,
                 node_positions=self.env.pos_tensor,
                 edge_attr=ea,
+                start_indices=self.env.current_node,
+                goal_indices=self.env.target_node,
             )
             plan_diag = self._compute_plan_reward_adjustment(s0, g0, sequences)
             score_bundle = self._compute_manager_plan_score(

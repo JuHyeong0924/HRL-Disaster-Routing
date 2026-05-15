@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 
-from src.trainers.pomo_trainer import DOMOTrainer
+from src.trainers.legacy.pomo_trainer import DOMOTrainer
 
 
 class WorkerNavTrainer(DOMOTrainer):

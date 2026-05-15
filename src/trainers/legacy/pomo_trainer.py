@@ -24,6 +24,7 @@ class DOMOTrainer:
         self.worker = worker
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.mgr_state_preset = getattr(config, 'mgr_state_preset', 'S0')
         
         self.save_dir = getattr(config, 'save_dir', "logs/rl_finetune")
         # [Diagnostic] 디버그 모드 플래그
@@ -120,6 +121,13 @@ class DOMOTrainer:
         self.manager_entropy_ema = 0.0
         self.manager_clip_hit_ema = 0.0
         self.dagger_cooldown = 0
+        
+        # [Ablation] Manager Bias/Reward config 적용
+        # Why: train_rl.py에서 preset → config dict로 변환된 설정을 Manager 모델에 전달
+        bias_mask_cfg = getattr(config, 'bias_mask_cfg', None)
+        if bias_mask_cfg is not None:
+            self.manager.mask_cfg.update(bias_mask_cfg)
+        self.reward_ablation_cfg = getattr(config, 'reward_ablation_cfg', {})
 
     def _should_collect_debug(self, ep, episodes):
         if not self.debug_mode:
@@ -127,7 +135,34 @@ class DOMOTrainer:
         if ep == 0 or ep == episodes - 1:
             return True
         return (ep % self.debug_interval) == 0
+                
+    def _get_mgr_x_in(self) -> torch.Tensor:
+        """Manager State Preset에 따라 pyg_data.x 컬럼을 필터링하여 입력 구성"""
+        x_all = self.env.pyg_data.x  # [B*N, 12]
+        # x_all cols: [0:x, 1:y, 2:is_cur, 3:is_tgt, 4:visit, 5:dist, 6:dir_x, 7:dir_y, 8:final, 9:hop, 10:deg, 11:bet]
+        preset = self.mgr_state_preset
         
+        # 1. Base 좌표/위치 구성
+        if preset in ("S0", "S3", "S4", "S5", "S6", "S11", "S12", "S13"):
+            base = x_all[:, :4]  # [x, y, is_curr, is_tgt]
+        elif preset in ("S1", "S2", "S7", "S8", "S9", "S10"):
+            base = x_all[:, 2:4] # [is_curr, is_tgt]
+        else:
+            base = x_all[:, :4]  # Fallback S0
+            
+        features = [base]
+        # 2. 추가 피처 덧붙이기
+        if preset in ("S2", "S3", "S7", "S8", "S9", "S10", "S11", "S12", "S13"):
+            features.append(x_all[:, 9:10]) # +hop_dist
+        if preset in ("S4", "S9", "S10", "S13"):
+            features.append(x_all[:, 5:6])  # +net_dist
+        if preset in ("S5", "S7", "S8", "S9", "S10", "S11", "S12", "S13"):
+            features.append(x_all[:, 10:11]) # +degree
+        if preset in ("S6", "S8", "S10", "S12", "S13"):
+            features.append(x_all[:, 11:12]) # +betweenness
+            
+        return torch.cat(features, dim=1)
+
     def train(self, episodes):
         os.makedirs(self.save_dir, exist_ok=True)
         if self.debug_mode:
@@ -181,7 +216,7 @@ class DOMOTrainer:
             g0 = self.env.target_node[0].item()
             
             # 2. Manager Plan Generation (Vectorized)
-            x_mgr_in = self.env.pyg_data.x[:, :4] 
+            x_mgr_in = self._get_mgr_x_in()
             edge_index = self.env.pyg_data.edge_index 
             batch_vec = self.env.pyg_data.batch
             
@@ -194,11 +229,14 @@ class DOMOTrainer:
                     x_mgr_in,
                     edge_index,
                     batch_vec,
-                    max_len=50,  # [성능 고도화] 대형 맵에서도 끝까지 서브골 생성 가능하도록 확장 (20→50)
+                    max_len=50,
                     temperature=temperature,
                     apsp_matrix=self.env.hop_matrix,
                     node_positions=self.env.pos_tensor,
                     edge_attr=ea,
+                    hop_matrix=self.env.hop_matrix,  # [Ablation] K-hop 마스킹용
+                    start_indices=self.env.current_node,
+                    goal_indices=self.env.target_node,
                 )
             
             # 3. Vectorized Execution
@@ -1894,10 +1932,7 @@ class DOMOTrainer:
         subgoal_hit_mask = torch.zeros_like(valid_mask, dtype=torch.bool, device=device)
         corridor_by_rank = plan_diag['corridor_ok'].to(device) if plan_diag is not None else torch.zeros_like(valid_mask, dtype=torch.bool, device=device)
         
-        # LSTM 상태 초기화
-        hid_dim = self.worker.lstm.hidden_size
-        h = torch.zeros(batch_size, hid_dim, device=device)
-        c = torch.zeros(batch_size, hid_dim, device=device)
+        # LSTM은 Worker v2에서 제거되었으므로 hidden state 초기화 생략
         
         # 추적 변수 초기화
         active_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
@@ -2115,21 +2150,50 @@ class DOMOTrainer:
                 col_idx = subgoal_ptrs[valid_arrived_subgoal]
                 subgoal_hit_mask[row_idx, col_idx] = True
             
-            # B: 서브골 도달 보상 (진행률 비례 + 최적성 보너스)
+            # B: 서브골 도달 보상 — Ablation config로 exact/proximity 모드 분기
             total_subgoals_count = generated_plan_lengths.float().clamp(min=1.0)
             progress_ratio = torch.clamp(subgoal_ptrs.float() / total_subgoals_count, min=0.0, max=1.0)
             subgoal_bonus = 0.5 * (SUBGOAL_BASE + SUBGOAL_SCALE * progress_ratio)
             corridor_ok_now = torch.gather(corridor_by_rank, 1, subgoal_ptrs.unsqueeze(1)).squeeze(1)
-            eligible_subgoal = valid_arrived_subgoal & corridor_ok_now & improved_goal
-            subgoal_rewards += eligible_subgoal.float() * subgoal_bonus
             
-            # C: 서브골 최적성 보너스 (A* 최단경로 대비 실제 스텝)
-            optimal_subgoal_dist = self.env.apsp_matrix[prev_subgoal_node, current_subgoals]
-            optimal_subgoal_steps = torch.clamp(optimal_subgoal_dist / max(self.env.max_dist / self.env.num_nodes, 1.0), min=1.0)
-            actual_steps = steps_since_last_subgoal.float().clamp(min=1.0)
-            opt_ratio = optimal_subgoal_steps / actual_steps
-            opt_bonus = OPTIMALITY_BONUS * torch.clamp(opt_ratio, 0.0, 1.0)
-            subgoal_rewards += eligible_subgoal.float() * opt_bonus
+            rcfg = self.reward_ablation_cfg
+            subgoal_mode = rcfg.get('subgoal_reward_mode', 'exact')
+            
+            if subgoal_mode == 'proximity':
+                # [Phase 2] Proximity 모드: 정확 도달 대신 근접도 기반 보상
+                # advance_mask가 True인 배치에 대해, 이전 subgoal까지의 최소 hop 거리로 점수 산출
+                # min_hop_to_active_subgoal: Worker가 해당 subgoal에 가장 가까웠던 hop 거리
+                prox_K = float(rcfg.get('proximity_K', 10))
+                # 근접도 = 1 - (최소거리 / 시작거리), [0, 1] 범위 클램프
+                proximity_score = torch.clamp(
+                    1.0 - min_hop_to_active_subgoal / current_subgoal_start_hops.clamp(min=1.0),
+                    min=0.0, max=1.0,
+                )
+                # 정확히 도달하면 1.0, 멀수록 0에 수렴
+                # advance_mask: 도달이든 스킵이든 다음 subgoal로 전진한 배치
+                proximity_bonus = subgoal_bonus * (0.3 + 0.7 * proximity_score)
+                subgoal_rewards += advance_mask.float() * proximity_bonus
+                
+                # C: 최적성 보너스도 proximity 모드에서는 실제 도달한 경우에만
+                if valid_arrived_subgoal.any():
+                    optimal_subgoal_dist = self.env.apsp_matrix[prev_subgoal_node, current_subgoals]
+                    optimal_subgoal_steps = torch.clamp(optimal_subgoal_dist / max(self.env.max_dist / self.env.num_nodes, 1.0), min=1.0)
+                    actual_steps = steps_since_last_subgoal.float().clamp(min=1.0)
+                    opt_ratio = optimal_subgoal_steps / actual_steps
+                    opt_bonus = OPTIMALITY_BONUS * torch.clamp(opt_ratio, 0.0, 1.0)
+                    subgoal_rewards += valid_arrived_subgoal.float() * opt_bonus
+            else:
+                # [기존] Exact 모드: 정확히 도달 + corridor 내 + goal 진전해야 점수
+                eligible_subgoal = valid_arrived_subgoal & corridor_ok_now & improved_goal
+                subgoal_rewards += eligible_subgoal.float() * subgoal_bonus
+                
+                # C: 서브골 최적성 보너스 (A* 최단경로 대비 실제 스텝)
+                optimal_subgoal_dist = self.env.apsp_matrix[prev_subgoal_node, current_subgoals]
+                optimal_subgoal_steps = torch.clamp(optimal_subgoal_dist / max(self.env.max_dist / self.env.num_nodes, 1.0), min=1.0)
+                actual_steps = steps_since_last_subgoal.float().clamp(min=1.0)
+                opt_ratio = optimal_subgoal_steps / actual_steps
+                opt_bonus = OPTIMALITY_BONUS * torch.clamp(opt_ratio, 0.0, 1.0)
+                subgoal_rewards += eligible_subgoal.float() * opt_bonus
             
             last_subgoal_advance = advance_mask & (subgoal_ptrs == (generated_plan_lengths - 1))
             reached_last_subgoal_mask = reached_last_subgoal_mask | (valid_arrived_subgoal & last_subgoal_advance)
@@ -2274,32 +2338,26 @@ class DOMOTrainer:
             goal_finish_window = in_post_last_subgoal_phase & (steps_after_last_subgoal < POST_HANDOFF_WINDOW)
 
             # Worker Action (Gradient 유지)
-            # Env X: [x, y, is_curr(2), is_tgt(3), visit(4), dist(5), dir_x(6), dir_y(7), is_final_target_phase(8), hop_dist(9)]
-            # Worker: [x, y, is_curr, is_tgt, dist, dir_x, dir_y, is_final_target_phase, hop_dist] (visit 제외 = 9채널)
             env_x = self.env.pyg_data.x
-            wkr_in = torch.cat([env_x[:, :4], env_x[:, 5:]], dim=1) # [B*N, 9]
+            # Phase 1 Worker는 [is_curr, is_tgt(서브골), is_final_target_phase, hop_dist_to_tgt] 등을 사용
+            # 여기서는 DisasterEnv의 4채널 추출: [is_curr(2), is_subgoal(3), final_phase(8), hop_dist(9)]
+            wkr_in = torch.cat([env_x[:, 2:4], env_x[:, 8:10]], dim=1) # [B*N, 4]
 
-            # [Fix] 동적으로 edge_attr 5D 슬라이싱 (환경이 변할 수 있으므로 매 스텝 계산)
+            # [Fix] 동적으로 edge_attr 5D 슬라이싱
             ea = self.env.pyg_data.edge_attr[:, [0, 7, 8]]  # [length, capacity, speed]
             
-            # AMP: Worker forward pass를 autocast로 감싸 VRAM 절감 (LSTM BPTT 메모리 핵심)
-            # RL에서는 spatial encoder를 고정해 매-step full-graph backward 비용을 줄인다.
             with autocast('cuda', enabled=self.use_amp):
-                scores, h_n, c_n, value_pred = self.worker.predict_next_hop(
-                    wkr_in, self.env.pyg_data.edge_index, h, c, self.env.pyg_data.batch,
+                action_probs, value_pred, _ = self.worker(
+                    wkr_in, self.env.pyg_data.edge_index, self.env.pyg_data.batch,
                     detach_spatial=detach_spatial, edge_attr=ea
                 )
+                # Softmax probs를 logits로 변환 (기존 코드 호환성 유지)
+                scores = torch.log(action_probs + 1e-8)
             
             # Value 예측 저장 (Critic 학습 및 초기 예측 Advantage용)
             v_sq = value_pred.squeeze(-1)
             if t == 0:
                 self._last_initial_values = v_sq # Save for Actor-Critic Advantage Baseline
-            
-            h, c = h_n, c_n
-            # [Fix] Truncated BPTT: 50스텝마다 hidden state detach → VRAM 일정 유지
-            if t > 0 and t % 50 == 0:
-                h = h.detach()
-                c = c.detach()
             
             # Masking & Sampling
             mask = self.env.get_mask() # [Batch, Num_Nodes]
@@ -2533,42 +2591,62 @@ class DOMOTrainer:
         )
         post_last_sg_success_mask = goal_after_last_subgoal_mask & (self.env.current_node == goal_idx)
 
-        # === [v6] 최종 보상 계산 (PBRS + 7요소) ===
+        # === [v6] 최종 보상 계산 — Ablation config 기반 ===
         is_success = (self.env.current_node == goal_idx)
+        rcfg = self.reward_ablation_cfg  # Ablation config 참조
         
-        # A: PBRS (포텐셜 기반 거리 가이드)
-        final_rewards = pbrs_sum * POTENTIAL_SCALE
+        final_rewards = torch.zeros_like(pbrs_sum)
         
-        # B: 서브골 보상 (진행률 + 최적성 보너스 포함)
-        final_rewards += subgoal_rewards
+        # R1: PBRS (포텐셜 기반 거리 가이드)
+        if rcfg.get('enable_r1_pbrs', True):
+            final_rewards += pbrs_sum * POTENTIAL_SCALE
         
-        # C: 목표 도달 보상
-        final_rewards += is_success.float() * GOAL_REWARD
+        # R2: 서브골 보상 (진행률 + 최적성 보너스)
+        if rcfg.get('enable_r2_subgoal', True):
+            final_rewards += subgoal_rewards
         
-        # D: 마일스톤 보상
-        final_rewards += milestone_sum
+        # R3: 목표 도달 보상
+        if rcfg.get('enable_r3_goal', True):
+            final_rewards += is_success.float() * GOAL_REWARD
         
-        # E: 탐색 보너스
-        final_rewards += exploration_sum
+        # R5: 마일스톤 보상
+        if rcfg.get('enable_r5_milestone', True):
+            final_rewards += milestone_sum
+        
+        # R6: 탐색 보너스
+        if rcfg.get('enable_r6_exploration', True):
+            final_rewards += exploration_sum
         
         # R4: 효율성 보너스 (성공 시에만)
-        optimal_steps = max(optimal_dist / (self.env.max_dist / self.env.num_nodes), 1.0)
-        ratio = step_counts.float() / optimal_steps
-        efficiency_bonus = torch.clamp(EFFICIENCY_MAX * (2.0 - ratio), min=0.0, max=EFFICIENCY_MAX)
-        final_rewards += torch.where(is_success, efficiency_bonus, torch.zeros_like(efficiency_bonus))
+        if rcfg.get('enable_r4_efficiency', True):
+            optimal_steps = max(optimal_dist / (self.env.max_dist / self.env.num_nodes), 1.0)
+            ratio = step_counts.float() / optimal_steps
+            efficiency_bonus = torch.clamp(EFFICIENCY_MAX * (2.0 - ratio), min=0.0, max=EFFICIENCY_MAX)
+            final_rewards += torch.where(is_success, efficiency_bonus, torch.zeros_like(efficiency_bonus))
         
-        # F: 시간 압박 페널티 (누적)
-        final_rewards += step_penalty_sum
+        # P1: 시간 압박 페널티 (누적)
+        if rcfg.get('enable_p1_time_pressure', True):
+            final_rewards += step_penalty_sum
         
         # P2: 루프 페널티 (누적)
-        final_rewards += loop_penalty_sum
+        if rcfg.get('enable_p2_loop', True):
+            final_rewards += loop_penalty_sum
         
         # P3: 실패 페널티
-        fail_penalty = (~is_success).float() * FAIL_PENALTY
-        final_rewards += fail_penalty
+        if rcfg.get('enable_p3_fail', True):
+            fail_penalty = (~is_success).float() * FAIL_PENALTY
+            final_rewards += fail_penalty
+        
         base_rewards = final_rewards.clone()
-        if plan_adjustment is not None:
+        # R7: Plan Penalty (plan_adjustment에 포함)
+        if plan_adjustment is not None and rcfg.get('enable_r7_plan_penalty', True):
             final_rewards = final_rewards + plan_adjustment.to(self.device)
+        
+        # [Ablation] 디버그 호환: fail_penalty/efficiency_bonus가 비활성 시 기본값
+        if 'fail_penalty' not in locals():
+            fail_penalty = torch.zeros_like(final_rewards)
+        if 'efficiency_bonus' not in locals():
+            efficiency_bonus = torch.zeros_like(final_rewards)
 
         # --- Critic Value Loss (Monte Carlo Targets) ---
         target = final_rewards.detach()
