@@ -1,0 +1,13 @@
+{
+  "ablation_id": "A7",
+  "config": {
+    "description": "GATv2 1-Layer (3→1): 최소 GNN으로 충분한가?",
+    "num_layers": 1
+  },
+  "episodes": 5000,
+  "pomo": 32,
+  "gpu_id": 1,
+  "map": "Anaheim",
+  "started_at": "2026-04-27T03:19:40.947433",
+  "pid": 2165048
+}

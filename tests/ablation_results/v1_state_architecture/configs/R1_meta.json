@@ -1,0 +1,13 @@
+{
+  "ablation_id": "R1",
+  "config": {
+    "description": "PBRS 제거: Dense reward 없이 Sparse만으로 학습 가능한가?",
+    "disable_pbrs": true
+  },
+  "episodes": 5000,
+  "pomo": 32,
+  "gpu_id": 1,
+  "map": "Anaheim",
+  "started_at": "2026-04-27T10:54:32.491976",
+  "pid": 2504576
+}

@@ -1,0 +1,13 @@
+{
+  "ablation_id": "R4",
+  "config": {
+    "description": "AuxCE Loss 제거: 보조 Cross-entropy 손실 기여도",
+    "disable_aux_ce": true
+  },
+  "episodes": 5000,
+  "pomo": 32,
+  "gpu_id": 0,
+  "map": "Anaheim",
+  "started_at": "2026-04-27T15:33:37.947508",
+  "pid": 2747156
+}

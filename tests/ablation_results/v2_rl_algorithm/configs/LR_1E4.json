@@ -1,0 +1,16 @@
+{
+  "stage": "worker (HRL Phase 1)",
+  "lr": 0.0001,
+  "episodes": 5000,
+  "accum_batch": 16,
+  "gamma": 0.99,
+  "ablation": {
+    "zone_progress_reward": true,
+    "use_gae": false,
+    "gae_lambda": null,
+    "entropy_coeff": 0.0,
+    "use_cosine_lr": false
+  },
+  "save_dir": "logs/rl_worker_stage/2026-04-29_0122_worker_pomo16_LR_1E4",
+  "started_at": "2026-04-29T01:22:10"
+}

@@ -1,0 +1,13 @@
+{
+  "ablation_id": "R5",
+  "config": {
+    "description": "간소화 보상: goal_reward + step_penalty만 (모든 bonus/penalty 제거)",
+    "simplified_reward": true
+  },
+  "episodes": 5000,
+  "pomo": 32,
+  "gpu_id": 1,
+  "map": "Anaheim",
+  "started_at": "2026-04-27T15:33:37.947912",
+  "pid": 2747157
+}

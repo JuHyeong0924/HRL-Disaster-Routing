@@ -1,0 +1,13 @@
+{
+  "ablation_id": "A3",
+  "config": {
+    "description": "GraphNorm 제거: 정규화 기여도 확인",
+    "use_graph_norm": false
+  },
+  "episodes": 5000,
+  "pomo": 32,
+  "gpu_id": 1,
+  "map": "Anaheim",
+  "started_at": "2026-04-26T22:28:02.399197",
+  "pid": 1946438
+}

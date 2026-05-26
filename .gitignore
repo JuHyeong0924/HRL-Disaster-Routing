@@ -1,9 +1,11 @@
-# === 학습 로그 및 체크포인트 ===
+# === 학습 로그 및 체크포인트 (대용량, 로컬 전용) ===
 logs/
 data/
 
-# === Ablation Study 결과 (대용량, 로컬 전용) ===
-tests/ablation_results/
+# === Ablation Study 결과 ===
+# 보고서(.md)와 설정(.json)은 추적, 대용량 로그/이미지는 제외
+tests/ablation_results/*/logs/
+tests/ablation_results/*/curves/
 tests/ablation_run.log
 nohup.out
 

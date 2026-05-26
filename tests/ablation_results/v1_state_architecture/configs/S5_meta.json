@@ -1,0 +1,18 @@
+{
+  "ablation_id": "S5",
+  "config": {
+    "description": "최소 State (3-Dim): is_curr + is_tgt + hop_dist만으로 네비게이션 가능한가?",
+    "state_keep_cols": [
+      0,
+      1,
+      6
+    ],
+    "node_dim_override": 3
+  },
+  "episodes": 5000,
+  "pomo": 32,
+  "gpu_id": 0,
+  "map": "Anaheim",
+  "started_at": "2026-04-27T10:54:32.472780",
+  "pid": 2504575
+}

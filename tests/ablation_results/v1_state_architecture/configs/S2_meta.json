@@ -1,0 +1,17 @@
+{
+  "ablation_id": "S2",
+  "config": {
+    "description": "dir_x, dir_y 제거 (5-Dim): 방향 벡터 없이 hop만으로 충분한가?",
+    "state_remove_cols": [
+      3,
+      4
+    ],
+    "node_dim_override": 5
+  },
+  "episodes": 5000,
+  "pomo": 32,
+  "gpu_id": 1,
+  "map": "Anaheim",
+  "started_at": "2026-04-27T06:19:56.938829",
+  "pid": 2298723
+}

@@ -1,0 +1,13 @@
+{
+  "ablation_id": "A6",
+  "config": {
+    "description": "GATv2 4-Layer (3→4): 더 깊은 GNN 효과 검증",
+    "num_layers": 4
+  },
+  "episodes": 5000,
+  "pomo": 32,
+  "gpu_id": 0,
+  "map": "Anaheim",
+  "started_at": "2026-04-27T03:19:40.947073",
+  "pid": 2165047
+}

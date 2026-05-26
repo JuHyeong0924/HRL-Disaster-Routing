@@ -1,0 +1,16 @@
+{
+  "ablation_id": "S1",
+  "config": {
+    "description": "hop_dist 제거 (6-Dim): 위상학적 거리 없이 유클리드만으로 충분한가?",
+    "state_remove_cols": [
+      6
+    ],
+    "node_dim_override": 6
+  },
+  "episodes": 5000,
+  "pomo": 32,
+  "gpu_id": 0,
+  "map": "Anaheim",
+  "started_at": "2026-04-27T06:19:56.938552",
+  "pid": 2298722
+}
