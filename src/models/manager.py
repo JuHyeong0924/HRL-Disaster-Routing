@@ -1,5 +1,5 @@
 """
-Manager v2: 비자기회귀 단일 서브골 예측 모델 (ReactiveManager)
+Manager v2: 비자기회귀 단일 서브골 예측 모델 (Manager)
 
 Worker와 통일된 GATv2 + Dual Head(Actor/Critic) 아키텍처.
 Transformer Decoder를 제거하고, 매 턴마다 K-hop 반경 내에서
@@ -18,7 +18,7 @@ from torch_geometric.nn import GATv2Conv, GraphNorm
 from typing import Tuple, Optional
 
 
-class ReactiveManager(nn.Module):
+class Manager(nn.Module):
     """비자기회귀 단일 서브골 예측 Manager.
 
     매 턴마다 전체 그래프를 GATv2로 인코딩한 후,
@@ -123,51 +123,60 @@ class ReactiveManager(nn.Module):
         self,
         x: torch.Tensor,
         edge_index: torch.Tensor,
-        current_idx: int,
-        goal_idx: int,
+        current_idx: torch.Tensor,
+        goal_idx: torch.Tensor,
         candidate_mask: torch.Tensor,
         batch: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """단일 그래프에 대한 서브골 선택 확률 및 상태 가치 출력.
-
-        Args:
-            x: [N, node_dim] 노드 피처
-            edge_index: [2, E] 엣지 인덱스
-            current_idx: 현재 위치 노드 인덱스 (스칼라)
-            goal_idx: 최종 목적지 노드 인덱스 (스칼라)
-            candidate_mask: [N] K-hop 내 후보 노드 마스크 (1=후보, 0=비후보)
-            batch: [N] 그래프 배치 인덱스 (단일 그래프면 None)
-
-        Returns:
-            probs: [N] 각 노드의 서브골 선택 확률 (마스킹 적용 후 Softmax)
-            value: [1] 현재 상태의 가치 추정값
-            logits: [N] 마스킹 전 raw logits (PPO ratio 계산용)
-        """
         # 1. GNN 인코딩
-        h = self._encode(x, edge_index, batch)  # [N, hidden_dim]
+        h = self._encode(x, edge_index, batch)  # [N_total, hidden_dim]
 
-        # 2. 현재 위치 및 목적지 임베딩 추출
-        h_curr = h[current_idx].unsqueeze(0)  # [1, hidden_dim]
-        h_goal = h[goal_idx].unsqueeze(0)     # [1, hidden_dim]
-
-        # 3. Actor: 모든 노드에 대한 점수 계산
-        N = h.size(0)
-        # h_curr, h_goal을 N개 노드로 브로드캐스트
-        h_curr_exp = h_curr.expand(N, -1)  # [N, hidden_dim]
-        h_goal_exp = h_goal.expand(N, -1)  # [N, hidden_dim]
-        # 각 노드(후보 서브골)별 점수 입력: [h_curr ∥ h_goal ∥ h_node]
-        actor_input = torch.cat([h_curr_exp, h_goal_exp, h], dim=-1)  # [N, 3*hidden_dim]
-        logits = self.actor(actor_input).squeeze(-1)  # [N]
-
-        # 4. K-hop 마스킹 적용
-        logits = logits.masked_fill(candidate_mask == 0, float('-inf'))
-
-        # 5. Softmax → 확률 분포
-        probs = F.softmax(logits, dim=-1)
-
-        # 6. Critic: 상태 가치 추정
-        critic_input = torch.cat([h_curr, h_goal], dim=-1)  # [1, 2*hidden_dim]
-        value = self.critic(critic_input).squeeze(-1)        # [1]
+        if batch is not None:
+            # 배치 내 각 그래프별 노드 수 계산
+            num_nodes_per_graph = torch.bincount(batch)
+            batch_offsets = torch.cat([torch.tensor([0], device=x.device), num_nodes_per_graph.cumsum(dim=0)[:-1]])
+            
+            curr_idx_flat = current_idx + batch_offsets
+            goal_idx_flat = goal_idx + batch_offsets
+            
+            h_curr = h[curr_idx_flat] # [B, hidden_dim]
+            h_goal = h[goal_idx_flat] # [B, hidden_dim]
+            
+            h_curr_exp = h_curr[batch] # [N_total, hidden_dim]
+            h_goal_exp = h_goal[batch] # [N_total, hidden_dim]
+            
+            actor_input = torch.cat([h_curr_exp, h_goal_exp, h], dim=-1)
+            logits = self.actor(actor_input).squeeze(-1)
+            logits = logits.masked_fill(candidate_mask == 0, -1e9)
+            
+            # Softmax per graph using scatter_max or just reshape if sizes are equal
+            # Since all zone graphs have the same size K, we can reshape safely
+            B = current_idx.size(0)
+            K = x.size(0) // B
+            logits_reshaped = logits.view(B, K)
+            # 마스크 처리 안된 부분을 무시하기 위해 마스킹된 버전을 사용
+            probs_reshaped = torch.nn.functional.softmax(logits_reshaped, dim=-1)
+            probs = probs_reshaped.view(-1)
+            logits = logits_reshaped # PPO 업데이트 시 1D가 아닌 [B, K]가 반환되도록 교체
+            
+            critic_input = torch.cat([h_curr, h_goal], dim=-1)
+            value = self.critic(critic_input).squeeze(-1)
+        else:
+            h_curr = h[current_idx].unsqueeze(0)
+            h_goal = h[goal_idx].unsqueeze(0)
+            
+            N = h.size(0)
+            h_curr_exp = h_curr.expand(N, -1)
+            h_goal_exp = h_goal.expand(N, -1)
+            
+            actor_input = torch.cat([h_curr_exp, h_goal_exp, h], dim=-1)
+            logits = self.actor(actor_input).squeeze(-1)
+            logits = logits.masked_fill(candidate_mask == 0, -1e9)
+            
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+            
+            critic_input = torch.cat([h_curr, h_goal], dim=-1)
+            value = self.critic(critic_input).squeeze(-1)
 
         return probs, value, logits
 

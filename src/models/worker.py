@@ -1,28 +1,34 @@
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as grad_ckpt
-from torch_geometric.nn import GATv2Conv, GraphNorm
+from torch_geometric.nn import GATv2Conv, GraphNorm, global_mean_pool
 
 class Worker(nn.Module):
     """
-    Phase 1: HRL Worker (Ablation 최적 구조 반영)
-    - 4-Dim State: [is_curr, is_tgt, is_next_zone, hop_dist]
+    HRL Worker (Model D 지원)
+    - Base (4-dim): [is_curr, is_tgt, is_next_zone, hop_dist]
+    - +is_visited (5-dim): 방문 노드 이력 → 순환 방지
+    - +global_pool: Critic에 전역 그래프 맥락 주입
     - Spatial: 2-Layer GATv2 + GraphNorm + Residual
-    - Temporal: LSTM 제거 (Linear 투영)
-    - Checkpointing: torch.utils.checkpoint 적용 → VRAM 절약
+    - Temporal: Linear 투영
     """
-    def __init__(self, node_dim: int = 4, hidden_dim: int = 256, num_layers: int = 2, dropout: float = 0.2, use_checkpoint: bool = False, use_jk_net: bool = False, use_edge_attr: bool = False):
+    def __init__(self, node_dim: int = 4, hidden_dim: int = 256, num_layers: int = 2,
+                 dropout: float = 0.2, use_checkpoint: bool = False,
+                 use_jk_net: bool = False, use_edge_attr: bool = False,
+                 use_is_visited: bool = False, use_global_pool: bool = False):
         super(Worker, self).__init__()
         self.node_dim = node_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        self.use_checkpoint = use_checkpoint  # VRAM 절약용 Gradient Checkpointing
+        self.use_checkpoint = use_checkpoint
         self.use_jk_net = use_jk_net
         self.use_edge_attr = use_edge_attr
+        self.use_is_visited = use_is_visited
+        self.use_global_pool = use_global_pool
         
         # 1. Spatial Encoder
         self.convs = nn.ModuleList()
-        edge_dim = 3 if use_edge_attr else None
+        edge_dim = 1 if use_edge_attr else None
         self.convs.append(GATv2Conv(node_dim, hidden_dim, heads=4, concat=False, dropout=dropout, edge_dim=edge_dim))
         self.input_proj = nn.Linear(node_dim, hidden_dim)
         
@@ -49,8 +55,10 @@ class Worker(nn.Module):
         )
         
         # 4. Value Head (Critic)
+        # Global Pool 사용 시 curr_emb + global_context 결합
+        critic_input_dim = hidden_dim * 2 if use_global_pool else hidden_dim
         self.critic = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(critic_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
@@ -88,13 +96,14 @@ class Worker(nn.Module):
     def forward(self, x, edge_index, batch, neighbors_mask=None, detach_spatial=False, edge_attr=None):
         """
         Args:
-            x: [N, 4] node features
+            x: [N, node_dim] node features
             edge_index: [2, E] edge indices
             batch: [N] graph assignment
             neighbors_mask: [N] action mask
         Returns:
             action_probs: [N] softmax probabilities over masked nodes
             value: [1] state value
+            logits: [N] raw logits
         """
         if not self.use_edge_attr:
             edge_attr = None
@@ -123,21 +132,29 @@ class Worker(nn.Module):
         h_t = self.temporal_proj(curr_emb)
         
         # Policy Scoring
-        # Broadcast h_t to all nodes in the respective graphs
         if batch is not None:
             h_t_expanded = h_t[batch]
         else:
             h_t_expanded = h_t.expand(x.size(0), -1)
             
         scorer_input = torch.cat([h, h_t_expanded], dim=-1)
-        logits = self.scorer(scorer_input).squeeze(-1) # [N]
+        logits = self.scorer(scorer_input).squeeze(-1)
         
         # Apply mask
         if neighbors_mask is not None:
             logits = logits.masked_fill(neighbors_mask == 0, float('-inf'))
             
         # Value estimate
-        value = self.critic(h_t) # [Batch, 1]
+        if self.use_global_pool:
+            # 전역 그래프 맥락을 Critic 입력에 결합
+            if batch is not None:
+                global_ctx = global_mean_pool(h, batch)  # [B, hidden_dim]
+            else:
+                global_ctx = h.mean(dim=0, keepdim=True)  # [1, hidden_dim]
+            critic_input = torch.cat([h_t, global_ctx], dim=-1)  # [B, hidden_dim*2]
+        else:
+            critic_input = h_t
+        value = self.critic(critic_input)
         
         # Softmax over actions (per graph in batch)
         if batch is not None:
@@ -146,4 +163,4 @@ class Worker(nn.Module):
         else:
             probs = torch.softmax(logits, dim=0)
             
-        return probs, value, h_t
+        return probs, value, logits

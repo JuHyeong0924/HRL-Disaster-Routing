@@ -160,3 +160,8 @@ train_rl.py --stage manager_v2
 1. **Congestion Estimation 기반 Safe Mapless Navigation (arXiv:2503.12036):** 혼잡도 평가를 결합하여 Local Minima를 회피하는 서브골 생성. (본 프로젝트의 Manager 혼잡도/데미지 반영 로직과 일치)
 2. **CBF(Control Barrier Functions) 결합 HRL (arXiv:2501.17424):** 하위 레벨에 안전 필터를 결합한 계층적 강화학습 구조. (향후 Worker의 충돌 회피/안전 제약에 적용 가능)
 3. **해마-선조체 영감 High-reward Graph Planning (arXiv:2410.09505):** 고수익(High-reward) 노드 위주의 메모리 그래프 구축. (본 프로젝트의 Node Graph 기반 서브골 선택과 매우 유사)
+
+### 2.5. Recent Architectural Fixes (Fix5 & Fix6)
+*   **Manager-Worker Decoupled Reward (Stochastic Trauma Prevention)**: Manager's reward ignores the Worker's `steps_taken` penalty to prevent overfitting to Worker's stochastic failures.
+*   **Mathematical PBRS**: Manager Potential Based Reward Shaping properly integrates $\gamma=0.99$ to penalize cyclic paths correctly.
+*   **Worker Stochastic Evaluation**: The Worker retains probabilistic sampling (`deterministic=False`) during evaluation to prevent `argmax`-induced infinite loop bugs inside contiguous zones.

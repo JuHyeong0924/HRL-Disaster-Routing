@@ -1,355 +1,322 @@
 """
-HRL Phase 1: Zone-Guided Worker 학습 Trainer
+Phase 1: Worker 사전 학습 트레이너 (정통 PPO 도입 버전)
 
-Gradient Accumulation 방식으로 N개 에피소드의 gradient를 누적하여
-대형 배치와 동일한 학습 효과를 달성. GATv2의 VRAM 제약을 회피하면서도
-분산 감소(Variance Reduction) 효과를 확보함.
-
-Ablation 플래그:
-- use_gae: GAE(λ) 적용 여부 (기본 False → Monte Carlo)
-- entropy_coeff: Entropy Bonus 계수 (기본 0.0 → 없음)
-- use_cosine_lr: Cosine LR Scheduler 사용 여부 (기본 False)
+- Rollout 과정에서 torch.no_grad()를 사용하여 초고속 데이터 수집.
+- 수집된 궤적(State, Action, Reward, Value 등)을 미니배치로 분할.
+- Epoch 반복을 통한 PPO 학습 효율 극대화.
 """
-import os
-import json
-from datetime import datetime
 
-import numpy as np
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions import Categorical
+import numpy as np
+from typing import Dict, List, Any
 from tqdm import tqdm
+
+from src.envs.worker_env import WorkerEnv
+from src.models.worker import Worker
 
 
 class HRLWorkerTrainer:
-    """HRL Phase 1: Gradient Accumulation 기반 Worker 학습.
-    
-    Ablation 실험을 위해 GAE, Entropy, LR Scheduler를 플래그로 제어.
-    """
+    """Worker 사전 학습(PPO) 트레이너"""
 
-    def __init__(self, env, manager, worker, config):
+    def __init__(self, env: WorkerEnv, logger: Any, worker_model: Worker, config: Any) -> None:
         self.env = env
-        self.manager = manager
-        self.worker = worker
-        self.config = config
-        self.device = next(worker.parameters()).device
+        self.logger = logger
+        self.worker = worker_model
         
-        # Gradient Accumulation 배치 크기
-        self.accum_batch = getattr(config, 'num_pomo', 16)
-
-        # 정적 edge_index (단일 그래프, 양방향) 및 edge_attr 추출
-        edge_list = []
-        edge_attr_list = []
-        for u, v, data in env.G.edges(data=True):
-            ui = env.node_to_idx[u]
-            vi = env.node_to_idx[v]
-            
-            cap = data.get('capacity', 0.0)
-            length = data.get('length', 0.0)
-            speed = data.get('speed', 0.0)
-            feat = [length, cap, speed]
-            
-            edge_list.append((ui, vi))
-            edge_attr_list.append(feat)
-            
-            # 양방향 추가
-            edge_list.append((vi, ui))
-            edge_attr_list.append(feat)
-            
-        self.edge_index = torch.tensor(edge_list, dtype=torch.long).t().to(self.device)
-        self.edge_attr = torch.tensor(edge_attr_list, dtype=torch.float32).to(self.device)
+        self.device = next(self.worker.parameters()).device
         
-        # Min-Max 정규화: 각 피처를 [0, 1] 범위로 스케일링
-        if self.edge_attr.size(0) > 0:
-            feat_min = self.edge_attr.min(dim=0, keepdim=True)[0]
-            feat_max = self.edge_attr.max(dim=0, keepdim=True)[0]
-            scale = (feat_max - feat_min).clamp(min=1e-8)
-            self.edge_attr = (self.edge_attr - feat_min) / scale
-
-        # 옵티마이저
+        # PPO 하이퍼파라미터
         self.lr = getattr(config, 'lr', 3e-4)
-        self.optimizer = optim.Adam(worker.parameters(), lr=self.lr)
-
-        # 하이퍼파라미터
-        self.gamma = 0.99
-        self.max_grad_norm = 0.5
-        
-        # [P1] GAE 및 Entropy Ablation 플래그
-        self.use_gae = getattr(config, 'use_gae', False)
+        self.gamma = getattr(config, 'gamma', 0.99)
         self.gae_lambda = getattr(config, 'gae_lambda', 0.95)
-        self.entropy_coeff = getattr(config, 'entropy_coeff', 0.0)
+        self.clip_ratio = getattr(config, 'clip_ratio', 0.2)
+        self.entropy_coeff = getattr(config, 'entropy_coeff', 0.01)
+        self.vf_coeff = getattr(config, 'vf_coeff', 0.5)
+        self.ppo_epochs = getattr(config, 'ppo_epochs', 4)
+        # 미니배치 크기: GNN forward OOM 방지 핵심
+        self.mini_batch_size = getattr(config, 'mini_batch_size', 128)
+        self.batch_size = getattr(config, 'num_pomo', 32)
         
-        # [P2] Cosine LR Scheduler
-        self.use_cosine_lr = getattr(config, 'use_cosine_lr', False)
-        self._episodes_total = getattr(config, 'episodes', 5000)
-        if self.use_cosine_lr:
-            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=self._episodes_total, eta_min=1e-5
-            )
-        else:
-            self.scheduler = None
-
-        # 저장 경로
+        self.optimizer = optim.Adam(self.worker.parameters(), lr=self.lr)
+        
         self.save_dir = getattr(config, 'save_dir', 'logs/rl_worker_stage')
         os.makedirs(self.save_dir, exist_ok=True)
-
-        # Manager 동결
-        if manager is not None:
-            manager.eval()
-            for p in manager.parameters():
-                p.requires_grad_(False)
-
-        # Worker 학습 활성화
-        worker.train()
-        for p in worker.parameters():
-            p.requires_grad_(True)
-
-    def _compute_gae(self, rewards: list, values: list) -> torch.Tensor:
-        """GAE(λ) 계산. 분산-편향 트레이드오프 제어."""
+        
+        # 정적 엣지 인덱스/속성 캐싱
+        edge_list = []
+        for u, v in env.G.edges():
+            ui = env.node_to_idx[u]
+            vi = env.node_to_idx[v]
+            edge_list.append((ui, vi))
+            edge_list.append((vi, ui))
+        self.edge_index = torch.tensor(edge_list, dtype=torch.long).t().to(self.device)
+        self.edge_attr = torch.zeros((self.edge_index.size(1), 1), dtype=torch.float32).to(self.device)
+        
+    def _compute_gae(self, rewards: List[float], values: List[float]) -> torch.Tensor:
+        """GAE (Generalized Advantage Estimation) 계산"""
         advantages = []
         gae = 0.0
-        next_value = 0.0  # 에피소드 종료이므로 terminal value = 0
-        
+        next_value = 0.0
         for r, v in zip(reversed(rewards), reversed(values)):
-            v_scalar = v.item()
-            delta = r + self.gamma * next_value - v_scalar
+            delta = r + self.gamma * next_value - v
             gae = delta + self.gamma * self.gae_lambda * gae
             advantages.insert(0, gae)
-            next_value = v_scalar
-            
+            next_value = v
         return torch.tensor(advantages, dtype=torch.float32, device=self.device)
 
-    def _run_batch_episodes(self, batch_size: int) -> list:
-        """B개 에피소드를 환경에서 동시에(병렬) 실행하고 각각의 결과를 반환.
-
-        HRLZoneEnv의 reset(batch_size=B) + step_batch(actions[B])를 활용하여
-        B개의 경로 탐색을 하나의 반복문으로 동시에 처리함.
-        POMO(Policy Optimization with Multiple Optima) 병렬화와 동일한 효과.
-        """
+    @torch.no_grad()
+    def _run_batch_episodes(self, batch_size: int) -> tuple:
+        """초고속 Rollout (No Grad) — 계산 그래프 없이 데이터만 수집."""
         state = self.env.reset(batch_size=batch_size)  # [B, N, 4]
         B = batch_size
         N = state.shape[1]
 
-        # 배치별 궤적 저장소
-        traj_log_probs  = [[] for _ in range(B)]  # 배치 b: 로그 확률 리스트
-        traj_values     = [[] for _ in range(B)]  # 배치 b: 가치 추정 리스트
-        traj_rewards    = [[] for _ in range(B)]  # 배치 b: 보상 리스트
-        traj_entropies  = [[] for _ in range(B)]  # 배치 b: 엔트로피 리스트
-        done_flags      = [False] * B             # 종료 여부
-
-        # 환경 공유 edge_index (동일 그래프, batch 인덱스로 구분)
-        # batch 텐서: [N*B] — 각 노드가 어느 그래프(에피소드)에 속하는지
-        batch_idx = torch.arange(B, device=self.device).repeat_interleave(N)
-
-        # 배치 edge_index: 각 에피소드의 엣지 인덱스를 i*N만큼 offset
-        batch_ei_list = []
-        for b in range(B):
-            batch_ei_list.append(self.edge_index + b * N)
-        batch_ei = torch.cat(batch_ei_list, dim=1)  # [2, E*B]
-
-        # 종료 시점의 info를 배치별로 보존 (step_batch가 매번 infos를 새로 생성하므로)
+        # 에피소드별 궤적 저장소
+        ep_states = [[] for _ in range(B)]
+        ep_actions = [[] for _ in range(B)]
+        ep_rewards = [[] for _ in range(B)]
+        ep_values = [[] for _ in range(B)]
+        ep_log_probs = [[] for _ in range(B)]
+        ep_masks = [[] for _ in range(B)]
+        
+        done_flags = [False] * B
         final_infos = [{} for _ in range(B)]
 
         while not all(done_flags):
-            # 현재 활성(미종료) 에피소드 인덱스
             active = [b for b in range(B) if not done_flags[b]]
-
-            # 활성 에피소드만 묶어서 GNN 한 번에 처리
-            active_states = torch.stack(
-                [state[b].to(self.device) for b in active]
-            )  # [|active|, N, 4]
-            active_masks = torch.stack(
-                [self.env.get_action_mask_batch()[b].to(self.device) for b in active]
-            )  # [|active|, N]
-
-            x_flat = active_states.view(-1, active_states.shape[-1])   # [|A|*N, 4]
-            mask_flat = active_masks.view(-1)                           # [|A|*N]
             A = len(active)
+
+            active_states = torch.stack([state[b].to(self.device) for b in active])
+            active_masks = torch.stack([self.env.get_action_mask_batch()[b].to(self.device) for b in active])
+
+            x_flat = active_states.view(-1, active_states.shape[-1])
+            mask_flat = active_masks.view(-1)
+            
             ai = torch.arange(A, device=self.device).repeat_interleave(N)
             aei = torch.cat([self.edge_index + i * N for i in range(A)], dim=1)
-            ae_attr = self.edge_attr.repeat(A, 1)
+            ae_attr = self.edge_attr.repeat(A, 1) if self.worker.use_edge_attr else None
 
-            probs_all, values_all, _ = self.worker(
-                x_flat, aei, batch=ai, neighbors_mask=mask_flat, edge_attr=ae_attr
-            )  # probs_all: [|A|*N], values_all: [|A|, 1]
-
-            # 각 활성 에피소드별 행동 샘플링
-            actions = []
+            # 모델 추론 (No Grad — 계산 그래프 없음)
+            probs_all, values_all, _ = self.worker(x_flat, aei, batch=ai, neighbors_mask=mask_flat, edge_attr=ae_attr)
+            
+            probs_b = probs_all.view(A, N)
+            values_b = values_all.view(A)
+            
+            actions_cpu = []
+            
             for i, b in enumerate(active):
-                node_probs = probs_all[i * N: (i + 1) * N]  # [N]
-                node_val   = values_all[i].squeeze()         # scalar
-                dist = Categorical(node_probs)
+                prob = probs_b[i]
+                v = values_b[i].item()
+                
+                dist = torch.distributions.Categorical(prob)
                 action = dist.sample()
-                lp = dist.log_prob(action)
-                ent = dist.entropy()
-
-                traj_log_probs[b].append(lp)
-                traj_values[b].append(node_val)
-                traj_entropies[b].append(ent)
-                actions.append(action.item())
-
-            # 종료된 에피소드는 dummy 0 행동 전달 (환경 내부에서 무시됨)
+                log_prob = dist.log_prob(action).item()
+                
+                act_item = action.item()
+                actions_cpu.append(act_item)
+                
+                # CPU 텐서로 저장 (GPU 메모리 절약)
+                ep_states[b].append(state[b].clone().cpu())
+                ep_actions[b].append(act_item)
+                ep_values[b].append(v)
+                ep_log_probs[b].append(log_prob)
+                ep_masks[b].append(self.env.get_action_mask_batch()[b].clone().cpu())
+            
             all_actions = []
             ai_ptr = 0
             for b in range(B):
                 if not done_flags[b]:
-                    all_actions.append(actions[ai_ptr])
+                    all_actions.append(actions_cpu[ai_ptr])
                     ai_ptr += 1
                 else:
-                    all_actions.append(0)  # dummy
+                    all_actions.append(0)
+            
+            # 환경 스텝
+            next_state, rewards, dones, infos = self.env.step_batch(torch.tensor(all_actions))
+            
+            for i, b in enumerate(active):
+                ep_rewards[b].append(rewards[b].item())
+                if dones[b].item():
+                    done_flags[b] = True
+                    final_infos[b] = infos[b]
+                else:
+                    state[b] = next_state[b]
 
-            next_state, reward_t, done_t, infos = self.env.step_batch(
-                torch.tensor(all_actions)
-            )
-
-            for b in range(B):
-                if not done_flags[b]:
-                    traj_rewards[b].append(reward_t[b].item())
-                    if done_t[b].item():
-                        done_flags[b] = True
-                        final_infos[b] = infos[b]  # 종료 시점의 info 보존
-
-            state = next_state
-
-        # 배치별 loss 계산
-        results = []
+        # GAE 계산 및 버퍼 취합
+        all_states = []
+        all_actions = []
+        all_old_log_probs = []
+        all_returns = []
+        all_advantages = []
+        all_masks = []
+        
+        batch_results = []
+        
         for b in range(B):
-            rewards_b  = traj_rewards[b]
-            values_b   = traj_values[b]
-            log_probs_b = traj_log_probs[b]
-            entropies_b = traj_entropies[b]
-
-            if self.use_gae:
-                advantages = self._compute_gae(rewards_b, values_b)
-                values_t = torch.stack(values_b).detach()
-                returns_t = advantages + values_t
-            else:
-                returns_list, R = [], 0.0
-                for r in reversed(rewards_b):
-                    R = r + self.gamma * R
-                    returns_list.insert(0, R)
-                returns_t = torch.tensor(returns_list, dtype=torch.float32, device=self.device)
-                advantages = returns_t - torch.stack(values_b).detach()
-
-            policy_loss = torch.tensor(0.0, device=self.device)
-            value_loss  = torch.tensor(0.0, device=self.device)
-            entropy_loss = torch.tensor(0.0, device=self.device)
-            for lp, val, ret, adv, ent in zip(log_probs_b, values_b, returns_t, advantages, entropies_b):
-                policy_loss  = policy_loss  + (-lp * adv.detach())
-                value_loss   = value_loss   + nn.functional.mse_loss(val, ret.detach())
-                entropy_loss = entropy_loss + ent
-
-            ep_loss = policy_loss + value_loss - self.entropy_coeff * entropy_loss
-            info_b  = final_infos[b]  # 종료 시점에 보존한 info 사용
-
-            results.append({
-                'loss':     ep_loss,
-                'reward':   sum(rewards_b),
-                'success':  1.0 if info_b.get('reason') == 'success' else 0.0,
-                'path_len': info_b.get('path_len', len(rewards_b)),
+            r_list = ep_rewards[b]
+            v_list = ep_values[b]
+            adv_tensor = self._compute_gae(r_list, v_list)
+            v_tensor = torch.tensor(v_list, dtype=torch.float32, device=self.device)
+            ret_tensor = adv_tensor + v_tensor
+            
+            batch_results.append({
+                'reward': sum(r_list),
+                'success': 1.0 if final_infos[b].get('reason') == 'success' else 0.0,
+                'path_len': final_infos[b].get('path_len', len(r_list)),
             })
+            
+            all_states.extend(ep_states[b])
+            all_actions.extend(ep_actions[b])
+            all_old_log_probs.extend(ep_log_probs[b])
+            all_returns.extend(ret_tensor.cpu().numpy())
+            all_advantages.extend(adv_tensor.cpu().numpy())
+            all_masks.extend(ep_masks[b])
+            
+        buffer = {}
+        buffer['states'] = torch.stack(all_states)
+        buffer['actions'] = torch.tensor(all_actions, dtype=torch.long)
+        buffer['old_log_probs'] = torch.tensor(all_old_log_probs, dtype=torch.float32)
+        buffer['returns'] = torch.tensor(all_returns, dtype=torch.float32)
+        buffer['advantages'] = torch.tensor(all_advantages, dtype=torch.float32)
+        buffer['masks'] = torch.stack(all_masks)
+        
+        # Advantage 정규화
+        adv = buffer['advantages']
+        if adv.numel() > 1:
+            buffer['advantages'] = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
+        else:
+            buffer['advantages'] = adv - adv.mean()
+        
+        return buffer, batch_results
 
-        return results
+    def _update_ppo(self, buffer: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """수집된 궤적(Buffer)을 미니배치 단위 PPO로 업데이트."""
+        states = buffer['states'].to(self.device)
+        actions = buffer['actions'].to(self.device)
+        old_log_probs = buffer['old_log_probs'].to(self.device)
+        returns = buffer['returns'].to(self.device)
+        advantages = buffer['advantages'].to(self.device)
+        masks = buffer['masks'].to(self.device)
+        
+        T_total = states.size(0)
+        N = states.size(1)
+        indices = np.arange(T_total)
+        
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy_loss = 0.0
+        num_updates = 0
+        
+        for _ in range(self.ppo_epochs):
+            np.random.shuffle(indices)
+            for start in range(0, T_total, self.mini_batch_size):
+                end = start + self.mini_batch_size
+                mb_idx = indices[start:end]
+                
+                mb_states = states[mb_idx]
+                mb_actions = actions[mb_idx]
+                mb_old_log_probs = old_log_probs[mb_idx]
+                mb_returns = returns[mb_idx]
+                mb_advantages = advantages[mb_idx]
+                mb_masks = masks[mb_idx]
+                
+                A = mb_states.size(0)
+                
+                x_flat = mb_states.view(-1, mb_states.shape[-1])
+                mask_flat = mb_masks.view(-1)
+                
+                ai = torch.arange(A, device=self.device).repeat_interleave(N)
+                aei = torch.cat([self.edge_index + i * N for i in range(A)], dim=1)
+                ae_attr = self.edge_attr.repeat(A, 1) if self.worker.use_edge_attr else None
+                
+                # GNN forward (미분 활성화)
+                probs_all, values_all, logits_all = self.worker(x_flat, aei, batch=ai, neighbors_mask=mask_flat, edge_attr=ae_attr)
+                
+                probs_b = probs_all.view(A, N)
+                values_b = values_all.view(A)
+                logits_b = logits_all.view(A, N)
+                
+                dist = torch.distributions.Categorical(logits=logits_b)
+                new_log_probs = dist.log_prob(mb_actions)
+                entropy = dist.entropy().mean()
+                
+                # PPO Clipped Objective
+                ratio = torch.exp(new_log_probs - mb_old_log_probs)
+                surr1 = ratio * mb_advantages
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * mb_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                value_loss = nn.functional.mse_loss(values_b, mb_returns)
+                
+                loss = policy_loss + self.vf_coeff * value_loss - self.entropy_coeff * entropy
+                
+                if torch.isnan(loss):
+                    print("⚠️ Loss is NaN! Skipping update.")
+                    continue
+                    
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.worker.parameters(), 0.5)
+                self.optimizer.step()
+                
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy_loss += entropy.item()
+                num_updates += 1
+                
+        return {
+            'policy_loss': total_policy_loss / max(num_updates, 1),
+            'value_loss': total_value_loss / max(num_updates, 1),
+            'entropy': total_entropy_loss / max(num_updates, 1),
+        }
 
     def train(self, episodes: int) -> None:
-        """메인 학습 루프 (POMO 배치 병렬 실행).
-
-        매 스텝마다 num_pomo(K)개의 에피소드를 동시에 실행하고
-        K개의 gradient를 평균 합산하여 1회 업데이트.
-        총 업데이트 횟수 = episodes // K 회.
-        """
+        """메인 학습 루프: Rollout(No Grad) → PPO Update(Mini-batch)."""
         from collections import deque
-
         recent_rewards = deque(maxlen=100)
         recent_success = deque(maxlen=100)
-        recent_lengths = deque(maxlen=100)
-        best_success_rate = 0.0
-        K = self.accum_batch  # POMO 배치 크기 (동시 에피소드 수)
+        
+        best_reward = -float('inf')
+        B = self.batch_size
+        num_updates = max(1, episodes // B)
+        
+        print(f"📋 HRL Phase 1: Worker PPO 학습 (batch={B}, mini_batch={self.mini_batch_size}, ppo_epochs={self.ppo_epochs})")
+        
+        with tqdm(total=num_updates, desc="Phase 1", ncols=120) as pbar:
+            for ep in range(1, num_updates + 1):
+                buffer, batch_results = self._run_batch_episodes(B)
+                
+                for r in batch_results:
+                    recent_rewards.append(r['reward'])
+                    recent_success.append(r['success'])
+                    
+                loss_info = self._update_ppo(buffer)
+                
+                avg_reward = np.mean(recent_rewards)
+                avg_success = np.mean(recent_success)
+                
+                pbar.update(1)
+                pbar.set_postfix({
+                    'SR': f"{avg_success*100:.1f}%",
+                    'Rw': f"{avg_reward:.1f}",
+                    'PLoss': f"{loss_info['policy_loss']:.3f}",
+                    'VLoss': f"{loss_info['value_loss']:.3f}"
+                })
+                
+                if ep % 50 == 0:
+                    pbar.write(
+                        f'[Step {ep:4d}/{num_updates}] SR={avg_success*100:5.1f}% | '
+                        f'Rw={avg_reward:6.1f} | PLoss={loss_info["policy_loss"]:.3f}'
+                    )
+                    
+                # Best 모델 저장
+                if ep % 50 == 0 and avg_reward > best_reward and len(recent_success) >= 50:
+                    best_reward = avg_reward
+                    torch.save(self.worker.state_dict(), os.path.join(self.save_dir, 'best.pt'))
 
-        # 런타임 설정 저장
-        ablation_flags = {
-            'zone_progress_reward': getattr(self.env, 'zone_progress_reward', False),
-            'use_gae': self.use_gae,
-            'gae_lambda': self.gae_lambda if self.use_gae else None,
-            'entropy_coeff': self.entropy_coeff,
-            'use_cosine_lr': self.use_cosine_lr,
-            'pomo_batch_size': K,
-        }
-        runtime_config = {
-            'stage': 'worker (HRL Phase 1)',
-            'lr': self.lr,
-            'episodes': episodes,
-            'pomo_batch': K,
-            'gamma': self.gamma,
-            'ablation': ablation_flags,
-            'save_dir': self.save_dir,
-            'started_at': datetime.now().isoformat(timespec='seconds'),
-        }
-        with open(os.path.join(self.save_dir, 'runtime_config.json'), 'w') as f:
-            json.dump(runtime_config, f, indent=2)
-
-        # 총 업데이트 스텝 수 (K개 에피소드 단위)
-        total_steps = max(1, episodes // K)
-        ep_counter = 0  # 완료된 에피소드 수 추적
-        ema_succ = 0.0
-
-        pbar = tqdm(range(1, total_steps + 1), desc="Phase 1", ncols=120)
-
-        for step in pbar:
-            self.optimizer.zero_grad()
-
-            # K개 에피소드 동시 병렬 실행
-            batch_results = self._run_batch_episodes(batch_size=K)
-
-            # 배치 내 모든 에피소드의 loss를 평균 합산하여 역전파
-            total_loss = torch.stack([r['loss'] for r in batch_results]).mean()
-            total_loss.backward()
-
-            nn.utils.clip_grad_norm_(self.worker.parameters(), max_norm=self.max_grad_norm)
-            self.optimizer.step()
-
-            # [P2] LR Scheduler Step (매 업데이트마다)
-            if self.scheduler is not None:
-                self.scheduler.step()
-
-            # 로깅 (배치 내 모든 에피소드 결과 반영)
-            for r in batch_results:
-                recent_rewards.append(r['reward'])
-                recent_success.append(r['success'])
-                recent_lengths.append(r['path_len'])
-
-            ep_counter += K
-            ema_succ = np.mean(recent_success) * 100
-            pbar.set_postfix({
-                'Step': f'{step}/{total_steps}',
-                'SR': f'{ema_succ:5.1f}%',
-                'Rw': f'{np.mean(recent_rewards):6.1f}',
-                'Len': f'{np.mean(recent_lengths):5.1f}',
-            })
-
-            # 100 스텝마다 로그 출력
-            if step % 100 == 0:
-                pbar.write(
-                    f'[Step {step:4d}/{total_steps}] SR={ema_succ:5.1f}% | '
-                    f'Rw={np.mean(recent_rewards):6.1f} | '
-                    f'Len={np.mean(recent_lengths):5.1f}'
-                )
-
-            # Best 모델 저장
-            if ema_succ > best_success_rate and len(recent_success) >= 50:
-                best_success_rate = ema_succ
-                self._save_checkpoint('best.pt', ep_counter, ema_succ)
-
-        self._save_checkpoint('final.pt', ep_counter, ema_succ)
-        pbar.write(f'✅ HRL Worker Phase 1 학습 완료! Best EMA Success: {best_success_rate:.1f}%')
-
-    def _save_checkpoint(self, filename: str, ep: int, metric: float) -> None:
-        payload = {
-            'epoch': ep,
-            'stage': 'worker_hrl_phase1',
-            'worker_state': self.worker.state_dict(),
-            'metric': metric,
-            'metric_name': 'success_rate_ema',
-        }
-        torch.save(payload, os.path.join(self.save_dir, filename))
+        # Final 저장
+        torch.save(self.worker.state_dict(), os.path.join(self.save_dir, 'best.pt'))
+        print(f'✅ HRL Worker Phase 1 학습 완료! Best Reward: {best_reward:.1f}')

@@ -9,19 +9,26 @@ from typing import Dict, List, Tuple, Optional
 from src.envs.disaster_map import DisasterMap
 
 
-class HRLZoneEnv:
+class WorkerEnv:
     """
     Phase 1: 재난이 없는 상태에서의 HRL 길찾기 검증용 환경
     - Manager: Zone Graph에서 A* 알고리즘으로 최단 Zone 시퀀스 일괄 생성 (Dummy)
     - Worker: Action Masking + Sliding Window 방식으로 다음 Zone 타겟만 제공받음
     - POMO 배치 병렬 처리 지원: reset(batch_size=N)으로 N개 에피소드 동시 진행
     """
-    def __init__(self, node_file: str, net_file: str, 
-                 zone_json: str = 'data/node_to_zone_k30.json', 
-                 zone_graph_json: str = 'data/zone_graph_k30.json',
-                 masking_mode: str = 'hard',
-                 use_pbrs: bool = False,
-                 subgoal_mode: str = 'zone'):
+    def __init__(self, 
+                 node_file: str,
+                 net_file: str,
+                 zone_json: str = 'data/grid_Anaheim_node_to_zone.json',
+                 zone_graph_json: str = 'data/grid_Anaheim_zone_graph.json',
+                 c_max: int = 20,
+                 subgoal_mode: str = 'zone', # 'zone' or 'node'
+                 masking_mode: str = 'hard', # 'hard', 'hard_full_seq', 'soft_curr_next', 'soft_flex'
+                 oob_penalty: float = -1.0,
+                 use_pbrs: bool = True,
+                 use_relative_hop: bool = False,
+                 use_is_visited: bool = False,
+                 device: str = 'cpu'):
         # 1. 원본 맵 로드
         self.dm = DisasterMap(node_file, net_file)
         self.G = self.dm.graph
@@ -94,7 +101,6 @@ class HRLZoneEnv:
         self.GOAL_REWARD = 50.0
         self.STEP_PENALTY = -0.1
         self.INVALID_PENALTY = -10.0
-        self.OOB_PENALTY = -0.5       # [v3] Zone 이탈 페널티 (soft 모드 전용)
         self.MAX_STEPS = 200
         self.zone_progress_reward = False  # [P0] Ablation 제어 플래그
         
@@ -104,7 +110,12 @@ class HRLZoneEnv:
         # soft_curr_next: 물리적 제약 없음, 현재/다음 Zone 이탈 시 OOB 페널티
         # soft_flex: 물리적 제약 없음, 전체 시퀀스 이탈 시 OOB 페널티
         self.masking_mode = masking_mode
+        self.oob_penalty = oob_penalty
         self.use_pbrs = use_pbrs
+        self.use_relative_hop = use_relative_hop
+        self.use_is_visited = use_is_visited
+
+        self.device = torch.device(device)
         self.subgoal_mode = subgoal_mode  # 'zone' or 'node'
         
         # 배치 상태 관리 (reset에서 초기화)
@@ -117,6 +128,7 @@ class HRLZoneEnv:
         self.node_seq_idxs = None   # [B] 현재 node sequence 인덱스
         self.steps_count = None     # [B] 스텝 카운터
         self.dones = None           # [B] 종료 플래그
+        self.visited_nodes = None   # [B, N] 방문 이력
         
     def reset(self, batch_size: int = 1) -> torch.Tensor:
         """배치 에피소드 초기화 및 Manager Zone 시퀀스 생성.
@@ -169,6 +181,10 @@ class HRLZoneEnv:
             sub_idx = min(len(nseq) - 1, 3)
             self.subgoal_nodes[b] = self.node_to_idx[nseq[sub_idx]]
             
+        self.visited_nodes = torch.zeros(self.batch_size, self.num_nodes, dtype=torch.float32, device=self.device)
+        for b in range(self.batch_size):
+            self.visited_nodes[b, int(self.curr_nodes[b].item())] = 1.0
+            
         return self._get_state_batch()
     
     def _get_current_and_next_zone_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -186,10 +202,11 @@ class HRLZoneEnv:
         return curr_z, next_z
     
     def _get_state_batch(self) -> torch.Tensor:
-        """배치 Worker 입력 상태 구성 [B, N, 4]."""
+        """배치 Worker 입력 상태 구성 [B, N, D]."""
         B = self.batch_size
         N = self.num_nodes
-        state = torch.zeros(B, N, 4)
+        state_dim = 5 if self.use_is_visited else 4
+        state = torch.zeros(B, N, state_dim)
         
         curr_z, next_z = self._get_current_and_next_zone_batch()
         nz_tensor = self._node_zone_tensor  # [N]
@@ -207,11 +224,26 @@ class HRLZoneEnv:
                 # is_next_target: 서브골 Node 1개만 활성화
                 state[b, int(self.subgoal_nodes[b].item()), 2] = 1.0
                 
-            # hop_dist (정규화: 25.0 대신 맵의 실제 max_hop 사용)
+            # hop_dist
             tgt_idx = int(self.target_nodes[b].item())
             hops = torch.from_numpy(self.hop_matrix[:, tgt_idx].copy()).float()
-            hops = torch.clamp(hops, max=100.0) / max(self.max_hop, 1.0)
-            state[b, :, 3] = hops
+            
+            if self.use_relative_hop:
+                curr_idx = int(self.curr_nodes[b].item())
+                curr_dist = float(self.hop_matrix[curr_idx, tgt_idx])
+                # 상대적 홉 기울기: (현재 위치에서의 거리 - 임의 노드에서의 거리)
+                # 정규화: 범위 클리핑 (-5 to 5) 후 / 5.0
+                rel_hops = (curr_dist - hops)
+                rel_hops = torch.clamp(rel_hops, -5.0, 5.0) / 5.0
+                state[b, :, 3] = rel_hops
+            else:
+                hops = torch.clamp(hops, max=100.0) / max(self.max_hop, 1.0)
+                state[b, :, 3] = hops
+                
+            # is_visited 채널 (use_is_visited 활성화 시)
+            if self.use_is_visited:
+                state[b, :, 4] = self.visited_nodes[b]
+
             
         return state
     
@@ -340,10 +372,12 @@ class HRLZoneEnv:
                 if action_zone not in allowed:
                     is_oob = True
             
-            # 이동 실행
+            # Update current nodes
             self.curr_nodes[b] = action_idx
+            if not self.dones[b]:
+                self.visited_nodes[b, action_idx] = 1.0
             
-            # Sliding Window 업데이트 (다음 Zone 진입 시 - Zone 모드이거나 soft_curr_next 마스킹을 위해 항상 추적)
+            # 1) Transition Info (다음 Zone 진입 시 - Zone 모드이거나 soft_curr_next 마스킹을 위해 항상 추적)
             if action_zone == int(next_z[b].item()) and int(self.zone_seq_idxs[b].item()) + 1 < len(self.zone_sequences[b]):
                 self.zone_seq_idxs[b] += 1
                 # [P0] Zone 전환 중간 보상 (Zone 모드에서만)
@@ -374,7 +408,7 @@ class HRLZoneEnv:
                 rewards[b] += self.STEP_PENALTY
                 # [v3] OOB 페널티 추가 (soft 모드에서 Zone 이탈 시)
                 if is_oob:
-                    rewards[b] += self.OOB_PENALTY
+                    rewards[b] += self.oob_penalty
         
         # [v3 PBRS] 이동 후 hop_dist 차이 기반 Dense Reward 추가
         if self.use_pbrs and prev_hop_dists is not None:

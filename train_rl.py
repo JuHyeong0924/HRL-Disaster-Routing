@@ -25,10 +25,11 @@ from src.models.worker import Worker
 from src.trainers.worker_trainer import HRLWorkerTrainer  # [HRL Phase 1]
 
 # [Manager v2] 비자기회귀 + PPO + PBRS Re-planning
-from src.models.reactive_manager import ReactiveManager
-from src.trainers.manager_ppo_trainer import ManagerPPOTrainer
-from src.envs.hrl_closed_loop_env import HRLClosedLoopEnv
-from src.envs.hrl_env import HRLZoneEnv
+from src.models.manager import Manager
+from src.models.manager import Manager
+from src.trainers.manager_trainer import ManagerTrainer
+from src.envs.manager_env import ManagerEnv
+from src.envs.worker_env import WorkerEnv
 
 
 class Config:
@@ -128,16 +129,18 @@ def _build_config(args, loaded_checkpoint_paths):
 
     Why: Trainer에 전달할 학습 설정을 일관된 형식으로 묶기 위함.
     """
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
-    run_label = f"{timestamp}_{args.stage}_B{args.batch_size}"
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H%M%S')
+    exp_suffix = f"_{args.exp_name}" if getattr(args, 'exp_name', None) else ""
+    run_label = f"{timestamp}_{args.stage}_B{args.batch_size}{exp_suffix}"
     stage_base = {
         'worker': os.path.join('logs', 'rl_worker_stage'),
-        'manager_v2': os.path.join('logs', 'rl_manager_v2'),
+        'manager': os.path.join('logs', 'rl_manager_stage'),
     }.get(args.stage, os.path.join('logs', 'rl_finetune'))
     save_dir = os.path.join(stage_base, run_label)
     return Config(
         lr=args.lr,
         num_pomo=args.batch_size,
+        mini_batch_size=getattr(args, "mini_batch_size", 256),
         episodes=args.episodes,
         save_dir=save_dir,
         stage=args.stage,
@@ -159,27 +162,23 @@ def _build_config(args, loaded_checkpoint_paths):
 
 def _init_worker_env(args):
     """Phase 1 Worker 학습용 HRLZoneEnv 환경 초기화."""
-    import glob
-    # 맵별 Zone 파일 자동 탐색: data/node_to_zone_{map}_k*.json 우선, 없으면 기본 k30
-    zone_json = 'data/node_to_zone_k30.json'
-    zone_graph_json = 'data/zone_graph_k30.json'
-    map_zone_files = glob.glob(f"data/node_to_zone_{args.map}_k*.json")
-    if map_zone_files:
-        zone_json = sorted(map_zone_files)[-1]  # 가장 큰 K 사용
-        k_val = zone_json.split('_k')[-1].replace('.json', '')
-        zone_graph_json = f"data/zone_graph_{args.map}_k{k_val}.json"
-        print(f"   Zone 파일: {zone_json} (맵별 자동 탐색)")
-    env = HRLZoneEnv(
+    zone_json = f'data/grid_{args.map}_node_to_zone.json'
+    zone_graph_json = f'data/grid_{args.map}_zone_graph.json'
+    print(f"   Zone 파일: {zone_json} (Grid 분할)")
+    env = WorkerEnv(
         f"data/{args.map}_node.tntp",
         f"data/{args.map}_net.tntp",
         zone_json=zone_json,
         zone_graph_json=zone_graph_json,
-        masking_mode=getattr(args, 'masking_mode', 'hard'),
+        masking_mode=getattr(args, 'masking_mode', 'soft_flex'),
         use_pbrs=getattr(args, 'use_pbrs', False),
-        subgoal_mode=getattr(args, 'subgoal_mode', 'default'),
+        subgoal_mode=getattr(args, 'subgoal_mode', 'zone'),
+        use_relative_hop=getattr(args, 'use_relative_hop', False),
+        use_is_visited=getattr(args, 'use_is_visited', False),
+        oob_penalty=getattr(args, 'oob_penalty', -1.0)
     )
     env.zone_progress_reward = getattr(args, 'zone_progress_reward', False)
-    print(f"   Env: masking_mode={env.masking_mode}, use_pbrs={env.use_pbrs}, subgoal_mode={getattr(args, 'subgoal_mode', 'default')}")
+    print(f"   Env: masking_mode={env.masking_mode}, use_pbrs={env.use_pbrs}, subgoal_mode={getattr(args, 'subgoal_mode', 'zone')}")
     return env
 
 
@@ -217,16 +216,21 @@ def _run_worker_stage(args) -> None:
     num_layers = getattr(args, 'num_layers', 2)
     use_jk_net = getattr(args, 'use_jk_net', False)
     use_edge_attr = getattr(args, 'use_edge_attr', False)
+    use_is_visited = getattr(args, 'use_is_visited', False)
+    use_global_pool = getattr(args, 'use_global_pool', False)
+    node_dim = 5 if use_is_visited else 4
     worker = Worker(
-        node_dim=4,
+        node_dim=node_dim,
         hidden_dim=args.hidden_dim,
         num_layers=num_layers,
-        dropout=0.2,
-        use_checkpoint=True,  # Worker stage에서는 Gradient Checkpointing 활성
+        dropout=0.0,
+        use_checkpoint=False,
         use_jk_net=use_jk_net,
         use_edge_attr=use_edge_attr,
+        use_is_visited=use_is_visited,
+        use_global_pool=use_global_pool,
     ).to(device)
-    print(f"   Worker: node_dim=4, hidden_dim={args.hidden_dim}, num_layers={num_layers}, use_jk_net={use_jk_net}, use_edge_attr={use_edge_attr}")
+    print(f"   Worker: node_dim={node_dim}, hidden_dim={args.hidden_dim}, num_layers={num_layers}, use_is_visited={use_is_visited}, use_global_pool={use_global_pool}")
 
     # Worker는 scratch에서 시작
     print("📋 HRL Phase 1: Worker를 scratch에서 학습합니다.")
@@ -242,10 +246,10 @@ def _run_worker_stage(args) -> None:
     print(f"   저장 위치: {config.save_dir}")
 
 
-def _run_manager_v2_stage(args) -> None:
-    """Phase 2: ReactiveManager PPO 학습 (Closed-loop + 동결된 Worker)."""
+def _run_manager_stage(args) -> None:
+    """Phase 2: Manager PPO 학습 (Closed-loop + 동결된 Worker)."""
     print(f"\n{'='*60}")
-    print(f"🚀 Stage [MANAGER_V2] 학습 시작 ({args.episodes} episodes)")
+    print(f"🚀 Stage [MANAGER] 학습 시작 ({args.episodes} episodes)")
     print(f"{'='*60}")
 
     device = _get_device()
@@ -255,42 +259,48 @@ def _run_manager_v2_stage(args) -> None:
     num_layers = getattr(args, 'num_layers', 2)
     use_jk_net = getattr(args, 'use_jk_net', False)
     use_edge_attr = getattr(args, 'use_edge_attr', False)
+    use_is_visited = getattr(args, 'use_is_visited', False)
+    use_global_pool = getattr(args, 'use_global_pool', False)
+    node_dim = 5 if use_is_visited else 4
     worker = Worker(
-        node_dim=4,
+        node_dim=node_dim,
         hidden_dim=args.hidden_dim,
         num_layers=num_layers,
-        dropout=0.2,
-        use_checkpoint=False,  # Manager stage에서 Worker는 동결
+        dropout=0.0,
+        use_checkpoint=False,
         use_jk_net=use_jk_net,
         use_edge_attr=use_edge_attr,
+        use_is_visited=use_is_visited,
+        use_global_pool=use_global_pool,
     ).to(device)
 
-    wkr_ckpt = _get_latest_ckpt(os.path.join('logs', 'rl_worker_stage'), 'best.pt')
+    wkr_ckpt = args.worker_ckpt if getattr(args, 'worker_ckpt', None) else _get_latest_ckpt(os.path.join('logs', 'rl_worker_stage'), 'best.pt')
     if not _load_worker_checkpoint(wkr_ckpt, worker, device, loaded_checkpoint_paths):
         print("⚠️ Worker 체크포인트 없음. Worker는 랜덤 초기 상태로 사용됩니다.")
 
-    # ReactiveManager 생성
-    node_dim = 4  # is_curr, is_tgt, hop_dist, degree
-    reactive_mgr = ReactiveManager(
+    # Manager 생성
+    node_dim = 4  # is_curr, is_tgt, is_visited, zone_hop_dist
+    manager_model = Manager(
         node_dim=node_dim, hidden_dim=args.hidden_dim,
-        num_layers=num_layers, dropout=0.2,
+        num_layers=num_layers, dropout=0.0,
     ).to(device)
-    print(f"📋 Manager v2: ReactiveManager (node_dim={node_dim}, hidden={args.hidden_dim})")
-    print(f"   파라미터 수: {sum(p.numel() for p in reactive_mgr.parameters()):,}")
+    print(f"📋 Manager v2: Manager (node_dim={node_dim}, hidden={args.hidden_dim})")
+    print(f"   파라미터 수: {sum(p.numel() for p in manager_model.parameters()):,}")
 
     # Closed-loop 환경 생성
     node_file = f"data/{args.map}_node.tntp"
     net_file = f"data/{args.map}_net.tntp"
-    cl_env = HRLClosedLoopEnv(
-        node_file=node_file, net_file=net_file,
-        worker=worker, k_hop=5, c_max=8,
+    cl_env = ManagerEnv(
+        node_file=node_file,
+        net_file=net_file,
+        worker=worker, c_max=20,
         device=str(device),
     )
 
     # PPO Trainer 생성 및 학습
     config = _build_config(args, loaded_checkpoint_paths)
     os.makedirs(config.save_dir, exist_ok=True)
-    ppo_trainer = ManagerPPOTrainer(cl_env, reactive_mgr, config)
+    ppo_trainer = ManagerTrainer(cl_env, manager_model, config)
     ppo_trainer.train(args.episodes)
 
     print(f"\n✅ Stage [MANAGER_V2] 학습 완료!")
@@ -323,8 +333,8 @@ def train_rl(args):
 
     if args.stage == "worker":
         _run_worker_stage(args)
-    elif args.stage == "manager_v2":
-        _run_manager_v2_stage(args)
+    elif args.stage == "manager":
+        _run_manager_stage(args)
     else:
         raise ValueError(f"Unknown stage: {args.stage}")
 
@@ -337,13 +347,16 @@ if __name__ == "__main__":
                         help="총 에피소드 수 (--steps 미지정 시 사용, 기본 5000)")
     parser.add_argument("--steps", type=int, default=None,
                         help="총 gradient 업데이트 스텝 수 (지정 시 --episodes보다 우선)")
-    parser.add_argument("--batch_size", "--num_pomo", type=int, default=16,
-                        help="배치 크기: 스텝당 동시 실행 에피소드 수 (기본 16)")
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="배치 크기: 스텝당 동시 실행 에피소드 수 (기본 32)")
+    parser.add_argument("--mini_batch_size", type=int, default=256,
+                        help="PPO 미니배치 크기 (기본 256)")
     parser.add_argument(
         "--stage",
+        type=str,
         default="worker",
-        choices=["worker", "manager_v2"],
-        help="학습 단계: worker(Phase 1), manager_v2(Phase 2 비자기회귀+PPO)",
+        choices=["worker", "manager", "all"],
+        help="학습 단계: worker(Phase 1), manager(Phase 2 비자기회귀+PPO)",
     )
     parser.add_argument("--wkr_lr_floor", type=float, default=1e-5,
                         help="Worker 최소 학습률 (기본 1e-5)")
@@ -367,7 +380,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_cosine_lr", action="store_true",
                         help="Cosine LR Scheduler 사용")
     # [Worker 환경/모델 제어]
-    parser.add_argument("--masking_mode", type=str, default="hard",
+    parser.add_argument("--masking_mode", type=str, default="soft_curr_next",
                         choices=["hard", "hard_full_seq", "soft_curr_next", "soft_flex"],
                         help="Action Masking 모드 (hard/hard_full_seq/soft_curr_next/soft_flex)")
     parser.add_argument("--use_pbrs", action="store_true",
@@ -381,6 +394,14 @@ if __name__ == "__main__":
     parser.add_argument("--subgoal_mode", type=str, default="zone",
                         choices=["zone", "node"],
                         help="Manager Subgoal 모드 (zone / node)")
+    
+    # Ablation Study Arguments
+    parser.add_argument("--use_relative_hop", action="store_true")
+    parser.add_argument("--oob_penalty", type=float, default=-1.0)
+    parser.add_argument("--use_is_visited", action="store_true", help="Worker에 방문 노드 이력 상태 채널 추가 (5-dim)")
+    parser.add_argument("--use_global_pool", action="store_true", help="Worker Critic에 Global Mean Pooling 추가")
+    parser.add_argument("--exp_name", type=str, default=None, help="Experiment name for logging directory")
+    parser.add_argument("--worker_ckpt", type=str, default=None, help="Path to specific worker checkpoint")
 
     args = parser.parse_args()
     train_rl(args)
