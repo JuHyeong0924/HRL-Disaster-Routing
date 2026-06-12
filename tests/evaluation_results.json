@@ -1,0 +1,66 @@
+{
+    "anaheim": {
+        "Flat RL": {
+            "SR": 0.8,
+            "PLR": 1.0584415584415585,
+            "Timeout": 0.0,
+            "Loop": 0.2,
+            "Revisits": 0.084
+        },
+        "Proposed HRL": {
+            "SR": 1.0,
+            "PLR": 1.122567287784679,
+            "Timeout": 0.0,
+            "Loop": 0.0,
+            "Revisits": 0.0
+        }
+    },
+    "berlin-friedrichshain": {
+        "Flat RL": {
+            "SR": 1.0,
+            "PLR": 1.0,
+            "Timeout": 0.0,
+            "Loop": 0.0,
+            "Revisits": 0.0
+        },
+        "Proposed HRL": {
+            "SR": 1.0,
+            "PLR": 1.0857142857142859,
+            "Timeout": 0.0,
+            "Loop": 0.0,
+            "Revisits": 0.0
+        }
+    },
+    "berlin-mitte": {
+        "Flat RL": {
+            "SR": 1.0,
+            "PLR": 1.0095238095238095,
+            "Timeout": 0.0,
+            "Loop": 0.0,
+            "Revisits": 0.0
+        },
+        "Proposed HRL": {
+            "SR": 0.6,
+            "PLR": 1.2608417240770182,
+            "Timeout": 0.0,
+            "Loop": 0.4,
+            "Revisits": 0.096
+        }
+    },
+    "chicago": {
+        "Flat RL": {
+            "SR": 1.0,
+            "PLR": 1.008,
+            "Timeout": 0.0,
+            "Loop": 0.0,
+            "Revisits": 0.0
+        },
+        "Proposed HRL": {
+            "SR": 1.0,
+            "PLR": 1.1383116883116884,
+            "Timeout": 0.0,
+            "Loop": 0.0,
+            "Revisits": 0.0
+        }
+    }
+}

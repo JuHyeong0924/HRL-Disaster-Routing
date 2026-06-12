@@ -28,7 +28,9 @@ class WorkerEnv:
                  use_pbrs: bool = True,
                  use_relative_hop: bool = False,
                  use_is_visited: bool = False,
+                 baseline: bool = False,
                  device: str = 'cpu'):
+        self.baseline = baseline
         # 1. 원본 맵 로드
         self.dm = DisasterMap(node_file, net_file)
         self.G = self.dm.graph
@@ -217,12 +219,13 @@ class WorkerEnv:
             # is_tgt
             state[b, self.target_nodes[b], 1] = 1.0
             
-            if self.subgoal_mode == 'zone':
-                # is_next_zone: 해당 배치의 다음 목표 Zone에 속한 노드들
-                state[b, :, 2] = (nz_tensor == next_z[b]).float()
-            elif self.subgoal_mode == 'node':
-                # is_next_target: 서브골 Node 1개만 활성화
-                state[b, int(self.subgoal_nodes[b].item()), 2] = 1.0
+            if not self.baseline:
+                if self.subgoal_mode == 'zone':
+                    # is_next_zone: 해당 배치의 다음 목표 Zone에 속한 노드들
+                    state[b, :, 2] = (nz_tensor == next_z[b]).float()
+                elif self.subgoal_mode == 'node':
+                    # is_next_target: 서브골 Node 1개만 활성화
+                    state[b, int(self.subgoal_nodes[b].item()), 2] = 1.0
                 
             # hop_dist
             tgt_idx = int(self.target_nodes[b].item())

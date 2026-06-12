@@ -1,41 +1,40 @@
-\begin{table}[t]
+\begin{table}[!ht]
   \centering
-  \caption{Hyperparameters and Training Settings}
+  \caption{Hyperparameters and PPO Training Settings}
   \label{tab:hyperparameters}
   \begin{tabular}{l l}
     \toprule
-    \textbf{Parameter} & \textbf{Value} \\
+    Parameter & Value \\
     \midrule
-    \multicolumn{2}{l}{\textit{Architecture}} \\
+    \multicolumn{2}{l}{\textit{Architecture (Dual-Agent)}} \\
+    \quad Manager Node Feature Dim & 7 (Incl. Density \& Compass) \\
+    \quad Worker Node Feature Dim & 4 (Incl. Subgoal Beacon) \\
     \quad Hidden Dimension ($H$) & 256 \\
-    \quad Manager Encoder Layers & 3 \\
-    \quad Manager Attention Heads & 4 \\
-    \quad Worker GATv2 Layers & 3 (Residual) \\
-    \quad Worker Scorer Heads & 4 \\
-    \quad Laplacian PE Eigenvectors ($k$) & 8 \\
-    \quad Dropout & 0.2 \\
+    \quad GATv2 Layers (Both Agents) & 3 (with Residual) \cite{brody2022how} \\
+    \quad GATv2 Attention Heads & 4 \\
+    \quad Critic Network & 2-Layer MLP \\
     \midrule
-    \multicolumn{2}{l}{\textit{SL Pre-training}} \\
-    \quad Epochs & 20 \\
-    \quad Batch Size & 32 \\
-    \quad Teacher Forcing Ratio & $1.0 \to 0.0$ \\
+    \multicolumn{2}{l}{\textit{RL Training (Decoupled PPO)}} \\
+    \quad RL Algorithm & Proximal Policy Optimization \\
+    \quad Parallel Environments (Batch) & 32 \\
+    \quad Training Episodes (per stage) & 5000 \\
+    \quad Learning Rate ($\eta$) & $3 \times 10^{-4}$ \\
+    \quad Optimizer & Adam \\
+    \quad PPO Clip Range ($\epsilon$) & 0.2 \\
+    \quad PPO Entropy Coefficient & 0.01 \\
+    \quad Manager Max Turns & 100 \\
+    \quad Worker Max Steps (per turn) & 100 \\
     \midrule
-    \multicolumn{2}{l}{\textit{RL Fine-tuning (Phase 1 APTE)}} \\
-    \quad Learning Rate & 0.0001 \\
-    \quad POMO Batch Size & 32 \\
-    \quad Episodes & 10000 \\
-    \quad Max Rollout Steps & 400 \\
-    \quad LR Schedule & CosineAnnealing \\
-    \quad LR Floor ($\eta_{\min}$) & 1e-05 \\
-    \midrule
-    \multicolumn{2}{l}{\textit{Reward Function}} \\
-    \quad Goal Reward ($R_3$) & 40.0 \\
-    \quad Fail Penalty ($P_3$) & -20.0 \\
-    \quad PBRS Scale & 6.5 \\
+    \multicolumn{2}{l}{\textit{Hierarchical Reward Structure}} \\
+    \quad \textbf{[Manager Rewards]} & \\
     \quad PBRS Discount ($\gamma$) & 0.99 \\
-    \quad Efficiency Max ($R_4$) & 8.0 \\
-    \quad Loop Limit & 6 \\
-    \quad Stagnation Patience & 24 \\
+    \quad PBRS Scaling Factor & 0.5 \\
+    \quad Turn Penalty & -0.5 \\
+    \quad Zone Revisit Penalty & -5.0 \\
+    \quad Worker Step Penalty & $-0.1 \times (\text{steps})^{1.5}$ \\
+    \quad \textbf{[Worker Rewards]} & \\
+    \quad Subgoal Boundary Reached & +10.0 \\
+    \quad Micro-Step Penalty & -0.1 \\
     \bottomrule
   \end{tabular}
 \end{table}

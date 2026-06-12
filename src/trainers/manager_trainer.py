@@ -80,7 +80,8 @@ class RolloutBuffer:
 
         if len(advantages) > 1:
             self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
-            self.returns = (self.returns - self.returns.mean()) / (self.returns.std() + 1e-8)
+            # 🚨 [삭제] 아래 self.returns 정규화 코드는 무조건 삭제하세요!
+            # self.returns = (self.returns - self.returns.mean()) / (self.returns.std() + 1e-8)
 
     def clear(self) -> None:
         self.states.clear()
@@ -113,6 +114,7 @@ class ManagerTrainer:
         self.clip_range = getattr(config, 'clip_range', 0.2)
         self.n_epochs = getattr(config, 'n_epochs', 4)
         self.value_coeff = getattr(config, 'value_coeff', 0.5)
+        self.entropy_coeff = getattr(config, 'entropy_coeff', 0.0)
         
         # [수정] 사용자님의 제안대로 SAC 스타일 자동 튜닝을 복구하되,
         # 이산 행동 공간에 맞게 target_entropy를 양수로 설정. (마스킹된 유효 액션 3~5개 기준 적절한 양수인 0.5로 설정)
@@ -281,22 +283,19 @@ class ManagerTrainer:
                 critic_loss = nn.functional.mse_loss(value.squeeze(-1) if value.dim() > 1 else value, batch_data.target_return)
 
                 # 자동 alpha 적용
-                alpha = self.log_alpha.exp().detach()
-                loss = actor_loss + self.value_coeff * critic_loss - alpha * entropy
+                # alpha = self.log_alpha.exp().detach()
+                loss = actor_loss + self.value_coeff * critic_loss - self.entropy_coeff * entropy
 
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.manager.parameters(), self.max_grad_norm)
                 self.optimizer.step()
 
-                # [수정] Alpha 자동 업데이트 로직 완벽 수정 복원
-                # 목표: 엔트로피가 target보다 낮으면(너무 탐색 안함) alpha 증가, 
-                #       엔트로피가 target보다 높으면(너무 엉뚱한데 탐색함) alpha 감소.
-                # 수학적 구현: log_alpha * (entropy - target_entropy) 의 부호가 음수인지 양수인지에 따라 자동 조절됨.
-                alpha_loss = self.log_alpha * (entropy.detach() - self.target_entropy)
-                self.alpha_optimizer.zero_grad()
-                alpha_loss.backward()
-                self.alpha_optimizer.step()
+                # 🚨 [삭제] 아래 4줄의 alpha_loss 및 optimizer 로직을 반드시 전체 주석 처리하세요!
+                # alpha_loss = self.log_alpha * (entropy.detach() - self.target_entropy)
+                # self.alpha_optimizer.zero_grad()
+                # alpha_loss.backward()
+                # self.alpha_optimizer.step()
 
                 total_actor_loss += actor_loss.item()
                 total_critic_loss += critic_loss.item()

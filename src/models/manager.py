@@ -27,6 +27,7 @@ class Manager(nn.Module):
 
     Args:
         node_dim: 노드 피처 차원 (S7 기준 4: is_curr, is_tgt, hop_dist, degree)
+        node_dim: 노드 피처 차원 (S7 기준 5: is_curr, is_tgt, hop_dist, degree, distance)
         hidden_dim: GNN 및 MLP 히든 차원
         num_layers: GATv2 레이어 수
         gat_heads: GATv2 어텐션 헤드 수
@@ -35,7 +36,7 @@ class Manager(nn.Module):
 
     def __init__(
         self,
-        node_dim: int = 4,
+        node_dim: int = 5,
         hidden_dim: int = 256,
         num_layers: int = 2,
         gat_heads: int = 4,

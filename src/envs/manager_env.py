@@ -69,6 +69,27 @@ class ManagerEnv:
             z = n2z.get(str(node_id), n2z.get(node_id, 0))
             self._node_zone_tensor[i] = z
 
+        # Zone별 노드 밀도(개수) 계산
+        self.zone_node_counts = torch.zeros(self.k_zones, dtype=torch.float32, device=self.device)
+        for z in range(self.k_zones):
+            self.zone_node_counts[z] = (self._node_zone_tensor == z).sum().float()
+        self.max_zone_nodes = float(self.zone_node_counts.max())
+
+        # Zone Centroids (for Direction Feature)
+        self.zone_centroids = torch.zeros((self.k_zones, 2), dtype=torch.float32, device=self.device)
+        for z in range(self.k_zones):
+            z_mask = (self._node_zone_tensor == z)
+            if z_mask.any():
+                z_nodes = z_mask.nonzero(as_tuple=True)[0]
+                x_sum, y_sum = 0.0, 0.0
+                for idx in z_nodes:
+                    node_id = self.idx_to_node[idx.item()]
+                    x, y = self.dm.pos[node_id]
+                    x_sum += x
+                    y_sum += y
+                self.zone_centroids[z, 0] = x_sum / len(z_nodes)
+                self.zone_centroids[z, 1] = y_sum / len(z_nodes)
+
         # Zone Graph 생성 및 APSP (Manager State 용)
         self.ZG = nx.Graph()
         for i in range(self.k_zones):
@@ -108,6 +129,16 @@ class ManagerEnv:
             np.save(cache_path, self.hop_matrix)
 
         self.max_hop = float(self.hop_matrix[self.hop_matrix < np.inf].max())
+
+        # g(n) 계산을 위한 [num_nodes, k_zones] 캐시 테이블 사전 연산
+        self.node_to_zone_hop_matrix = torch.zeros((self.num_nodes, self.k_zones), dtype=torch.float32, device=self.device)
+        hop_tensor = torch.tensor(self.hop_matrix, dtype=torch.float32, device=self.device)
+        for z in range(self.k_zones):
+            z_mask = (self._node_zone_tensor == z)
+            if z_mask.any():
+                self.node_to_zone_hop_matrix[:, z] = hop_tensor[:, z_mask].min(dim=1).values
+            else:
+                self.node_to_zone_hop_matrix[:, z] = 50.0
 
         # 엣지 인덱스 (정적, Worker용)
         edge_list = []
@@ -155,11 +186,17 @@ class ManagerEnv:
         return self.current_idx, self.goal_idx
 
     def get_manager_state(self) -> torch.Tensor:
-        """Manager 입력 State 생성 (Zone-level: [K, 4])."""
-        x = torch.zeros(self.k_zones, 4, device=self.device)
+        """Manager 입력 State 생성 (Zone-level: [K, 7])."""
+        x = torch.zeros(self.k_zones, 7, device=self.device)
         
         curr_z = int(self._node_zone_tensor[self.current_idx].item())
         goal_z = int(self._node_zone_tensor[self.goal_idx].item())
+        
+        # 방향 벡터 (나침반) 계산
+        curr_centroid = self.zone_centroids[curr_z]
+        goal_centroid = self.zone_centroids[goal_z]
+        goal_vec = goal_centroid - curr_centroid
+        goal_norm = torch.norm(goal_vec) + 1e-8
         
         # 채널 0: is_curr_zone
         x[curr_z, 0] = 1.0
@@ -168,10 +205,34 @@ class ManagerEnv:
         # 채널 2: is_visited_zone
         for z in self.visited_zones:
             x[z, 2] = 1.0
-        # 채널 3: zone_hop_dist to goal_zone
-        hops = torch.from_numpy(self.zone_hop_matrix[:, goal_z].copy()).float().to(self.device)
-        hops = torch.clamp(hops, max=50.0) / max(self.max_zone_hop, 1.0)
-        x[:, 3] = hops
+        # 채널 3: zone_hop_dist (목적지 구역에서 해당 구역까지의 최소 거리, h(n))
+        node_dists_to_goal = torch.tensor(self.hop_matrix[:, self.goal_idx], dtype=torch.float32, device=self.device)
+        zone_min_dists = torch.zeros(self.k_zones, device=self.device)
+        for z in range(self.k_zones):
+            z_mask = (self._node_zone_tensor == z)
+            if z_mask.any():
+                zone_min_dists[z] = node_dists_to_goal[z_mask].min()
+            else:
+                zone_min_dists[z] = 50.0
+        
+        # 정규화 (max_hop 기준)
+        x[:, 3] = torch.clamp(zone_min_dists, max=50.0) / max(self.max_hop, 1.0)
+        
+        # 채널 4: distance from current node (현재 노드에서 해당 구역까지의 최소 거리, g(n))
+        x[:, 4] = torch.clamp(self.node_to_zone_hop_matrix[self.current_idx, :], max=50.0) / max(self.max_hop, 1.0)
+        
+        # 채널 5: zone node count (해당 구역의 밀도/복잡도)
+        x[:, 5] = self.zone_node_counts / max(self.max_zone_nodes, 1.0)
+        
+        # 채널 6: 방향 코사인 유사도 (목적지 방향과의 일치도)
+        for z in range(self.k_zones):
+            if z == curr_z:
+                x[z, 6] = 0.0
+            else:
+                cand_vec = self.zone_centroids[z] - curr_centroid
+                cand_norm = torch.norm(cand_vec) + 1e-8
+                cos_sim = torch.dot(goal_vec, cand_vec) / (goal_norm * cand_norm)
+                x[z, 6] = cos_sim
 
         return x
 
@@ -207,12 +268,16 @@ class ManagerEnv:
         mask_tz = (self._node_zone_tensor == subgoal_zone_idx)
         x[mask_tz, 2] = 1.0           # is_next_zone
 
-        # 채널 3: Relative hop — 현재 위치 기준 상대적 거리 이점
+        # 채널 3: hop_dist (Worker 학습 시의 use_relative_hop 설정과 완벽하게 동기화)
         hops = torch.from_numpy(self.hop_matrix[:, self.goal_idx].copy()).float().to(self.device)
-        curr_dist = float(self.hop_matrix[self.current_idx, self.goal_idx])
-        rel_hops = (curr_dist - hops)
-        rel_hops = torch.clamp(rel_hops, -5.0, 5.0) / 5.0
-        x[:, 3] = rel_hops
+        if getattr(self.worker, 'use_relative_hop', False):
+            curr_dist = float(self.hop_matrix[self.current_idx, self.goal_idx])
+            rel_hops = (curr_dist - hops)
+            rel_hops = torch.clamp(rel_hops, -5.0, 5.0) / 5.0
+            x[:, 3] = rel_hops
+        else:
+            abs_hops = torch.clamp(hops, max=100.0) / max(self.max_hop, 1.0)
+            x[:, 3] = abs_hops
 
         # 채널 4: is_visited (Worker가 방문한 노드 이력)
         if state_dim == 5:
@@ -221,7 +286,7 @@ class ManagerEnv:
         return x
 
     def _get_worker_action_mask(self, subgoal_zone_idx: int = -1) -> torch.Tensor:
-        """Worker 행동 마스크: 현재 노드의 인접 노드만 허용."""
+        """Worker 행동 마스크: Soft Masking (모든 이웃 노드 허용)."""
         mask = torch.zeros(self.num_nodes, device=self.device)
         for neighbor_idx in self._adj_list[self.current_idx]:
             mask[neighbor_idx] = 1.0
@@ -241,10 +306,6 @@ class ManagerEnv:
             # 도착 확인 (Worker가 목표 노드 도달 시 즉시 성공 반환)
             if self.current_idx == self.goal_idx:
                 return self.current_idx, steps_taken, True
-                
-            # 서브골 존에 도달했는지 확인 (단, 최종 목표 존인 경우는 목표 노드까지 가야 하므로 멈추지 않음)
-            if curr_z == subgoal_zone_idx and subgoal_zone_idx != goal_z:
-                break
 
             w_state = self._get_worker_state(subgoal_zone_idx)
             w_mask = self._get_worker_action_mask()
@@ -256,9 +317,12 @@ class ManagerEnv:
                 edge_attr=self.edge_attr if self.worker.use_edge_attr else None,
             )
 
-            # 확률적 이동 (sample) — argmax는 동일 상태에서 무한 루프 유발
-            dist = torch.distributions.Categorical(logits)
-            action = dist.sample().item()
+            # 🚨 확률적 이동(sample) 삭제
+            # dist = torch.distributions.Categorical(logits)
+            # action = dist.sample().item()
+            
+            # ✅ 확정적 이동(argmax)으로 직진성 보장
+            action = logits.argmax().item()
             self.current_idx = action
             steps_taken += 1
             self.total_worker_steps += 1
@@ -269,6 +333,10 @@ class ManagerEnv:
 
             if self.current_idx == self.goal_idx:
                 return self.current_idx, steps_taken, True
+                
+            # 워커가 새로운 구역(Zone) 경계선을 넘을 경우 즉시 이동 중단 (매니저 재개입 강제)
+            if new_z != curr_z:
+                break
 
         return self.current_idx, steps_taken, (self.current_idx == self.goal_idx)
 
@@ -301,28 +369,39 @@ class ManagerEnv:
         reached_subgoal = (end_z == subgoal_zone_idx)
 
         # Base step cost + Manager Turn Penalty + Revisit Penalty
-        manager_turn_penalty = -0.5  # 턴 패널티 정상화
+        manager_turn_penalty = -0.5
         
-        # [수정] Stochastic Trauma 방지: 매니저 보상의 완전한 계층적 분리(Decoupling)
-        # 훈련 중 워커의 확률적 탐색으로 인해 발생하는 스텝(steps_taken)을 매니저에게 전가하면, 
-        # 매니저는 "최단 경로"가 아니라 "워커가 덜 헤매는 쉬운 경로"로 우회하거나 핑퐁을 칩니다.
-        # 이를 방지하기 위해 매니저는 오직 '턴 페널티'와 '재방문 페널티'만 받도록 계층간 보상을 분리합니다.
-        step_cost = manager_turn_penalty + revisit_penalty
+        # [수정] 워커의 이동(steps_taken)에 대한 페널티 초선형(Super-linear) 함수 적용
+        # 옌센의 부등식에 의해 매니저가 긴 거리를 지시할수록 페널티가 기하급수적으로 폭발함
+        worker_step_penalty = -0.1 * (steps_taken ** 1.5)
+        
+        step_cost = manager_turn_penalty + revisit_penalty + worker_step_penalty
             
         reward = step_cost
         pbrs = 0.0
         
+        # PBRS (Potential Based Reward Shaping) - Node-level (Stochastic Trauma 방지 체제 하에서 수학적 정합성)
+        node_dists = self.hop_matrix[:, self.goal_idx]
+        start_z_mask = (self._node_zone_tensor == start_z).cpu().numpy()
+        end_z_mask = (self._node_zone_tensor == end_z).cpu().numpy()
+        
+        dist_before = node_dists[start_z_mask].min() if start_z_mask.any() else 50.0
+        dist_after = node_dists[end_z_mask].min() if end_z_mask.any() else 50.0
+        
+        # [추가] 무한대(inf)가 -inf로 폭발하는 것을 원천 차단
+        dist_before = min(float(dist_before), 50.0)
+        dist_after = min(float(dist_after), 50.0)
+        
+        # 양수 포텐셜 유지 (Negative Potential Exploit 차단)
+        max_dist = max(self.max_hop, 50.0)
+        phi_before = max_dist - dist_before
+        phi_after = max_dist - dist_after
+        pbrs = (0.99 * phi_after - phi_before) * 0.5
+        
         if reached_subgoal:
-            # 양수로 정의된 수학적 Potential을 기반으로 완벽한 PBRS 계산
-            phi_after = max_dist - float(self.zone_hop_matrix[subgoal_zone_idx, goal_z])
-            gamma = 0.99
-            pbrs = (gamma * phi_after - phi_before) * 0.5
             reward += pbrs
         else:
-            phi_after = max_dist - float(self.zone_hop_matrix[end_z, goal_z])
-            gamma = 0.99
-            pbrs = (gamma * phi_after - phi_before) * 0.5
-            reward += pbrs - 1.0
+            reward += pbrs - 15.0
 
         info = {
             'start_idx': start_idx,

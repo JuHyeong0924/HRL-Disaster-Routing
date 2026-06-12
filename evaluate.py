@@ -88,10 +88,6 @@ def visualize_map(map_name, worker, manager, device, save_dir=None, save_prefix=
         net_file=net_file,
         worker=worker,
         c_max=100, # Initial placeholder, will update dynamically below
-        goal_bonus=10.0,
-        step_penalty_scale=0.1,
-
-
         zone_json=zone_json,
         zone_graph_json=zone_graph_json,
         device=device
@@ -111,7 +107,7 @@ def visualize_map(map_name, worker, manager, device, save_dir=None, save_prefix=
 
     # 3. Run evaluation for N episodes
     success_count = 0
-    efficiency_sum = 0.0
+    expansion_sum = 0.0
     total_episodes = 100 # Run 100 episodes sequentially
     
     first_success_path = None
@@ -132,14 +128,13 @@ def visualize_map(map_name, worker, manager, device, save_dir=None, save_prefix=
         path_nodes = [start_node]
         manager_zones = []
         visited_zones = set()
-        manager_turns = 0
+        max_manager_turns = 100 
 
         done = False
         success = False
         while not done:
-            manager_turns += 1
-            if manager_turns > env.max_manager_turns:
-                print(f"Failed: Max manager turns ({env.max_manager_turns}) exceeded.")
+            if len(manager_zones) > max_manager_turns:
+                print(f"Failed: Max manager turns ({max_manager_turns}) exceeded.", flush=True)
                 break
                 
             x = env.get_manager_state()
@@ -171,7 +166,6 @@ def visualize_map(map_name, worker, manager, device, save_dir=None, save_prefix=
                 
             w_done = False
             turns = 0
-            start_z_for_worker = int(env._node_zone_tensor[env.current_idx].item())
             
             while not w_done and turns < current_worker_c_max:
                 wx = env._get_worker_state(subgoal_z)
@@ -180,20 +174,25 @@ def visualize_map(map_name, worker, manager, device, save_dir=None, save_prefix=
                 
                 with torch.no_grad():
                     probs, value, _ = worker(wx, env.edge_index, w_batch, neighbors_mask=w_mask, edge_attr=env.edge_attr)
-                dist = torch.distributions.Categorical(probs)
-                next_idx = dist.sample().item()
                 
-                path_nodes.append(env.nodes[next_idx])
+                # [수정] 평가 시 Deterministic(argmax) 이동으로 인한 핑퐁 무한루프 방지
+                # 최근 방문한 노드들의 확률을 대폭 깎아 우회로를 찾도록 유도
+                for past_node in path_nodes[-5:]:
+                    if past_node in env.node_to_idx:
+                        probs[env.node_to_idx[past_node]] *= 0.001
+                        
+                next_idx = torch.argmax(probs).item()
+                
+                curr_z_eval = int(env._node_zone_tensor[env.current_idx].item())
+                next_z_eval = int(env._node_zone_tensor[next_idx].item())
+                
                 env.current_idx = next_idx
+                path_nodes.append(env.nodes[next_idx])
                 turns += 1
-                
-                next_z = int(env._node_zone_tensor[next_idx].item())
                 
                 if env.current_idx == env.goal_idx:
                     w_done = True
-                elif next_z == subgoal_z and subgoal_z != goal_z:
-                    w_done = True
-                elif next_z != start_z_for_worker and next_z != subgoal_z and next_z != goal_z:
+                elif next_z_eval != curr_z_eval:
                     w_done = True
             
             if env.current_idx == env.goal_idx:
@@ -211,13 +210,15 @@ def visualize_map(map_name, worker, manager, device, save_dir=None, save_prefix=
         if success:
             success_count += 1
             
-            # Calculate path efficiency
+            # Calculate path expansion
             try:
                 opt_path = nx.shortest_path(env.G, start_node, goal_node)
                 opt_len = len(opt_path) - 1
                 agent_len = len(path_nodes) - 1
-                if agent_len > 0:
-                    efficiency_sum += (opt_len / agent_len)
+                if opt_len > 0:
+                    expansion_sum += (agent_len / opt_len)
+                elif agent_len == 0:
+                    expansion_sum += 1.0 # start == goal
                 print(f"[{config['name']}] Ep {ep+1}/{total_episodes}: Success (Opt: {opt_len}, Agent: {agent_len})", flush=True)
             except nx.NetworkXNoPath:
                 pass 
@@ -232,8 +233,8 @@ def visualize_map(map_name, worker, manager, device, save_dir=None, save_prefix=
             print(f"[{config['name']}] Ep {ep+1}/{total_episodes}: Failed (Manager Zones: {manager_zones})", flush=True)
 
     success_rate = (success_count / total_episodes) * 100
-    avg_efficiency = (efficiency_sum / success_count * 100) if success_count > 0 else 0.0
-    print(f"[{config['name']}] Success Rate: {success_count}/{total_episodes} ({success_rate:.1f}%) | Avg Path Efficiency: {avg_efficiency:.1f}%")
+    avg_expansion = (expansion_sum / success_count) if success_count > 0 else 0.0
+    print(f"[{config['name']}] Success Rate: {success_count}/{total_episodes} ({success_rate:.1f}%) | Avg Path Expansion: {avg_expansion:.2f}배 (최적 경로 대비)")
 
     if first_success_path is None:
         print("Failed to find any successful path for visualization.")
@@ -319,23 +320,14 @@ def visualize_map(map_name, worker, manager, device, save_dir=None, save_prefix=
     draw_grid_zone(goal_z, 'lightcoral', label='Goal Zone')
 
     drawn_zones = {start_z: True, goal_z: True}
-    zone_centers = []
     
-    # Manager Zones Sequence
-    for step_idx, z in enumerate(manager_zones):
+    draw_counter = 1
+    start_x, start_y = pos[start_node]
+    for z in manager_zones:
         if z not in drawn_zones:
+            draw_grid_zone(z, 'lightblue', draw_text=True, step_idx=draw_counter)
             drawn_zones[z] = True
-            c_pt = draw_grid_zone(z, 'lightblue', draw_text=True, step_idx=step_idx+1)
-            if c_pt: zone_centers.append(c_pt)
-        else:
-            if z in zone_to_cells:
-                cells = set(zone_to_cells[z])
-                sum_cx = sum([min_x + gx * dx + dx/2 for gx, gy in cells])
-                sum_cy = sum([min_y + gy * dy + dy/2 for gx, gy in cells])
-                c_pt = (sum_cx / len(cells), sum_cy / len(cells))
-                zone_centers.append(c_pt)
-                ax.text(c_pt[0], c_pt[1], str(step_idx + 1), color='black', fontsize=14, weight='bold', 
-                        ha='center', va='center', bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.2'))
+            draw_counter += 1
 
     # Draw arrows between zone centers to show manager sequence
     # Removed as per user request
@@ -438,8 +430,7 @@ def main():
     worker.load_state_dict(torch.load(w_ckpt, map_location=device, weights_only=True))
     worker.eval()
     print(f"📦 Loaded worker checkpoint from {w_ckpt}")
-    
-    manager = Manager(node_dim=4, hidden_dim=256, num_layers=2).to(device)
+    manager = Manager(node_dim=7, hidden_dim=256, num_layers=2).to(device)
     m_ckpt = args.manager_ckpt if args.manager_ckpt else get_latest_ckpt('logs/rl_manager_stage')
     manager.load_state_dict(torch.load(m_ckpt, map_location=device, weights_only=True))
     manager.eval()

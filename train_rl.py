@@ -175,6 +175,7 @@ def _init_worker_env(args):
         subgoal_mode=getattr(args, 'subgoal_mode', 'zone'),
         use_relative_hop=getattr(args, 'use_relative_hop', False),
         use_is_visited=getattr(args, 'use_is_visited', False),
+        baseline=getattr(args, 'baseline', False),
         oob_penalty=getattr(args, 'oob_penalty', -1.0)
     )
     env.zone_progress_reward = getattr(args, 'zone_progress_reward', False)
@@ -279,7 +280,7 @@ def _run_manager_stage(args) -> None:
         print("⚠️ Worker 체크포인트 없음. Worker는 랜덤 초기 상태로 사용됩니다.")
 
     # Manager 생성
-    node_dim = 4  # is_curr, is_tgt, is_visited, zone_hop_dist
+    node_dim = 7  # is_curr, is_tgt, is_visited, zone_hop_dist, distance_from_curr, zone_node_count
     manager_model = Manager(
         node_dim=node_dim, hidden_dim=args.hidden_dim,
         num_layers=num_layers, dropout=0.0,
@@ -400,6 +401,9 @@ if __name__ == "__main__":
     parser.add_argument("--oob_penalty", type=float, default=-1.0)
     parser.add_argument("--use_is_visited", action="store_true", help="Worker에 방문 노드 이력 상태 채널 추가 (5-dim)")
     parser.add_argument("--use_global_pool", action="store_true", help="Worker Critic에 Global Mean Pooling 추가")
+    parser.add_argument('--baseline', action='store_true', help='Flat RL Baseline 학습 (Subgoal 비활성화)')
+
+    # [Manager-Specific Settings] 추가
     parser.add_argument("--exp_name", type=str, default=None, help="Experiment name for logging directory")
     parser.add_argument("--worker_ckpt", type=str, default=None, help="Path to specific worker checkpoint")
 
