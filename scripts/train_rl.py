@@ -1,7 +1,10 @@
 import argparse
 import os
+import sys
 import warnings
 from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # lr_scheduler.step() 순서 경고 억제
 warnings.filterwarnings("ignore", message=".*lr_scheduler.step.*optimizer.step.*")

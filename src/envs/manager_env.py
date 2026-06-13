@@ -69,11 +69,9 @@ class ManagerEnv:
             z = n2z.get(str(node_id), n2z.get(node_id, 0))
             self._node_zone_tensor[i] = z
 
-        # Zone별 노드 밀도(개수) 계산
-        self.zone_node_counts = torch.zeros(self.k_zones, dtype=torch.float32, device=self.device)
-        for z in range(self.k_zones):
-            self.zone_node_counts[z] = (self._node_zone_tensor == z).sum().float()
-        self.max_zone_nodes = float(self.zone_node_counts.max())
+        # Zone별 재난 강도(Disaster Intensity) 초기화 (추후 재난 정보 연동)
+        self.zone_disaster_intensity = torch.zeros(self.k_zones, dtype=torch.float32, device=self.device)
+        self.max_zone_disaster = 1.0 # 0 division 방지
 
         # Zone Centroids (for Direction Feature)
         self.zone_centroids = torch.zeros((self.k_zones, 2), dtype=torch.float32, device=self.device)
@@ -98,47 +96,51 @@ class ManagerEnv:
         zone_edge_list = []
         for u, neighbors in self.zone_adj.items():
             for v in neighbors:
-                self.ZG.add_edge(u, v)
+                # 중심점 간 유클리디안 거리를 엣지 가중치로 부여
+                p1 = self.zone_centroids[u]
+                p2 = self.zone_centroids[v]
+                dist = float(torch.norm(p1 - p2))
+                self.ZG.add_edge(u, v, weight=dist)
                 zone_edge_list.append((u, v))
                 
         self.zone_edge_index = torch.tensor(zone_edge_list, dtype=torch.long).t().to(self.device) if zone_edge_list else torch.zeros(2, 0, dtype=torch.long, device=self.device)
                 
-        z_apsp = dict(nx.all_pairs_shortest_path_length(self.ZG))
-        self.zone_hop_matrix = np.full((self.k_zones, self.k_zones), np.inf)
+        z_apsp = dict(nx.all_pairs_dijkstra_path_length(self.ZG, weight='weight'))
+        self.zone_dist_matrix = np.full((self.k_zones, self.k_zones), np.inf)
         for u, lengths in z_apsp.items():
             for v, length in lengths.items():
-                self.zone_hop_matrix[u, v] = length
-        self.max_zone_hop = float(self.zone_hop_matrix[self.zone_hop_matrix < np.inf].max())
+                self.zone_dist_matrix[u, v] = length
+        self.max_zone_dist = float(self.zone_dist_matrix[self.zone_dist_matrix < np.inf].max())
 
-        # 노드 레벨 APSP 홉 행렬 (PBRS 보상 용)
+        # 노드 레벨 APSP 물리적 거리 행렬 (PBRS 보상 용)
         import os
         import hashlib
         cache_key = hashlib.md5(f"{node_file}_{net_file}_{self.num_nodes}".encode()).hexdigest()[:8]
-        cache_path = f"data/hop_matrix_{cache_key}.npy"
+        cache_path = f"data/dist_matrix_{cache_key}.npy"
 
         if os.path.exists(cache_path):
-            self.hop_matrix = np.load(cache_path)
+            self.dist_matrix = np.load(cache_path)
         else:
-            apsp = dict(nx.all_pairs_shortest_path_length(self.G))
-            self.hop_matrix = np.full((self.num_nodes, self.num_nodes), np.inf)
+            apsp = dict(nx.all_pairs_dijkstra_path_length(self.G, weight='weight'))
+            self.dist_matrix = np.full((self.num_nodes, self.num_nodes), np.inf)
             for u, lengths in apsp.items():
                 u_idx = self.node_to_idx[u]
                 for v, length in lengths.items():
                     v_idx = self.node_to_idx[v]
-                    self.hop_matrix[u_idx, v_idx] = length
-            np.save(cache_path, self.hop_matrix)
+                    self.dist_matrix[u_idx, v_idx] = length
+            np.save(cache_path, self.dist_matrix)
 
-        self.max_hop = float(self.hop_matrix[self.hop_matrix < np.inf].max())
+        self.max_dist = float(self.dist_matrix[self.dist_matrix < np.inf].max())
 
         # g(n) 계산을 위한 [num_nodes, k_zones] 캐시 테이블 사전 연산
-        self.node_to_zone_hop_matrix = torch.zeros((self.num_nodes, self.k_zones), dtype=torch.float32, device=self.device)
-        hop_tensor = torch.tensor(self.hop_matrix, dtype=torch.float32, device=self.device)
+        self.node_to_zone_dist_matrix = torch.zeros((self.num_nodes, self.k_zones), dtype=torch.float32, device=self.device)
+        dist_tensor = torch.tensor(self.dist_matrix, dtype=torch.float32, device=self.device)
         for z in range(self.k_zones):
             z_mask = (self._node_zone_tensor == z)
             if z_mask.any():
-                self.node_to_zone_hop_matrix[:, z] = hop_tensor[:, z_mask].min(dim=1).values
+                self.node_to_zone_dist_matrix[:, z] = dist_tensor[:, z_mask].min(dim=1).values
             else:
-                self.node_to_zone_hop_matrix[:, z] = 50.0
+                self.node_to_zone_dist_matrix[:, z] = 50000.0
 
         # 엣지 인덱스 (정적, Worker용)
         edge_list = []
@@ -171,7 +173,7 @@ class ManagerEnv:
             if s != t:
                 s_idx = self.node_to_idx[s]
                 t_idx = self.node_to_idx[t]
-                if self.hop_matrix[s_idx, t_idx] < np.inf:
+                if self.dist_matrix[s_idx, t_idx] < np.inf:
                     break
 
         self.current_idx = s_idx
@@ -205,24 +207,24 @@ class ManagerEnv:
         # 채널 2: is_visited_zone
         for z in self.visited_zones:
             x[z, 2] = 1.0
-        # 채널 3: zone_hop_dist (목적지 구역에서 해당 구역까지의 최소 거리, h(n))
-        node_dists_to_goal = torch.tensor(self.hop_matrix[:, self.goal_idx], dtype=torch.float32, device=self.device)
+        # 채널 3: zone_dist (목적지 구역에서 해당 구역까지의 최소 물리적 거리, h(n))
+        node_dists_to_goal = torch.tensor(self.dist_matrix[:, self.goal_idx], dtype=torch.float32, device=self.device)
         zone_min_dists = torch.zeros(self.k_zones, device=self.device)
         for z in range(self.k_zones):
             z_mask = (self._node_zone_tensor == z)
             if z_mask.any():
                 zone_min_dists[z] = node_dists_to_goal[z_mask].min()
             else:
-                zone_min_dists[z] = 50.0
+                zone_min_dists[z] = 50000.0
         
-        # 정규화 (max_hop 기준)
-        x[:, 3] = torch.clamp(zone_min_dists, max=50.0) / max(self.max_hop, 1.0)
+        # 정규화 (max_dist 기준)
+        x[:, 3] = torch.clamp(zone_min_dists, max=100000.0) / max(self.max_dist, 1.0)
         
-        # 채널 4: distance from current node (현재 노드에서 해당 구역까지의 최소 거리, g(n))
-        x[:, 4] = torch.clamp(self.node_to_zone_hop_matrix[self.current_idx, :], max=50.0) / max(self.max_hop, 1.0)
+        # 채널 4: distance from current node (현재 노드에서 해당 구역까지의 최소 물리적 거리, g(n))
+        x[:, 4] = torch.clamp(self.node_to_zone_dist_matrix[self.current_idx, :], max=100000.0) / max(self.max_dist, 1.0)
         
-        # 채널 5: zone node count (해당 구역의 밀도/복잡도)
-        x[:, 5] = self.zone_node_counts / max(self.max_zone_nodes, 1.0)
+        # 채널 5: zone disaster intensity (해당 구역의 재난 피해도)
+        x[:, 5] = self.zone_disaster_intensity / max(self.max_zone_disaster, 1.0)
         
         # 채널 6: 방향 코사인 유사도 (목적지 방향과의 일치도)
         for z in range(self.k_zones):
@@ -258,26 +260,31 @@ class ManagerEnv:
         return mask
 
     def _get_worker_state(self, subgoal_zone_idx: int) -> torch.Tensor:
-        """Worker State [N, D]: is_curr, is_tgt, is_next_zone, relative_hop, [is_visited]."""
+        """Worker State [N, D]: is_curr, is_tgt, zone_info, dist, [is_visited]."""
         # Worker의 use_is_visited에 따라 차원 결정
         state_dim = 5 if getattr(self.worker, 'use_is_visited', False) else 4
         x = torch.zeros(self.num_nodes, state_dim, device=self.device)
 
         x[self.current_idx, 0] = 1.0  # is_curr
         x[self.goal_idx, 1] = 1.0     # is_tgt
-        mask_tz = (self._node_zone_tensor == subgoal_zone_idx)
-        x[mask_tz, 2] = 1.0           # is_next_zone
+        
+        # zone_info (채널 2): -1(금지구역), 0(현재구역), 1(목표구역)
+        curr_z = int(self._node_zone_tensor[self.current_idx].item())
+        x[:, 2] = -1.0
+        x[self._node_zone_tensor == curr_z, 2] = 0.0
+        x[self._node_zone_tensor == subgoal_zone_idx, 2] = 1.0
 
-        # 채널 3: hop_dist (Worker 학습 시의 use_relative_hop 설정과 완벽하게 동기화)
-        hops = torch.from_numpy(self.hop_matrix[:, self.goal_idx].copy()).float().to(self.device)
+        # 채널 3: dist (Worker 학습 시의 use_relative_hop 설정과 완벽하게 동기화)
+        dists = torch.from_numpy(self.dist_matrix[:, self.goal_idx].copy()).float().to(self.device)
         if getattr(self.worker, 'use_relative_hop', False):
-            curr_dist = float(self.hop_matrix[self.current_idx, self.goal_idx])
-            rel_hops = (curr_dist - hops)
-            rel_hops = torch.clamp(rel_hops, -5.0, 5.0) / 5.0
-            x[:, 3] = rel_hops
+            curr_dist = float(self.dist_matrix[self.current_idx, self.goal_idx])
+            rel_dists = (curr_dist - dists)
+            scale = max(self.max_dist * 0.1, 1.0)
+            rel_dists = torch.clamp(rel_dists, -scale, scale) / scale
+            x[:, 3] = rel_dists
         else:
-            abs_hops = torch.clamp(hops, max=100.0) / max(self.max_hop, 1.0)
-            x[:, 3] = abs_hops
+            abs_dists = torch.clamp(dists, max=100000.0) / max(self.max_dist, 1.0)
+            x[:, 3] = abs_dists
 
         # 채널 4: is_visited (Worker가 방문한 노드 이력)
         if state_dim == 5:
@@ -360,8 +367,8 @@ class ManagerEnv:
         # PBRS: zone-level 거리 기반 포텐셜
         # [수정] 무한 핑퐁 루프의 수학적 원인(Negative Potential Exploit) 완벽 차단!
         # Potential Phi(s)가 음수일 경우 gamma를 곱해 차이를 구하면 사이클에서 양의 보상이 나오는 버그가 발생합니다.
-        max_dist = max(self.max_zone_hop, 50.0)
-        phi_before = max_dist - float(self.zone_hop_matrix[start_z, goal_z])
+        max_dist_pbrs = max(self.max_zone_dist, 50000.0)
+        phi_before = max_dist_pbrs - float(self.zone_dist_matrix[start_z, goal_z])
 
         end_idx, steps_taken, reached_goal = self.execute_worker(subgoal_zone_idx)
         
@@ -381,22 +388,25 @@ class ManagerEnv:
         pbrs = 0.0
         
         # PBRS (Potential Based Reward Shaping) - Node-level (Stochastic Trauma 방지 체제 하에서 수학적 정합성)
-        node_dists = self.hop_matrix[:, self.goal_idx]
+        node_dists = self.dist_matrix[:, self.goal_idx]
         start_z_mask = (self._node_zone_tensor == start_z).cpu().numpy()
         end_z_mask = (self._node_zone_tensor == end_z).cpu().numpy()
         
-        dist_before = node_dists[start_z_mask].min() if start_z_mask.any() else 50.0
-        dist_after = node_dists[end_z_mask].min() if end_z_mask.any() else 50.0
+        dist_before = node_dists[start_z_mask].min() if start_z_mask.any() else 50000.0
+        dist_after = node_dists[end_z_mask].min() if end_z_mask.any() else 50000.0
         
         # [추가] 무한대(inf)가 -inf로 폭발하는 것을 원천 차단
-        dist_before = min(float(dist_before), 50.0)
-        dist_after = min(float(dist_after), 50.0)
+        dist_before = min(float(dist_before), 50000.0)
+        dist_after = min(float(dist_after), 50000.0)
         
         # 양수 포텐셜 유지 (Negative Potential Exploit 차단)
-        max_dist = max(self.max_hop, 50.0)
-        phi_before = max_dist - dist_before
-        phi_after = max_dist - dist_after
-        pbrs = (0.99 * phi_after - phi_before) * 0.5
+        max_dist_node = max(self.max_dist, 50000.0)
+        phi_before = max_dist_node - dist_before
+        phi_after = max_dist_node - dist_after
+        
+        # 거리 스케일에 맞춰 PBRS 스케일링 필요
+        scale_factor = 0.5 / max(self.max_dist * 0.1, 1.0)
+        pbrs = (0.99 * phi_after - phi_before) * scale_factor
         
         if reached_subgoal:
             reward += pbrs

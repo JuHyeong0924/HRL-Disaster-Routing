@@ -39,29 +39,29 @@ class WorkerEnv:
         self.idx_to_node = {i: n for n, i in self.node_to_idx.items()}
         self.num_nodes = len(self.nodes)
         
-        # APSP (가장 짧은 홉 거리 계산) — 캐시 파일 우선 로드
+        # APSP (가장 짧은 물리적 거리 계산) — 캐시 파일 우선 로드
         import hashlib
         # 맵 파일 기반 캐시 키 생성 (노드/엣지 변경 시 자동 무효화)
         cache_key = hashlib.md5(f"{node_file}_{net_file}_{self.num_nodes}".encode()).hexdigest()[:8]
-        cache_path = f"data/hop_matrix_{cache_key}.npy"
+        cache_path = f"data/dist_matrix_{cache_key}.npy"
         
         if os.path.exists(cache_path):
             # 캐시 파일에서 즉시 로드 (수 ms)
-            self.hop_matrix = np.load(cache_path)
+            self.dist_matrix = np.load(cache_path)
         else:
-            # 최초 1회: BFS로 계산 후 캐시 저장
-            self.apsp = dict(nx.all_pairs_shortest_path_length(self.G))
-            self.hop_matrix = np.full((self.num_nodes, self.num_nodes), np.inf)
+            # 최초 1회: Dijkstra로 계산 후 캐시 저장
+            self.apsp = dict(nx.all_pairs_dijkstra_path_length(self.G, weight='weight'))
+            self.dist_matrix = np.full((self.num_nodes, self.num_nodes), np.inf)
             for u, lengths in self.apsp.items():
                 u_idx = self.node_to_idx[u]
                 for v, length in lengths.items():
                     v_idx = self.node_to_idx[v]
-                    self.hop_matrix[u_idx, v_idx] = length
-            np.save(cache_path, self.hop_matrix)
+                    self.dist_matrix[u_idx, v_idx] = length
+            np.save(cache_path, self.dist_matrix)
                 
-        # 최대 홉 거리(Graph Diameter) 계산 및 저장 (정규화에 사용)
-        valid_hops = self.hop_matrix[self.hop_matrix < np.inf]
-        self.max_hop = float(np.max(valid_hops)) if len(valid_hops) > 0 else 25.0
+        # 최대 거리(Graph Diameter) 계산 및 저장 (정규화에 사용)
+        valid_dists = self.dist_matrix[self.dist_matrix < np.inf]
+        self.max_dist = float(np.max(valid_dists)) if len(valid_dists) > 0 else 25.0
                 
         # 2. Zone 데이터 로드
         with open(zone_json, 'r') as f:
@@ -77,6 +77,27 @@ class WorkerEnv:
         for n, z in self.n2z.items():
             self.z2n[z].append(n)
             
+        # 노드별 Zone 인덱스 텐서 (정적, GPU 전송용)
+        self._node_zone_tensor = torch.tensor(
+            [self.n2z[self.idx_to_node[i]] for i in range(self.num_nodes)],
+            dtype=torch.long,
+        )
+        
+        # Zone Centroids 계산 (물리적 거리 가중치용)
+        self.zone_centroids = torch.zeros((self.k, 2), dtype=torch.float32)
+        for z in range(self.k):
+            z_mask = (self._node_zone_tensor == z)
+            if z_mask.any():
+                z_nodes = z_mask.nonzero(as_tuple=True)[0]
+                x_sum, y_sum = 0.0, 0.0
+                for idx in z_nodes:
+                    node_id = self.idx_to_node[idx.item()]
+                    x, y = self.dm.pos[node_id]
+                    x_sum += x
+                    y_sum += y
+                self.zone_centroids[z, 0] = x_sum / len(z_nodes)
+                self.zone_centroids[z, 1] = y_sum / len(z_nodes)
+
         # Manager를 위한 Zone Graph (NetworkX 객체)
         self.ZG = nx.Graph()
         for z in range(self.k):
@@ -84,13 +105,11 @@ class WorkerEnv:
         for z_str, neighbors in self.zone_graph_data['zone_adjacency'].items():
             z = int(z_str)
             for neighbor in neighbors:
-                self.ZG.add_edge(z, neighbor, weight=1.0)
-        
-        # 노드별 Zone 인덱스 텐서 (정적, GPU 전송용)
-        self._node_zone_tensor = torch.tensor(
-            [self.n2z[self.idx_to_node[i]] for i in range(self.num_nodes)],
-            dtype=torch.long,
-        )
+                # 중심점 간 유클리디안 거리를 엣지 가중치로 부여
+                p1 = self.zone_centroids[z]
+                p2 = self.zone_centroids[neighbor]
+                dist = float(torch.norm(p1 - p2))
+                self.ZG.add_edge(z, neighbor, weight=dist)
         
         # 인접 리스트 사전 계산 (idx 기반)
         self._adj_list = [[] for _ in range(self.num_nodes)]
@@ -136,7 +155,7 @@ class WorkerEnv:
         """배치 에피소드 초기화 및 Manager Zone 시퀀스 생성.
         
         Returns:
-            state: [B, N, 4] 텐서 (is_curr, is_tgt, is_next_zone, hop_dist)
+            state: [B, N, 4] 텐서 (is_curr, is_tgt, zone_info, dist)
         """
         self.batch_size = batch_size
         self.curr_nodes = torch.zeros(batch_size, dtype=torch.long)
@@ -221,27 +240,33 @@ class WorkerEnv:
             
             if not self.baseline:
                 if self.subgoal_mode == 'zone':
-                    # is_next_zone: 해당 배치의 다음 목표 Zone에 속한 노드들
-                    state[b, :, 2] = (nz_tensor == next_z[b]).float()
+                    # zone_info: -1(금지/이탈), 0(현재Zone), 1(목표Zone)
+                    c_z = int(curr_z[b].item())
+                    n_z = int(next_z[b].item())
+                    state[b, :, 2] = -1.0
+                    state[b, nz_tensor == c_z, 2] = 0.0
+                    state[b, nz_tensor == n_z, 2] = 1.0
                 elif self.subgoal_mode == 'node':
                     # is_next_target: 서브골 Node 1개만 활성화
+                    state[b, :, 2] = -1.0
                     state[b, int(self.subgoal_nodes[b].item()), 2] = 1.0
                 
-            # hop_dist
+            # dist
             tgt_idx = int(self.target_nodes[b].item())
-            hops = torch.from_numpy(self.hop_matrix[:, tgt_idx].copy()).float()
+            dists = torch.from_numpy(self.dist_matrix[:, tgt_idx].copy()).float()
             
             if self.use_relative_hop:
                 curr_idx = int(self.curr_nodes[b].item())
-                curr_dist = float(self.hop_matrix[curr_idx, tgt_idx])
-                # 상대적 홉 기울기: (현재 위치에서의 거리 - 임의 노드에서의 거리)
-                # 정규화: 범위 클리핑 (-5 to 5) 후 / 5.0
-                rel_hops = (curr_dist - hops)
-                rel_hops = torch.clamp(rel_hops, -5.0, 5.0) / 5.0
-                state[b, :, 3] = rel_hops
+                curr_dist = float(self.dist_matrix[curr_idx, tgt_idx])
+                # 상대적 거리 기울기
+                rel_dists = (curr_dist - dists)
+                # 정규화 (실제 거리에 맞게 스케일 조정)
+                scale = max(self.max_dist * 0.1, 1.0)
+                rel_dists = torch.clamp(rel_dists, -scale, scale) / scale
+                state[b, :, 3] = rel_dists
             else:
-                hops = torch.clamp(hops, max=100.0) / max(self.max_hop, 1.0)
-                state[b, :, 3] = hops
+                dists = torch.clamp(dists, max=100000.0) / max(self.max_dist, 1.0)
+                state[b, :, 3] = dists
                 
             # is_visited 채널 (use_is_visited 활성화 시)
             if self.use_is_visited:
@@ -311,10 +336,10 @@ class WorkerEnv:
         curr_z, next_z = self._get_current_and_next_zone_batch()
         nz_tensor = self._node_zone_tensor
         
-        # [PBRS] 이동 전 hop_dist 기록 (use_pbrs=True 시에만 사용)
-        prev_hop_dists = None
+        # [PBRS] 이동 전 dist 기록 (use_pbrs=True 시에만 사용)
+        prev_dists = None
         if self.use_pbrs:
-            prev_hop_dists = torch.zeros(B)
+            prev_dists = torch.zeros(B)
             for b in range(B):
                 if not self.dones[b]:
                     ci = int(self.curr_nodes[b].item())
@@ -322,7 +347,7 @@ class WorkerEnv:
                         ti = int(self.subgoal_nodes[b].item())
                     else:
                         ti = int(self.target_nodes[b].item())
-                    prev_hop_dists[b] = float(self.hop_matrix[ci, ti])
+                    prev_dists[b] = float(self.dist_matrix[ci, ti])
         
         for b in range(B):
             if self.dones[b]:
@@ -413,8 +438,8 @@ class WorkerEnv:
                 if is_oob:
                     rewards[b] += self.oob_penalty
         
-        # [v3 PBRS] 이동 후 hop_dist 차이 기반 Dense Reward 추가
-        if self.use_pbrs and prev_hop_dists is not None:
+        # [v3 PBRS] 이동 후 dist 차이 기반 Dense Reward 추가
+        if self.use_pbrs and prev_dists is not None:
             for b in range(B):
                 # 이미 종료(success/invalid/stagnation)된 에피소드는 PBRS 적용 안 함
                 if infos[b].get('reason') in ('success', 'invalid', 'stagnation'):
@@ -424,9 +449,11 @@ class WorkerEnv:
                     ti = int(self.subgoal_nodes[b].item())
                 else:
                     ti = int(self.target_nodes[b].item())
-                new_hop = float(self.hop_matrix[ci, ti])
-                # PBRS: Φ(s) = -hop_dist → 가까워지면 양수, 멀어지면 음수
-                pbrs = (prev_hop_dists[b].item() - new_hop) * 0.5  # 스케일 계수 0.5
+                new_dist = float(self.dist_matrix[ci, ti])
+                # PBRS: Φ(s) = -dist → 가까워지면 양수, 멀어지면 음수
+                # 거리 스케일에 맞춰 계수를 조절해야 함. 너무 크지 않도록 스케일링.
+                scale_factor = 0.5 / max(self.max_dist * 0.1, 1.0)
+                pbrs = (prev_dists[b].item() - new_dist) * scale_factor
                 rewards[b] += pbrs
                 
         return self._get_state_batch(), rewards, self.dones.clone(), infos

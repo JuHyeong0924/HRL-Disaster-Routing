@@ -26,8 +26,7 @@ class Manager(nn.Module):
     PPO 학습을 위해 Actor/Critic Dual Head 구조를 갖는다.
 
     Args:
-        node_dim: 노드 피처 차원 (S7 기준 4: is_curr, is_tgt, hop_dist, degree)
-        node_dim: 노드 피처 차원 (S7 기준 5: is_curr, is_tgt, hop_dist, degree, distance)
+        node_dim: 구역(Zone) 피처 차원 (기본 7차원: is_curr, is_tgt, is_visited, zone_dist, node_dist, disaster_intensity, cos_sim)
         hidden_dim: GNN 및 MLP 히든 차원
         num_layers: GATv2 레이어 수
         gat_heads: GATv2 어텐션 헤드 수
@@ -36,7 +35,7 @@ class Manager(nn.Module):
 
     def __init__(
         self,
-        node_dim: int = 5,
+        node_dim: int = 7,
         hidden_dim: int = 256,
         num_layers: int = 2,
         gat_heads: int = 4,
