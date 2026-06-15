@@ -67,21 +67,44 @@ v1의 결론을 바탕으로 `HRLZoneEnv`라는 Zone 기반 환경으로 전환�
 
 ---
 
+## 5. v7: 거리 표현 & Zone 구조 (dist_mode / zone_info / zone_weight)
+**"Worker가 물리적 거리를 인식하게 하다"**
+
+기존 Worker의 핵심 State 채널(거리, Zone 정보, Zone Graph 가중치)을 개별 변인으로 분리하여 기여도를 측정. 초기(v7)에서 Dijkstra 정규화 시 **smoothing 문제**를 발견하여 v7.1에서 `log1p` 변환으로 해결. 평가 지표도 hop Ratio 단독에서 **hop + 물리 거리 이중 Ratio**로 확장하여 공정 비교.
+
+| ID | dist | zone | zw | SR | **R_hop** | **R_dist** |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Bv2** | dijkstra(log1p) | binary | uniform | **100%** | 1.157 | **1.171** |
+| C | hop | ternary | uniform | **100%** | **1.114** | 1.207 |
+| D | hop | binary | euclidean | 100% | **1.110** | 1.205 |
+| Ev2 | dijkstra(log1p) | ternary | euclidean | 100% | 1.216 | 1.196 |
+| F | hop | ternary | euclidean | **100%** | 1.148 | 1.225 |
+
+- **R_hop**: Agent 홉 수 / 최단 홉 수. **R_dist**: Agent 이동 거리 / Dijkstra 최단 거리.
+- hop 모델(C/D/F)은 홉 효율 우수, dijkstra 모델(Bv2)은 물리 거리 효율 우수.
+- **최종 채택: `dijkstra(log1p) + binary + uniform` (Bv2)** — 재난 라우팅에서는 물리적 거리 최소화가 핵심.
+
+---
+
 ## 종합 요약: 최종 확정 Worker 아키텍처
 
 | 항목 | 확정 값 | 근거 |
 |---|---|---|
-| **State Dim** | 4-Dim | v1: S5(3-Dim)=99.9% |
+| **State Dim** | 5-Dim (`is_curr`, `is_tgt`, `zone_info`, `dist`, `is_visited`) | v1: S5, v7 |
 | **GNN** | 3-Layer GATv2 + Residual + GraphNorm | v1: A5, v3: L3 |
-| **Temporal** | Linear 투영 (LSTM 제거) | v1: A5=91.4% vs BASELINE=81.4% |
-| **Masking** | `soft_curr_next` | v3: Len=15.5 (최단) |
-| **Reward** | Goal + Step + PBRS | v1: R5=99.7%, v3: +6.0 Rw |
+| **Temporal** | Linear 투영 (LSTM 제거) | v1: A5=91.4% |
+| **Masking** | `soft_curr_next` | v3: Len=15.5 |
+| **Reward** | Goal + Step + PBRS | v1: R5, v3: +6.0 Rw |
 | **Edge Features** | Edge-Conditioning | v4: JK3_EC=Len 12.6 |
 | **JK-Net** | Jumping Knowledge (`cat` 모드) | v4: Over-smoothing 방지 |
-| **RL 알고리즘** | REINFORCE + GAE(λ=0.95) + Entropy(0.01) + Cosine LR | v2: P0P1P2=100% |
+| **dist_mode** | `dijkstra` (log1p 변환) | v7.1: R_dist=1.171 (물리 거리 최소) |
+| **zone_info_mode** | `binary` (0/1) | v7.1: Bv2 best 조합 |
+| **zone_weight_mode** | `uniform` | v7.1: Bv2 best 조합 |
+| **RL 알고리즘** | PPO (4 epochs) + GAE(λ=0.95) + Entropy(0.01) + Cosine LR | v2 |
 
 ### 핵심 원리
 
-1. **차원 축소의 위력**: v1(7→3차원), v3(`soft_flex`→`soft_curr_next`) — 에이전트가 신경 써야 할 피처의 수를 줄일수록 RL은 더 짧고 완벽한 해를 찾아냄.
-2. **보상 함수의 진화**: 복잡한 휴리스틱(v1) → 단계적 보상(v2) → 수학적 PBRS(v3) — Policy Gradient의 분산을 단계적으로 통제.
-3. **아키텍처 혁신**: v4에서 JK-Net + Edge-Conditioning을 통해 15.5→12.6 홉 최적 경로 도출 성공.
+1. **차원 축소의 위력**: v1(7→3차원), v3(`soft_flex`→`soft_curr_next`) — 피처 수를 줄일수록 더 짧은 해를 찾음.
+2. **보상 함수의 진화**: 복잡한 휴리스틱(v1) → 단계적 보상(v2) → 수학적 PBRS(v3) — 분산을 단계적으로 통제.
+3. **아키텍처 혁신**: v4에서 JK-Net + Edge-Conditioning으로 15.5→12.6 홉 최적 경로 도출.
+4. **물리적 거리 인식**: v7.1에서 `log1p(dijkstra)` 변환으로 물리 거리 17% 이내 경로 생성. hop 기반보다 물리 거리 효율 개선.

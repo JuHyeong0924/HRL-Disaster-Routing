@@ -134,7 +134,7 @@ def _build_config(args, loaded_checkpoint_paths):
     """
     timestamp = datetime.now().strftime('%Y-%m-%d_%H%M%S')
     exp_suffix = f"_{args.exp_name}" if getattr(args, 'exp_name', None) else ""
-    run_label = f"{timestamp}_{args.stage}_B{args.batch_size}{exp_suffix}"
+    run_label = f"{timestamp}_{args.stage}{exp_suffix}"
     stage_base = {
         'worker': os.path.join('logs', 'rl_worker_stage'),
         'manager': os.path.join('logs', 'rl_manager_stage'),
@@ -142,7 +142,7 @@ def _build_config(args, loaded_checkpoint_paths):
     save_dir = os.path.join(stage_base, run_label)
     return Config(
         lr=args.lr,
-        num_pomo=args.batch_size,
+        batch_size=args.batch_size,
         mini_batch_size=getattr(args, "mini_batch_size", 256),
         episodes=args.episodes,
         save_dir=save_dir,
@@ -174,15 +174,13 @@ def _init_worker_env(args):
         zone_json=zone_json,
         zone_graph_json=zone_graph_json,
         masking_mode=getattr(args, 'masking_mode', 'soft_flex'),
-        use_pbrs=getattr(args, 'use_pbrs', False),
         subgoal_mode=getattr(args, 'subgoal_mode', 'zone'),
-        use_relative_hop=getattr(args, 'use_relative_hop', False),
-        use_is_visited=getattr(args, 'use_is_visited', False),
-        baseline=getattr(args, 'baseline', False),
-        oob_penalty=getattr(args, 'oob_penalty', -1.0)
+        oob_penalty=getattr(args, 'oob_penalty', -1.0),
     )
     env.zone_progress_reward = getattr(args, 'zone_progress_reward', False)
-    print(f"   Env: masking_mode={env.masking_mode}, use_pbrs={env.use_pbrs}, subgoal_mode={getattr(args, 'subgoal_mode', 'zone')}")
+    env.disaster_prob = getattr(args, 'disaster_prob', 0.0)
+    env.dynamic_disaster = getattr(args, 'dynamic_disaster', False)
+    print(f"   Env: masking_mode={env.masking_mode}, subgoal_mode={getattr(args, 'subgoal_mode', 'zone')}")
     return env
 
 
@@ -219,10 +217,7 @@ def _run_worker_stage(args) -> None:
     # Worker 생성
     num_layers = getattr(args, 'num_layers', 2)
     use_jk_net = getattr(args, 'use_jk_net', False)
-    use_edge_attr = getattr(args, 'use_edge_attr', False)
-    use_is_visited = getattr(args, 'use_is_visited', False)
-    use_global_pool = getattr(args, 'use_global_pool', False)
-    node_dim = 5 if use_is_visited else 4
+    node_dim = 5
     worker = Worker(
         node_dim=node_dim,
         hidden_dim=args.hidden_dim,
@@ -230,16 +225,22 @@ def _run_worker_stage(args) -> None:
         dropout=0.0,
         use_checkpoint=False,
         use_jk_net=use_jk_net,
-        use_edge_attr=use_edge_attr,
-        use_is_visited=use_is_visited,
-        use_global_pool=use_global_pool,
     ).to(device)
-    print(f"   Worker: node_dim={node_dim}, hidden_dim={args.hidden_dim}, num_layers={num_layers}, use_is_visited={use_is_visited}, use_global_pool={use_global_pool}")
-
-    # Worker는 scratch에서 시작
-    print("📋 HRL Phase 1: Worker를 scratch에서 학습합니다.")
+    print(f"   Worker: node_dim={node_dim}, hidden_dim={args.hidden_dim}, num_layers={num_layers}")
 
     loaded_checkpoint_paths = []
+    
+    if args.worker_ckpt and os.path.exists(args.worker_ckpt):
+        print(f"📦 HRL Phase 1: 기존 Worker 체크포인트에서 이어서 학습합니다 ({args.worker_ckpt})")
+        payload = torch.load(args.worker_ckpt, map_location=device, weights_only=False)
+        if "worker_state" in payload:
+            worker.load_state_dict(payload["worker_state"])
+        else:
+            worker.load_state_dict(payload)
+        loaded_checkpoint_paths.append(args.worker_ckpt)
+    else:
+        print("📋 HRL Phase 1: Worker를 scratch에서 학습합니다.")
+
     config = _build_config(args, loaded_checkpoint_paths)
 
     # HRLWorkerTrainer에는 manager 인자가 필요하지만 실제 사용하지 않으므로 None 전달
@@ -262,10 +263,7 @@ def _run_manager_stage(args) -> None:
     # Worker 생성 및 체크포인트 로드
     num_layers = getattr(args, 'num_layers', 2)
     use_jk_net = getattr(args, 'use_jk_net', False)
-    use_edge_attr = getattr(args, 'use_edge_attr', False)
-    use_is_visited = getattr(args, 'use_is_visited', False)
-    use_global_pool = getattr(args, 'use_global_pool', False)
-    node_dim = 5 if use_is_visited else 4
+    node_dim = 5
     worker = Worker(
         node_dim=node_dim,
         hidden_dim=args.hidden_dim,
@@ -273,9 +271,6 @@ def _run_manager_stage(args) -> None:
         dropout=0.0,
         use_checkpoint=False,
         use_jk_net=use_jk_net,
-        use_edge_attr=use_edge_attr,
-        use_is_visited=use_is_visited,
-        use_global_pool=use_global_pool,
     ).to(device)
 
     wkr_ckpt = args.worker_ckpt if getattr(args, 'worker_ckpt', None) else _get_latest_ckpt(os.path.join('logs', 'rl_worker_stage'), 'best.pt')
@@ -387,28 +382,23 @@ if __name__ == "__main__":
     parser.add_argument("--masking_mode", type=str, default="soft_curr_next",
                         choices=["hard", "hard_full_seq", "soft_curr_next", "soft_flex"],
                         help="Action Masking 모드 (hard/hard_full_seq/soft_curr_next/soft_flex)")
-    parser.add_argument("--use_pbrs", action="store_true",
-                        help="hop_dist 기반 PBRS Dense Reward 활성")
     parser.add_argument("--num_layers", type=int, default=2,
                         help="GATv2 레이어 수 (1~4)")
     parser.add_argument("--use_jk_net", action="store_true",
                         help="JK-Net (Jumping Knowledge) 활성")
-    parser.add_argument("--use_edge_attr", action="store_true",
-                        help="Edge-Conditioned MP (Edge Features) 활성")
     parser.add_argument("--subgoal_mode", type=str, default="zone",
                         choices=["zone", "node"],
                         help="Manager Subgoal 모드 (zone / node)")
     
-    # Ablation Study Arguments
-    parser.add_argument("--use_relative_hop", action="store_true")
     parser.add_argument("--oob_penalty", type=float, default=-1.0)
-    parser.add_argument("--use_is_visited", action="store_true", help="Worker에 방문 노드 이력 상태 채널 추가 (5-dim)")
-    parser.add_argument("--use_global_pool", action="store_true", help="Worker Critic에 Global Mean Pooling 추가")
-    parser.add_argument('--baseline', action='store_true', help='Flat RL Baseline 학습 (Subgoal 비활성화)')
 
     # [Manager-Specific Settings] 추가
     parser.add_argument("--exp_name", type=str, default=None, help="Experiment name for logging directory")
     parser.add_argument("--worker_ckpt", type=str, default=None, help="Path to specific worker checkpoint")
+    
+    # [Phase 1 Stage 2,3 Disaster Settings]
+    parser.add_argument("--disaster_prob", type=float, default=0.0, help="에피소드 내 재난 발생 확률 (Stage 2)")
+    parser.add_argument("--dynamic_disaster", action="store_true", help="에피소드 진행 중 동적 재난 발생 활성화 (Stage 3)")
 
     args = parser.parse_args()
     train_rl(args)

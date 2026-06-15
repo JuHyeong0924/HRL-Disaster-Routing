@@ -302,9 +302,9 @@ class ManagerEnv:
         return mask
 
     @torch.no_grad()
-    def execute_worker(self, subgoal_zone_idx: int) -> Tuple[int, int, bool]:
+    def execute_worker(self, subgoal_zone_idx: int) -> Tuple[int, float, bool]:
         """Worker를 실행하여 서브골 존까지 이동. 결정적(argmax) 이동."""
-        steps_taken = 0
+        time_taken = 0.0
         goal_z = int(self._node_zone_tensor[self.goal_idx].item())
         
         for _ in range(self.c_max):
@@ -312,7 +312,7 @@ class ManagerEnv:
             
             # 도착 확인 (Worker가 목표 노드 도달 시 즉시 성공 반환)
             if self.current_idx == self.goal_idx:
-                return self.current_idx, steps_taken, True
+                return self.current_idx, time_taken, True
 
             w_state = self._get_worker_state(subgoal_zone_idx)
             w_mask = self._get_worker_action_mask()
@@ -321,7 +321,7 @@ class ManagerEnv:
             logits, _, _ = self.worker(
                 w_state, self.edge_index, batch=None,
                 neighbors_mask=w_mask,
-                edge_attr=self.edge_attr if self.worker.use_edge_attr else None,
+                edge_attr=self.edge_attr,
             )
 
             # 🚨 확률적 이동(sample) 삭제
@@ -330,8 +330,13 @@ class ManagerEnv:
             
             # ✅ 확정적 이동(argmax)으로 직진성 보장
             action = logits.argmax().item()
+            
+            u_node = self.idx_to_node[self.current_idx]
+            v_node = self.idx_to_node[action]
+            edge_weight = self.G[u_node][v_node].get('weight', 1.0)
+            time_taken += edge_weight
+            
             self.current_idx = action
-            steps_taken += 1
             self.total_worker_steps += 1
             
             new_z = int(self._node_zone_tensor[self.current_idx].item())
@@ -339,13 +344,13 @@ class ManagerEnv:
             self.worker_visited_nodes[self.current_idx] = 1.0
 
             if self.current_idx == self.goal_idx:
-                return self.current_idx, steps_taken, True
+                return self.current_idx, time_taken, True
                 
             # 워커가 새로운 구역(Zone) 경계선을 넘을 경우 즉시 이동 중단 (매니저 재개입 강제)
             if new_z != curr_z:
                 break
 
-        return self.current_idx, steps_taken, (self.current_idx == self.goal_idx)
+        return self.current_idx, time_taken, (self.current_idx == self.goal_idx)
 
     def step(self, subgoal_zone_idx: int) -> Tuple[float, bool, Dict]:
         if self.done:
@@ -370,7 +375,7 @@ class ManagerEnv:
         max_dist_pbrs = max(self.max_zone_dist, 50000.0)
         phi_before = max_dist_pbrs - float(self.zone_dist_matrix[start_z, goal_z])
 
-        end_idx, steps_taken, reached_goal = self.execute_worker(subgoal_zone_idx)
+        end_idx, time_taken, reached_goal = self.execute_worker(subgoal_zone_idx)
         
         end_z = int(self._node_zone_tensor[end_idx].item())
         reached_subgoal = (end_z == subgoal_zone_idx)
@@ -378,9 +383,8 @@ class ManagerEnv:
         # Base step cost + Manager Turn Penalty + Revisit Penalty
         manager_turn_penalty = -0.5
         
-        # [수정] 워커의 이동(steps_taken)에 대한 페널티 초선형(Super-linear) 함수 적용
-        # 옌센의 부등식에 의해 매니저가 긴 거리를 지시할수록 페널티가 기하급수적으로 폭발함
-        worker_step_penalty = -0.1 * (steps_taken ** 1.5)
+        # [수정] 워커의 이동(steps)이 아닌 소요 물리 시간(time_taken) 기반 페널티 적용
+        worker_step_penalty = -0.1 * time_taken
         
         step_cost = manager_turn_penalty + revisit_penalty + worker_step_penalty
             
@@ -417,7 +421,7 @@ class ManagerEnv:
             'start_idx': start_idx,
             'subgoal_zone': subgoal_zone_idx,
             'end_idx': end_idx,
-            'steps_taken': steps_taken,
+            'time_taken': time_taken,
             'manager_turns': self.manager_turns,
             'total_worker_steps': self.total_worker_steps,
             'reached_subgoal': reached_subgoal,

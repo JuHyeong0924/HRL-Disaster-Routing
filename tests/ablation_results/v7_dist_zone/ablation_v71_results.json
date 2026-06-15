@@ -1,0 +1,74 @@
+{
+  "Bv2_dij_bin_uni": {
+    "exp_name": "Bv2_dij_bin_uni",
+    "desc": "dijkstra(log1p) + binary + uniform",
+    "success_rate": 100.0,
+    "avg_path_len": 12.4,
+    "avg_sp_hop": 10.7,
+    "ratio_hop": 1.157,
+    "avg_total_dist": 33173.7,
+    "avg_sp_dist": 28317.9,
+    "ratio_dist": 1.171,
+    "reasons": {
+      "success": 200
+    }
+  },
+  "C_hop_tern_uni": {
+    "exp_name": "C_hop_tern_uni",
+    "desc": "hop + ternary + uniform",
+    "success_rate": 100.0,
+    "avg_path_len": 12.0,
+    "avg_sp_hop": 10.7,
+    "ratio_hop": 1.114,
+    "avg_total_dist": 34098.7,
+    "avg_sp_dist": 28317.9,
+    "ratio_dist": 1.207,
+    "reasons": {
+      "success": 200
+    }
+  },
+  "D_hop_bin_euc": {
+    "exp_name": "D_hop_bin_euc",
+    "desc": "hop + binary + euclidean",
+    "success_rate": 99.5,
+    "avg_path_len": 11.9,
+    "avg_sp_hop": 10.7,
+    "ratio_hop": 1.11,
+    "avg_total_dist": 34453.4,
+    "avg_sp_dist": 28392.1,
+    "ratio_dist": 1.205,
+    "reasons": {
+      "success": 199,
+      "max_steps": 1
+    }
+  },
+  "Ev2_dij_tern_euc": {
+    "exp_name": "Ev2_dij_tern_euc",
+    "desc": "dijkstra(log1p) + ternary + euclidean",
+    "success_rate": 99.5,
+    "avg_path_len": 13.2,
+    "avg_sp_hop": 10.6,
+    "ratio_hop": 1.216,
+    "avg_total_dist": 34274.4,
+    "avg_sp_dist": 28249.0,
+    "ratio_dist": 1.196,
+    "reasons": {
+      "success": 199,
+      "max_steps": 1
+    }
+  },
+  "F_hop_tern_euc": {
+    "exp_name": "F_hop_tern_euc",
+    "desc": "hop + ternary + euclidean (최종 후보)",
+    "success_rate": 100.0,
+    "avg_path_len": 12.4,
+    "avg_sp_hop": 10.7,
+    "ratio_hop": 1.148,
+    "avg_total_dist": 34878.8,
+    "avg_sp_dist": 28317.9,
+    "ratio_dist": 1.225,
+    "reasons": {
+      "success": 200
+    }
+  }
+}

@@ -80,7 +80,11 @@ class DisasterMap:
                     
                     capacity = float(parts[2])
                     length = float(parts[3])
-                    ff_time = float(parts[4]) if len(parts) > 4 else length
+                    # 시속 30km/h (약 1640.42 ft/min) 기준으로 분(minute) 단위 소요 시간 산출
+                    speed_ft_per_min = 1640.42
+                    travel_time_min = length / speed_ft_per_min
+                    
+                    ff_time = float(parts[4]) if len(parts) > 4 else travel_time_min
                     
                     # Speed is usually index 7 (8th column)
                     # Use fallback if missing
@@ -98,10 +102,10 @@ class DisasterMap:
                         self.graph.add_edge(u, v, 
                                             capacity=capacity, 
                                             length=length, 
-                                            base_weight=length, 
-                                            weight=length,
-                                            base_time=ff_time, 
-                                            travel_time=ff_time,
+                                            base_weight=travel_time_min, 
+                                            weight=travel_time_min,
+                                            base_time=travel_time_min, 
+                                            travel_time=travel_time_min,
                                             speed=speed,
                                             is_highway=is_highway_val, # [New]
                                             damage=0.0,
@@ -132,31 +136,36 @@ class DisasterMap:
                 })
 
     def apply_disaster_damage(self, damage_prob=0.3):
+        is_reset = (damage_prob <= 0.0)
+        
         for u, v in self.graph.edges():
             edge = self.graph[u][v]
             
+            # 초기화 (Reset) 모드
+            if is_reset:
+                edge['damage'] = 0.0
+                edge['status'] = 'Normal'
+                edge['weight'] = edge['base_weight']
+                edge['travel_time'] = edge['base_time']
+                edge['injured'] = 0
+                if edge['has_building']:
+                    edge['healthy'] = edge['total_people']
+                continue
+            
             # 1. Damage Event Trigger
             if random.random() < damage_prob:
-                # 2. Damage Severity Distribution (Skewed Control)
-                # Goal: Avoid excessive 'Complete' damage (Isolation risk)
-                # - Slight (40%): 0.0 ~ 0.2
-                # - Moderate (30%): 0.2 ~ 0.5
-                # - Extensive (25%): 0.5 ~ 0.8
-                # - Complete (5%): 0.8 ~ 1.0 (Critical)
-                
                 severity_roll = random.random()
                 if severity_roll < 0.40:
-                    # Slight
                     damage = random.uniform(0.01, 0.2)
                 elif severity_roll < 0.70:
-                    # Moderate
                     damage = random.uniform(0.2, 0.5)
                 elif severity_roll < 0.95:
-                    # Extensive
                     damage = random.uniform(0.5, 0.8)
                 else:
-                    # Complete (Rare)
                     damage = random.uniform(0.8, 1.0)
+                
+                # 무조건 기존 데미지와 누적 합산 (최대 1.0)
+                damage = min(1.0, edge.get('damage', 0.0) + damage)
                 
                 edge['damage'] = damage
                 base_w = edge['base_weight']
@@ -165,20 +174,20 @@ class DisasterMap:
                 # 3. Status Assignment (HAZUS)
                 if damage > 0.8:
                     edge['status'] = 'Closed' # Complete
-                    edge['weight'] = base_w * 1000.0 # Virtually infinite
-                    edge['travel_time'] = base_t * 1000.0
+                    edge['weight'] = base_w * 50.0
+                    edge['travel_time'] = base_t * 50.0
                 elif damage > 0.5:
                     edge['status'] = 'Danger' # Extensive
-                    edge['weight'] = base_w * 10.0 # Expensive
-                    edge['travel_time'] = base_t * 10.0
+                    edge['weight'] = base_w * 20.0
+                    edge['travel_time'] = base_t * 20.0
                 elif damage > 0.2:
                     edge['status'] = 'Caution' # Moderate
-                    edge['weight'] = base_w * 3.0
-                    edge['travel_time'] = base_t * 3.0
+                    edge['weight'] = base_w * 5.0
+                    edge['travel_time'] = base_t * 5.0
                 else:
                     edge['status'] = 'Normal' # Slight
-                    edge['weight'] = base_w * 1.1 
-                    edge['travel_time'] = base_t * 1.1
+                    edge['weight'] = base_w * 2.0 
+                    edge['travel_time'] = base_t * 2.0
                     
                 if edge['has_building']:
                     total_pop = edge['total_people']
@@ -186,14 +195,6 @@ class DisasterMap:
                     num_injured = int(total_pop * injury_rate)
                     edge['injured'] = num_injured
                     edge['healthy'] = total_pop - num_injured
-            else:
-                edge['damage'] = 0.0
-                edge['status'] = 'Normal'
-                edge['weight'] = edge['base_weight']
-                edge['travel_time'] = edge['base_time']
-                edge['injured'] = 0
-                if edge['has_building']:
-                    edge['healthy'] = edge['total_people']
 
     def get_shortest_path(self, start_node, end_node):
         try:

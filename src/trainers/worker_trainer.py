@@ -38,7 +38,7 @@ class HRLWorkerTrainer:
         self.ppo_epochs = getattr(config, 'ppo_epochs', 4)
         # 미니배치 크기: GNN forward OOM 방지 핵심
         self.mini_batch_size = getattr(config, 'mini_batch_size', 128)
-        self.batch_size = getattr(config, 'num_pomo', 32)
+        self.batch_size = getattr(config, 'batch_size', 24)
         
         self.optimizer = optim.Adam(self.worker.parameters(), lr=self.lr)
         
@@ -97,7 +97,7 @@ class HRLWorkerTrainer:
             
             ai = torch.arange(A, device=self.device).repeat_interleave(N)
             aei = torch.cat([self.edge_index + i * N for i in range(A)], dim=1)
-            ae_attr = self.edge_attr.repeat(A, 1) if self.worker.use_edge_attr else None
+            ae_attr = self.edge_attr.repeat(A, 1)
 
             # 모델 추론 (No Grad — 계산 그래프 없음)
             probs_all, values_all, _ = self.worker(x_flat, aei, batch=ai, neighbors_mask=mask_flat, edge_attr=ae_attr)
@@ -230,7 +230,7 @@ class HRLWorkerTrainer:
                 
                 ai = torch.arange(A, device=self.device).repeat_interleave(N)
                 aei = torch.cat([self.edge_index + i * N for i in range(A)], dim=1)
-                ae_attr = self.edge_attr.repeat(A, 1) if self.worker.use_edge_attr else None
+                ae_attr = self.edge_attr.repeat(A, 1)
                 
                 # GNN forward (미분 활성화)
                 probs_all, values_all, logits_all = self.worker(x_flat, aei, batch=ai, neighbors_mask=mask_flat, edge_attr=ae_attr)
@@ -281,13 +281,31 @@ class HRLWorkerTrainer:
         
         best_reward = -float('inf')
         B = self.batch_size
-        num_updates = max(1, episodes // B)
         
         print(f"📋 HRL Phase 1: Worker PPO 학습 (batch={B}, mini_batch={self.mini_batch_size}, ppo_epochs={self.ppo_epochs})")
         
-        with tqdm(total=num_updates, desc="Phase 1", ncols=120) as pbar:
-            for ep in range(1, num_updates + 1):
-                buffer, batch_results = self._run_batch_episodes(B)
+        ep_count = 0
+        with tqdm(total=episodes, desc="Phase 1 Worker", ncols=140, unit="ep") as pbar:
+            while ep_count < episodes:
+                
+                # ---------------------------------------------------------
+                # HRL 단계별 커리큘럼 전환 로직 (1:1:1 비율)
+                # ---------------------------------------------------------
+                if ep_count < episodes // 3:
+                    self.env.disaster_prob = 0.0
+                    self.env.dynamic_disaster = False
+                elif ep_count < (episodes // 3) * 2:
+                    self.env.disaster_prob = 0.5
+                    self.env.dynamic_disaster = False
+                else:
+                    self.env.dynamic_disaster = True
+
+                # 이번 배치에서 시뮬레이션할 에피소드 수 (마지막 배치를 위해)
+                current_batch_size = min(B, episodes - ep_count)
+                if current_batch_size <= 0:
+                    break
+                    
+                buffer, batch_results = self._run_batch_episodes(current_batch_size)
                 
                 for r in batch_results:
                     recent_rewards.append(r['reward'])
@@ -295,28 +313,26 @@ class HRLWorkerTrainer:
                     
                 loss_info = self._update_ppo(buffer)
                 
-                avg_reward = np.mean(recent_rewards)
-                avg_success = np.mean(recent_success)
+                avg_reward = np.mean(recent_rewards) if len(recent_rewards) > 0 else 0.0
+                avg_success = np.mean(recent_success) if len(recent_success) > 0 else 0.0
                 
-                pbar.update(1)
+                # Update progress bar
                 pbar.set_postfix({
                     'SR': f"{avg_success*100:.1f}%",
                     'Rw': f"{avg_reward:.1f}",
-                    'PLoss': f"{loss_info['policy_loss']:.3f}",
-                    'VLoss': f"{loss_info['value_loss']:.3f}"
+                    'P-Loss': f"{loss_info['policy_loss']:.3f}",
+                    'V-Loss': f"{loss_info['value_loss']:.3f}"
                 })
+                pbar.update(current_batch_size)
+                ep_count += current_batch_size
                 
-                if ep % 50 == 0:
-                    pbar.write(
-                        f'[Step {ep:4d}/{num_updates}] SR={avg_success*100:5.1f}% | '
-                        f'Rw={avg_reward:6.1f} | PLoss={loss_info["policy_loss"]:.3f}'
-                    )
-                    
                 # Best 모델 저장
-                if ep % 50 == 0 and avg_reward > best_reward and len(recent_success) >= 50:
+                if avg_reward > best_reward and len(recent_success) >= 50:
                     best_reward = avg_reward
+                    os.makedirs(self.save_dir, exist_ok=True)
                     torch.save(self.worker.state_dict(), os.path.join(self.save_dir, 'best.pt'))
 
         # Final 저장
-        torch.save(self.worker.state_dict(), os.path.join(self.save_dir, 'best.pt'))
-        print(f'✅ HRL Worker Phase 1 학습 완료! Best Reward: {best_reward:.1f}')
+        os.makedirs(self.save_dir, exist_ok=True)
+        torch.save(self.worker.state_dict(), os.path.join(self.save_dir, 'last.pt'))
+        print(f'✅ HRL Worker Phase 1 PPO 학습 완료! Best Reward: {best_reward:.1f}')

@@ -8,6 +8,7 @@
 
 #### `disaster_map.py` & `disaster_env.py`
 - **역할**: TNTP 기반의 도로망 데이터를 NetworkX 그래프로 로드하고 관리합니다. 그래프 구조에 Zone 메타데이터를 통합하여 물리적 라우팅 환경의 기반을 제공합니다.
+- **주요 기능**: `apply_disaster_damage()`를 통해 노드/간선에 재난(지진 등) 피해를 확률적으로 부여하며, **HAZUS 기반 가중치 패널티(Closed 10배, Danger 5배, Caution 3배, Normal 1.5배)**를 동적으로 반영합니다. `is_reset` 모드가 아닐 경우 재난 피해도는 기존 피해와 물리적으로 누적(`min(1.0, current + new)`)됩니다.
 
 #### `worker_env.py` (`WorkerEnv`)
 - **역할**: Worker 단독 학습(Phase 1)을 위한 라우팅 환경. 하나의 Zone 내부 혹은 근접 인접 Zone으로 이동하는 세부 노드 스텝을 제어. 실제 물리적 거리(Dijkstra APSP, `weight='weight'`)를 기반으로 한 상태 공간과 보상 체계를 제공.
@@ -37,9 +38,14 @@
   - `masking_mode`에 의해 인접하지 않은 Zone이나 이미 제자리 걸음(Self-loop)을 유도하는 Zone은 Logit = `-inf` 마스킹 처리됨.
 - **Reward Schema**: 
   - Base Penalty: Manager 턴 소모에 따른 패널티 (`-0.5`) + Revisit 패널티 (`-5.0`) + Worker의 소모 스텝수에 비례하는 초선형 패널티(`-0.1 * steps^{1.5}`).
-  - PBRS: Zone 이동 시 목표와의 물리적 거리가 가까워진 정도에 비례하는 포텐셜 보상. 무한 핑퐁 루프 등 Negative Potential Exploit를 막기 위해 포텐셜이 음수로 발산하지 않도록 `min(dist, 50000.0)` 처리 등 수학적 안정장치가 적용됨.
+  - PBRS: Zone 이동 시 목표와의 물리적 거리가 가까워진 정도에 비례하는 포텐셜 보상. `reward_pbrs = (np.log1p(prev_dist) - np.log1p(curr_dist)) * 2.0` 수식을 사용하여 여진(Aftershock) 등으로 거리가 수만 단위로 폭주하더라도 `11.3` 내외로 압축 정규화하여 가치 신경망의 Loss 발산을 원천 차단함.
 
-### 1.2. Neural Network Models (`src/models/`)
+### 1.2. Simulation Engine & Continuous Time Model (SMDP)
+- **시간 흐름(Time Tick) 설계**: 기존의 1-Hop = 1-Step 방식에서 탈피하여, 물리적 가중치 거리(`edge_weight`)에 기반해 실제 소요 시간을 계산하는 **연속 시간(Continuous Time) 모델**로 개편되었습니다.
+- **RL 환경 (`hrl_env.py`)**: `current_time`은 단순 스텝 수가 아닌, 워커가 통과하는 도로의 `weight_dist`만큼 더해집니다. 따라서 파괴된 구간을 통과하면 엄청난 시간이 누적되어 타겟 데드라인(TW)을 초과하게 되므로 에이전트가 이를 수학적으로 기피하게 됩니다.
+- **시각화 엔진 (`visualize_heuristic.py`)**: `0.5` 간격으로 `global_time` 틱이 발생하며, 워커가 도로에 진입하면 그 가중치에 비례하는 시간 동안 `Busy` 상태가 되어 의사결정이 잠깁니다. 또한, 시간 흐름에 비례하여 출발지와 도착지 간의 좌표를 선형 보간(Linear Interpolation)하여 물리적으로 부드럽게 이동하는 애니메이션을 렌더링합니다.
+
+### 1.3. Neural Network Models (`src/models/`)
 
 #### `worker.py` (`Worker`)
 - **Architecture**: Graph Attention Network v2 (GATv2) 중심의 Local-feature Extractor + Actor-Critic MLP Head.

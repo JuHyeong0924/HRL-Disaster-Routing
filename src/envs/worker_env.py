@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import random
 from typing import Dict, List, Tuple, Optional
+from scipy.sparse.csgraph import shortest_path
 
 from src.envs.disaster_map import DisasterMap
 
@@ -25,12 +26,9 @@ class WorkerEnv:
                  subgoal_mode: str = 'zone', # 'zone' or 'node'
                  masking_mode: str = 'hard', # 'hard', 'hard_full_seq', 'soft_curr_next', 'soft_flex'
                  oob_penalty: float = -1.0,
-                 use_pbrs: bool = True,
-                 use_relative_hop: bool = False,
-                 use_is_visited: bool = False,
-                 baseline: bool = False,
+                 disaster_prob: float = 0.0,
+                 dynamic_disaster: bool = False,
                  device: str = 'cpu'):
-        self.baseline = baseline
         # 1. 원본 맵 로드
         self.dm = DisasterMap(node_file, net_file)
         self.G = self.dm.graph
@@ -39,17 +37,15 @@ class WorkerEnv:
         self.idx_to_node = {i: n for n, i in self.node_to_idx.items()}
         self.num_nodes = len(self.nodes)
         
-        # APSP (가장 짧은 물리적 거리 계산) — 캐시 파일 우선 로드
+        
+        # Dijkstra 거리 행렬 (APSP) — 캐시 파일 우선 로드
         import hashlib
-        # 맵 파일 기반 캐시 키 생성 (노드/엣지 변경 시 자동 무효화)
         cache_key = hashlib.md5(f"{node_file}_{net_file}_{self.num_nodes}".encode()).hexdigest()[:8]
         cache_path = f"data/dist_matrix_{cache_key}.npy"
         
         if os.path.exists(cache_path):
-            # 캐시 파일에서 즉시 로드 (수 ms)
             self.dist_matrix = np.load(cache_path)
         else:
-            # 최초 1회: Dijkstra로 계산 후 캐시 저장
             self.apsp = dict(nx.all_pairs_dijkstra_path_length(self.G, weight='weight'))
             self.dist_matrix = np.full((self.num_nodes, self.num_nodes), np.inf)
             for u, lengths in self.apsp.items():
@@ -59,9 +55,11 @@ class WorkerEnv:
                     self.dist_matrix[u_idx, v_idx] = length
             np.save(cache_path, self.dist_matrix)
                 
-        # 최대 거리(Graph Diameter) 계산 및 저장 (정규화에 사용)
         valid_dists = self.dist_matrix[self.dist_matrix < np.inf]
         self.max_dist = float(np.max(valid_dists)) if len(valid_dists) > 0 else 25.0
+        # log1p 변환 후 최대값 (dijkstra 정규화용)
+        self.max_log_dist = float(np.log1p(self.max_dist))
+        
                 
         # 2. Zone 데이터 로드
         with open(zone_json, 'r') as f:
@@ -105,11 +103,8 @@ class WorkerEnv:
         for z_str, neighbors in self.zone_graph_data['zone_adjacency'].items():
             z = int(z_str)
             for neighbor in neighbors:
-                # 중심점 간 유클리디안 거리를 엣지 가중치로 부여
-                p1 = self.zone_centroids[z]
-                p2 = self.zone_centroids[neighbor]
-                dist = float(torch.norm(p1 - p2))
-                self.ZG.add_edge(z, neighbor, weight=dist)
+                w = 1.0  # uniform
+                self.ZG.add_edge(z, neighbor, weight=w)
         
         # 인접 리스트 사전 계산 (idx 기반)
         self._adj_list = [[] for _ in range(self.num_nodes)]
@@ -120,7 +115,6 @@ class WorkerEnv:
                 
         # 보상 설정
         self.GOAL_REWARD = 50.0
-        self.STEP_PENALTY = -0.1
         self.INVALID_PENALTY = -10.0
         self.MAX_STEPS = 200
         self.zone_progress_reward = False  # [P0] Ablation 제어 플래그
@@ -132,12 +126,12 @@ class WorkerEnv:
         # soft_flex: 물리적 제약 없음, 전체 시퀀스 이탈 시 OOB 페널티
         self.masking_mode = masking_mode
         self.oob_penalty = oob_penalty
-        self.use_pbrs = use_pbrs
-        self.use_relative_hop = use_relative_hop
-        self.use_is_visited = use_is_visited
 
         self.device = torch.device(device)
         self.subgoal_mode = subgoal_mode  # 'zone' or 'node'
+        
+        self.disaster_prob = disaster_prob # 기본값 (재난 없음)
+        self.dynamic_disaster = dynamic_disaster # 동적 재난 모드
         
         # 배치 상태 관리 (reset에서 초기화)
         self.batch_size = 1
@@ -167,7 +161,19 @@ class WorkerEnv:
         self.node_seq_idxs = torch.zeros(batch_size, dtype=torch.long)
         self.steps_count = torch.zeros(batch_size, dtype=torch.long)
         self.dones = torch.zeros(batch_size, dtype=torch.bool)
+        self.total_dist = torch.zeros(batch_size, dtype=torch.float)  # 물리적 이동 거리 누적
         
+        # [Phase 1 Stage 2] 정적 재난 (에피소드 시작 시)
+        if self.disaster_prob > 0 and not self.dynamic_disaster:
+            self.dm.apply_disaster_damage(damage_prob=self.disaster_prob)
+            self._update_zone_graph_weights()
+            self._update_dist_matrix()
+        elif self.dynamic_disaster:
+            # 동적 모드일 경우 시작 시엔 재난 없이 시작
+            self.dm.apply_disaster_damage(damage_prob=0.0)
+            self._update_zone_graph_weights()
+            self._update_dist_matrix()
+            
         for b in range(batch_size):
             # 무작위 시종착점 선택 (서로 다른 Zone에 속하도록)
             while True:
@@ -207,7 +213,57 @@ class WorkerEnv:
             self.visited_nodes[b, int(self.curr_nodes[b].item())] = 1.0
             
         return self._get_state_batch()
-    
+        
+    def _update_zone_graph_weights(self):
+        """재난 발생으로 인한 Edge damage를 기반으로 Zone Graph의 weight 갱신"""
+        for u_z, v_z in self.ZG.edges():
+            cross_damages = []
+            for node_u in self.z2n[u_z]:
+                for node_v in self.z2n[v_z]:
+                    if self.G.has_edge(node_u, node_v):
+                        cross_damages.append(self.G[node_u][node_v].get('damage', 0.0))
+            avg_damage = sum(cross_damages) / max(len(cross_damages), 1)
+            
+            # 원래 weight에 비례하여 증가 (baseline: uniform weight 1.0)
+            base_weight = 1.0
+                
+            self.ZG[u_z][v_z]['weight'] = base_weight * (1 + avg_damage * 10)
+            
+    def _update_dist_matrix(self):
+        """Scipy를 사용하여 O(V^3) 플로이드 워셜을 밀리초 단위로 초고속 수행하여 dist_matrix 실시간 최신화"""
+        adj = nx.to_scipy_sparse_array(self.G, weight='weight')
+        self.dist_matrix = shortest_path(csgraph=adj, directed=False)
+        # 주의: 신경망 정규화 스케일 안정을 위해 self.max_dist는 초기 깨끗한 맵 기준값을 유지합니다.
+            
+    def apply_dynamic_disaster(self):
+        """[Phase 1 Stage 3] 에피소드 진행 중 동적 재난 발생 시뮬레이션"""
+        self.dm.apply_disaster_damage(damage_prob=self.disaster_prob)
+        self._update_zone_graph_weights()
+        self._update_dist_matrix()
+        
+        # 기존 경로를 무효화하고 진행중인(완료되지 않은) 에피소드의 Zone Sequence 재계산
+        for b in range(self.batch_size):
+            if not self.dones[b]:
+                curr_node_idx = int(self.curr_nodes[b].item())
+                target_node_idx = int(self.target_nodes[b].item())
+                sz = self.n2z[self.idx_to_node[curr_node_idx]]
+                tz = self.n2z[self.idx_to_node[target_node_idx]]
+                
+                try:
+                    zseq = nx.astar_path(self.ZG, sz, tz, weight='weight')
+                except nx.NetworkXNoPath:
+                    zseq = [sz, tz]
+                    
+                self.zone_sequences[b] = zseq
+                self.zone_seq_idxs[b] = 0
+                
+    def apply_aftershock(self):
+        """[Phase 2 HRL] 에피소드 진행 중 동적 재난(여진) 발생 시뮬레이션 (Manager 경로 덮어쓰기 방지)"""
+        self.dm.apply_disaster_damage(damage_prob=self.disaster_prob)
+        self._update_zone_graph_weights()
+        self._update_dist_matrix()
+        # 주의: HRL 구조에서는 zone_sequences를 재계산하지 않음 (Manager의 z_act를 유지하기 위함)
+                
     def _get_current_and_next_zone_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """배치별 현재 Zone과 다음 Zone 반환. [B] 텐서 2개."""
         curr_z = torch.zeros(self.batch_size, dtype=torch.long)
@@ -226,7 +282,7 @@ class WorkerEnv:
         """배치 Worker 입력 상태 구성 [B, N, D]."""
         B = self.batch_size
         N = self.num_nodes
-        state_dim = 5 if self.use_is_visited else 4
+        state_dim = 5
         state = torch.zeros(B, N, state_dim)
         
         curr_z, next_z = self._get_current_and_next_zone_batch()
@@ -238,39 +294,29 @@ class WorkerEnv:
             # is_tgt
             state[b, self.target_nodes[b], 1] = 1.0
             
-            if not self.baseline:
-                if self.subgoal_mode == 'zone':
-                    # zone_info: -1(금지/이탈), 0(현재Zone), 1(목표Zone)
-                    c_z = int(curr_z[b].item())
-                    n_z = int(next_z[b].item())
-                    state[b, :, 2] = -1.0
-                    state[b, nz_tensor == c_z, 2] = 0.0
-                    state[b, nz_tensor == n_z, 2] = 1.0
-                elif self.subgoal_mode == 'node':
-                    # is_next_target: 서브골 Node 1개만 활성화
-                    state[b, :, 2] = -1.0
-                    state[b, int(self.subgoal_nodes[b].item()), 2] = 1.0
+            if self.subgoal_mode == 'zone':
+                n_z = int(next_z[b].item())
+                # binary: 0(기타), 1(다음 Zone에 속한 노드)
+                state[b, :, 2] = 0.0
+                state[b, nz_tensor == n_z, 2] = 1.0
+            elif self.subgoal_mode == 'node':
+                state[b, :, 2] = -1.0
+                state[b, int(self.subgoal_nodes[b].item()), 2] = 1.0
                 
-            # dist
+            # dist (Ch.3): Dijkstra (Normalized)
             tgt_idx = int(self.target_nodes[b].item())
-            dists = torch.from_numpy(self.dist_matrix[:, tgt_idx].copy()).float()
+            # log1p 변환으로 smoothing 해결: [0, 83800] → [0, 11.3]
+            raw = torch.log1p(torch.from_numpy(self.dist_matrix[:, tgt_idx].copy()).float())
             
-            if self.use_relative_hop:
-                curr_idx = int(self.curr_nodes[b].item())
-                curr_dist = float(self.dist_matrix[curr_idx, tgt_idx])
-                # 상대적 거리 기울기
-                rel_dists = (curr_dist - dists)
-                # 정규화 (실제 거리에 맞게 스케일 조정)
-                scale = max(self.max_dist * 0.1, 1.0)
-                rel_dists = torch.clamp(rel_dists, -scale, scale) / scale
-                state[b, :, 3] = rel_dists
-            else:
-                dists = torch.clamp(dists, max=100000.0) / max(self.max_dist, 1.0)
-                state[b, :, 3] = dists
+            curr_idx = int(self.curr_nodes[b].item())
+            curr_val = float(np.log1p(self.dist_matrix[curr_idx, tgt_idx]))
+            scale = 3.0  # log 스케일에서 적절한 클리핑 범위
+            rel = (curr_val - raw)
+            rel = torch.clamp(rel, -scale, scale) / scale
+            state[b, :, 3] = rel
                 
-            # is_visited 채널 (use_is_visited 활성화 시)
-            if self.use_is_visited:
-                state[b, :, 4] = self.visited_nodes[b]
+            # is_visited 채널
+            state[b, :, 4] = self.visited_nodes[b]
 
             
         return state
@@ -336,18 +382,16 @@ class WorkerEnv:
         curr_z, next_z = self._get_current_and_next_zone_batch()
         nz_tensor = self._node_zone_tensor
         
-        # [PBRS] 이동 전 dist 기록 (use_pbrs=True 시에만 사용)
-        prev_dists = None
-        if self.use_pbrs:
-            prev_dists = torch.zeros(B)
-            for b in range(B):
-                if not self.dones[b]:
-                    ci = int(self.curr_nodes[b].item())
-                    if self.subgoal_mode == 'node':
-                        ti = int(self.subgoal_nodes[b].item())
-                    else:
-                        ti = int(self.target_nodes[b].item())
-                    prev_dists[b] = float(self.dist_matrix[ci, ti])
+        # [PBRS] 이동 전 거리 기록
+        prev_dists = torch.zeros(B)
+        for b in range(B):
+            if not self.dones[b]:
+                ci = int(self.curr_nodes[b].item())
+                if self.subgoal_mode == 'node':
+                    ti = int(self.subgoal_nodes[b].item())
+                else:
+                    ti = int(self.target_nodes[b].item())
+                prev_dists[b] = float(np.log1p(self.dist_matrix[ci, ti]))
         
         for b in range(B):
             if self.dones[b]:
@@ -402,6 +446,11 @@ class WorkerEnv:
             
             # Update current nodes
             self.curr_nodes[b] = action_idx
+            # 물리적 이동 거리 누적
+            u_node = self.idx_to_node[curr_idx]
+            v_node = self.idx_to_node[action_idx]
+            edge_weight = self.G[u_node][v_node].get('weight', 1.0)
+            self.total_dist[b] += edge_weight
             if not self.dones[b]:
                 self.visited_nodes[b, action_idx] = 1.0
             
@@ -424,22 +473,24 @@ class WorkerEnv:
                             rewards[b] += 2.0
                 
             # 목적지 도착 검사
+            time_penalty = -0.1 * edge_weight
+            
             if action_idx == int(self.target_nodes[b].item()):
                 rewards[b] = self.GOAL_REWARD
                 self.dones[b] = True
-                infos[b] = {'reason': 'success', 'path_len': int(self.steps_count[b].item())}
+                infos[b] = {'reason': 'success', 'path_len': int(self.steps_count[b].item()), 'total_dist': float(self.total_dist[b].item())}
             elif int(self.steps_count[b].item()) >= self.MAX_STEPS:
-                rewards[b] += self.STEP_PENALTY
+                rewards[b] += time_penalty
                 self.dones[b] = True
-                infos[b] = {'reason': 'max_steps', 'path_len': int(self.steps_count[b].item())}
+                infos[b] = {'reason': 'max_steps', 'path_len': int(self.steps_count[b].item()), 'total_dist': float(self.total_dist[b].item())}
             else:
-                rewards[b] += self.STEP_PENALTY
+                rewards[b] += time_penalty
                 # [v3] OOB 페널티 추가 (soft 모드에서 Zone 이탈 시)
                 if is_oob:
                     rewards[b] += self.oob_penalty
         
         # [v3 PBRS] 이동 후 dist 차이 기반 Dense Reward 추가
-        if self.use_pbrs and prev_dists is not None:
+        if prev_dists is not None:
             for b in range(B):
                 # 이미 종료(success/invalid/stagnation)된 에피소드는 PBRS 적용 안 함
                 if infos[b].get('reason') in ('success', 'invalid', 'stagnation'):
@@ -449,10 +500,9 @@ class WorkerEnv:
                     ti = int(self.subgoal_nodes[b].item())
                 else:
                     ti = int(self.target_nodes[b].item())
-                new_dist = float(self.dist_matrix[ci, ti])
+                new_dist = float(np.log1p(self.dist_matrix[ci, ti]))
                 # PBRS: Φ(s) = -dist → 가까워지면 양수, 멀어지면 음수
-                # 거리 스케일에 맞춰 계수를 조절해야 함. 너무 크지 않도록 스케일링.
-                scale_factor = 0.5 / max(self.max_dist * 0.1, 1.0)
+                scale_factor = 0.5  # log 스케일에서는 hop과 유사한 범위
                 pbrs = (prev_dists[b].item() - new_dist) * scale_factor
                 rewards[b] += pbrs
                 
