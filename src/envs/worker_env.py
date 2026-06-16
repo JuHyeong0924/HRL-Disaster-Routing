@@ -79,6 +79,7 @@ class WorkerEnv:
         self._node_zone_tensor = torch.tensor(
             [self.n2z[self.idx_to_node[i]] for i in range(self.num_nodes)],
             dtype=torch.long,
+            device=device
         )
         
         # Zone Centroids 계산 (물리적 거리 가중치용)
@@ -112,6 +113,19 @@ class WorkerEnv:
             ui, vi = self.node_to_idx[u], self.node_to_idx[v]
             self._adj_list[ui].append(vi)
             self._adj_list[vi].append(ui)
+            
+        # Dense Adjacency Matrix Tensor 생성 (Vectorized Masking용)
+        self._adj_matrix_tensor = torch.zeros((self.num_nodes, self.num_nodes), dtype=torch.bool, device=device)
+        for u in range(self.num_nodes):
+            for v in self._adj_list[u]:
+                self._adj_matrix_tensor[u, v] = True
+                
+        # Zone Adjacency Matrix Tensor 생성 (Manager Masking용)
+        self._zone_adj_matrix_tensor = torch.zeros((self.k, self.k), dtype=torch.bool, device=device)
+        for u in self.ZG.nodes():
+            self._zone_adj_matrix_tensor[u, u] = True # 자기 자신도 허용
+            for v in self.ZG.neighbors(u):
+                self._zone_adj_matrix_tensor[u, v] = True
                 
         # 보상 설정
         self.GOAL_REWARD = 50.0
@@ -279,50 +293,53 @@ class WorkerEnv:
         return curr_z, next_z
     
     def _get_state_batch(self) -> torch.Tensor:
-        """배치 Worker 입력 상태 구성 [B, N, D]."""
+        """배치 Worker 입력 상태 구성 [B, N, D] (Fully Vectorized)."""
         B = self.batch_size
         N = self.num_nodes
         state_dim = 5
-        state = torch.zeros(B, N, state_dim)
+        state = torch.zeros(B, N, state_dim, device=self.device)
         
         curr_z, next_z = self._get_current_and_next_zone_batch()
-        nz_tensor = self._node_zone_tensor  # [N]
+        curr_z = curr_z.to(self.device)
+        next_z = next_z.to(self.device)
+        nz_tensor = self._node_zone_tensor.to(self.device)
         
-        for b in range(B):
-            # is_curr
-            state[b, self.curr_nodes[b], 0] = 1.0
-            # is_tgt
-            state[b, self.target_nodes[b], 1] = 1.0
+        batch_idx = torch.arange(B, device=self.device)
+        curr_nodes = self.curr_nodes.to(self.device)
+        target_nodes = self.target_nodes.to(self.device)
+        
+        # is_curr, is_tgt 채널 일괄 업데이트
+        state[batch_idx, curr_nodes, 0] = 1.0
+        state[batch_idx, target_nodes, 1] = 1.0
+        
+        if self.subgoal_mode == 'zone':
+            # binary: 0(기타), 1(다음 Zone에 속한 노드)
+            state[:, :, 2] = (nz_tensor.unsqueeze(0) == next_z.unsqueeze(1)).float()
+        elif self.subgoal_mode == 'node':
+            state[:, :, 2] = -1.0
+            subgoal_nodes = self.subgoal_nodes.to(self.device)
+            state[batch_idx, subgoal_nodes, 2] = 1.0
             
-            if self.subgoal_mode == 'zone':
-                n_z = int(next_z[b].item())
-                # binary: 0(기타), 1(다음 Zone에 속한 노드)
-                state[b, :, 2] = 0.0
-                state[b, nz_tensor == n_z, 2] = 1.0
-            elif self.subgoal_mode == 'node':
-                state[b, :, 2] = -1.0
-                state[b, int(self.subgoal_nodes[b].item()), 2] = 1.0
+        # dist (Ch.3): Dijkstra (Normalized) 일괄 연산
+        dist_tensor = torch.from_numpy(self.dist_matrix).float().to(self.device)
+        
+        # raw: 타겟 노드에서 모든 노드까지의 거리 [B, N]
+        raw = torch.log1p(dist_tensor[:, target_nodes].T) 
+        
+        # curr_val: 현재 노드에서 타겟 노드까지의 거리 [B, 1]
+        curr_val = torch.log1p(dist_tensor[curr_nodes, target_nodes]).unsqueeze(1)
+        scale = 3.0
+        rel = (curr_val - raw)
+        rel = torch.clamp(rel, -scale, scale) / scale
+        state[:, :, 3] = rel
                 
-            # dist (Ch.3): Dijkstra (Normalized)
-            tgt_idx = int(self.target_nodes[b].item())
-            # log1p 변환으로 smoothing 해결: [0, 83800] → [0, 11.3]
-            raw = torch.log1p(torch.from_numpy(self.dist_matrix[:, tgt_idx].copy()).float())
-            
-            curr_idx = int(self.curr_nodes[b].item())
-            curr_val = float(np.log1p(self.dist_matrix[curr_idx, tgt_idx]))
-            scale = 3.0  # log 스케일에서 적절한 클리핑 범위
-            rel = (curr_val - raw)
-            rel = torch.clamp(rel, -scale, scale) / scale
-            state[b, :, 3] = rel
-                
-            # is_visited 채널
-            state[b, :, 4] = self.visited_nodes[b]
-
+        # is_visited 채널
+        state[:, :, 4] = self.visited_nodes
             
         return state
     
     def get_action_mask_batch(self) -> torch.Tensor:
-        """배치별 Action Masking [B, N].
+        """배치별 Action Masking [B, N] (Fully Vectorized).
         
         masking_mode에 따라 허용 범위가 달라짐:
         - hard: {현재 Zone, 다음 Zone} 이웃만 허용
@@ -331,39 +348,40 @@ class WorkerEnv:
         """
         B = self.batch_size
         N = self.num_nodes
-        mask = torch.zeros(B, N)
         
         curr_z, next_z = self._get_current_and_next_zone_batch()
-        nz_tensor = self._node_zone_tensor
+        curr_z = curr_z.to(self.device)
+        next_z = next_z.to(self.device)
+        nz_tensor = self._node_zone_tensor.to(self.device)
         
-        for b in range(B):
-            if self.dones[b]:
-                mask[b, int(self.curr_nodes[b].item())] = 1.0
-                continue
+        curr_nodes = self.curr_nodes.to(self.device)
+        
+        # Dense 인접 행렬을 통해 모든 에이전트의 인접 노드 일괄 마스킹
+        mask = self._adj_matrix_tensor[curr_nodes].clone().float() # [B, N]
+        
+        # 하드 마스킹 제약 추가
+        if self.masking_mode == 'hard':
+            allowed = (nz_tensor.unsqueeze(0) == curr_z.unsqueeze(1)) | (nz_tensor.unsqueeze(0) == next_z.unsqueeze(1))
+            mask = mask * allowed.float()
+        elif self.masking_mode == 'hard_full_seq':
+            # 시퀀스 길이가 달라서 배칭이 까다로우므로 순차 처리
+            for b in range(B):
+                if not self.dones[b]:
+                    allowed_zones = set(self.zone_sequences[b])
+                    for n in range(N):
+                        if int(nz_tensor[n].item()) not in allowed_zones:
+                            mask[b, n] = 0.0
+                            
+        # 종료된 에이전트 마스킹 해제 및 stagnation 방지 (갈 곳이 없으면 제자리 허용)
+        dones_gpu = self.dones.to(self.device)
+        mask[dones_gpu] = 0.0
+        
+        # 갈 곳이 없는 경우(Stagnation) 현재 노드라도 1.0으로 만들어줌
+        mask_sums = mask.sum(dim=1)
+        stagnation_batches = (mask_sums == 0) & (~dones_gpu)
+        if stagnation_batches.any():
+            mask[stagnation_batches, curr_nodes[stagnation_batches]] = 1.0
             
-            curr_idx = int(self.curr_nodes[b].item())
-            
-            if self.masking_mode in ('soft_curr_next', 'soft_flex'):
-                # Soft 모드: 물리적 인접 노드 전부 허용 (페널티로 유도)
-                for neighbor_idx in self._adj_list[curr_idx]:
-                    mask[b, neighbor_idx] = 1.0
-            elif self.masking_mode == 'hard_full_seq':
-                # Hard Full Seq: Zone Sequence 전체에 속한 이웃만 허용
-                allowed = set(self.zone_sequences[b])
-                for neighbor_idx in self._adj_list[curr_idx]:
-                    if int(nz_tensor[neighbor_idx].item()) in allowed:
-                        mask[b, neighbor_idx] = 1.0
-            else:
-                # Hard (기본): 현재/다음 Zone 이웃만 허용
-                allowed = {int(curr_z[b].item()), int(next_z[b].item())}
-                for neighbor_idx in self._adj_list[curr_idx]:
-                    if int(nz_tensor[neighbor_idx].item()) in allowed:
-                        mask[b, neighbor_idx] = 1.0
-            
-            # 갈 곳이 없으면 제자리 허용 (Stagnation 방지)
-            if mask[b].sum() == 0:
-                mask[b, curr_idx] = 1.0
-                
         return mask
     
     def step_batch(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[dict]]:
@@ -416,6 +434,10 @@ class WorkerEnv:
                 self.dones[b] = True
                 infos[b] = {'reason': 'stagnation', 'path_len': int(self.steps_count[b].item())}
                 continue
+            
+            # 재방문 패널티 추가 (무한루프 방지)
+            if self.visited_nodes[b, action_idx] == 1.0:
+                rewards[b] -= 5.0
             
             # Zone 위반 여부 판정 (masking_mode별 분기)
             is_oob = False

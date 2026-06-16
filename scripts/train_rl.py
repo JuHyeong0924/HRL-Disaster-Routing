@@ -325,7 +325,7 @@ def train_rl(args):
         args.episodes = args.steps * args.batch_size
         print(f"📐 배치={args.batch_size}, 스텝={args.steps} → 총 에피소드={args.episodes}")
     elif args.episodes is None:
-        args.episodes = 5000  # 기본값
+        args.episodes = 20000  # 기본값
         print(f"📐 배치={args.batch_size}, 에피소드={args.episodes} → 스텝={args.episodes // args.batch_size}")
     else:
         print(f"📐 배치={args.batch_size}, 에피소드={args.episodes} → 스텝={args.episodes // args.batch_size}")

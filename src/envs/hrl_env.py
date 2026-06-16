@@ -20,6 +20,14 @@ class HRLEnv:
         self.max_time = 200
         self.max_manager_turns = 50
         
+        # ManagerTrainer 호환성을 위한 zone_dist_matrix 사전 계산
+        z_apsp = dict(nx.all_pairs_dijkstra_path_length(self.env.ZG, weight='weight'))
+        z_mat = np.full((self.env.k, self.env.k), np.inf)
+        for u, lengths in z_apsp.items():
+            for v, length in lengths.items():
+                z_mat[u, v] = length
+        self.zone_dist_matrix = torch.tensor(z_mat, dtype=torch.float32, device=self.env.device)
+        
         # 상태 변수
         self.batch_size = 1
         self.num_targets = 10
@@ -264,6 +272,16 @@ class HRLEnv:
         
         for b in range(B):
             if not self.dones[b]:
+                # ---------------------------------------------
+                # [CRITICAL FIX] Manager 턴이 새로 시작될 때마다 Worker의 내부 상태를 초기화합니다.
+                self.env.dones[b] = False
+                self.env.steps_count[b] = 0
+                
+                # 매 턴마다 방문 이력 리셋 (단, 현재 위치는 방문 처리)
+                self.env.visited_nodes[b].zero_()
+                self.env.visited_nodes[b, int(self.env.curr_nodes[b].item())] = 1.0
+                # ---------------------------------------------
+                
                 self.manager_turns[b] += 1
                 t_idx = self.curr_target_idx[b].item()
                 self.env.target_nodes[b] = self.targets[b, t_idx]

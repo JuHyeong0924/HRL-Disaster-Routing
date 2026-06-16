@@ -45,8 +45,12 @@ class ManagerUnified(nn.Module):
         # h_last (128) + elapsed_time (1) + num_rescued (1)
         self.context_proj = nn.Linear(hidden_dim + 2, hidden_dim)
         
-        # 5. Zone Query Projection
-        self.zone_query_proj = nn.Linear(hidden_dim + hidden_dim, hidden_dim)
+        # 5. Zone Score Network (Query + ZoneEmb + Dist)
+        self.zone_score_net = nn.Sequential(
+            nn.Linear(hidden_dim + hidden_dim + 1, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
         
         # 6. Critic Head (Value Estimator)
         self.value_head = nn.Sequential(
@@ -126,23 +130,39 @@ class ManagerUnified(nn.Module):
         scores.masked_fill_(invalid, float('-inf'))
         return scores, invalid, t_emb_dense
         
-    def get_zone_logits(self, query, selected_target_emb, zone_embeddings, zone_adj_mask, zone_batch):
+    def get_zone_logits(self, query, selected_target_emb, zone_embeddings, zone_adj_mask, zone_batch, selected_target_zone_idx, zone_dist_matrix):
         """
         query: [B, 128]
         selected_target_emb: [B, 128]
         zone_embeddings: [total_K, 128]
         zone_adj_mask: [total_K] (1 for valid adjacent zones, 0 for invalid)
         zone_batch: [total_K]
+        selected_target_zone_idx: [B]
+        zone_dist_matrix: [B, K, K]
         
         Returns: [B, max_K] logits, and the invalid mask [B, max_K]
         """
         z_emb_dense, mask_dense = to_dense_batch(zone_embeddings, zone_batch) # [B, max_K, 128]
         z_mask_valid, _ = to_dense_batch(zone_adj_mask, zone_batch) # [B, max_K]
         
-        zone_query = self.zone_query_proj(torch.cat([query, selected_target_emb], dim=-1)) # [B, 128]
+        B, max_K, _ = z_emb_dense.shape
         
-        scores = torch.bmm(zone_query.unsqueeze(1), z_emb_dense.transpose(1, 2)).squeeze(1) # [B, max_K]
-        scores = scores / (self.hidden_dim ** 0.5)
+        # 1. Expand query & selected_target_emb to match max_K
+        query_expanded = query.unsqueeze(1).expand(B, max_K, -1) # [B, max_K, 128]
+        
+        # 2. Extract distance from each Zone to the Selected Target Zone
+        # dist_matrix: [B, K, K]. We want [B, K] where it's the distance to selected_target_zone_idx.
+        b_idx = torch.arange(B, device=query.device)
+        target_dists = zone_dist_matrix[b_idx, :, selected_target_zone_idx].unsqueeze(-1) # [B, K, 1]
+        
+        # Pad target_dists if max_K > K (although K is usually constant per batch)
+        if max_K > target_dists.size(1):
+            pad = torch.zeros(B, max_K - target_dists.size(1), 1, device=query.device)
+            target_dists = torch.cat([target_dists, pad], dim=1)
+            
+        # 3. Concatenate and score
+        combined = torch.cat([query_expanded, z_emb_dense, target_dists], dim=-1) # [B, max_K, 128 + 128 + 1]
+        scores = self.zone_score_net(combined).squeeze(-1) # [B, max_K]
         
         invalid = (~mask_dense) | (z_mask_valid == 0)
         scores.masked_fill_(invalid, float('-inf'))

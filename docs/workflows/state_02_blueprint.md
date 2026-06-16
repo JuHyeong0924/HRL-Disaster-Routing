@@ -1,28 +1,27 @@
-# State 02: Blueprint
+# State 02: System Design & Blueprint
 
-## Architectural Optimization: Vectorized Environment
+## 1. Architectural Changes
 
-### Identified Bottlenecks (CPU/GPU Starvation)
-1. **Inefficient Tensor Assembly (`torch.stack` overhead):** 
-   In `hrl_env.py`, the state and mask tensors are gathered via list comprehensions: `torch.stack([st[b] for b in active])`. Since `st` is already a batched tensor of shape `[B, N, D]`, this slicing and restacking forces PyTorch to allocate `len(active)` separate memory blocks and concatenate them on the CPU, causing massive `1368%` CPU load.
-2. **Unvectorized Python `for` loops in Env:** 
-   `WorkerEnv._get_state_batch()` and `WorkerEnv.get_action_mask_batch()` iterate over `B` items sequentially in Python. 
-3. **Dictionary Lookups in Hot Loop:**
-   `self._adj_list` is a Python list of lists, causing branch mispredictions and slow CPU memory lookups during the adjacency checks.
+### 1.1 `src/envs/worker_env.py`
+**Goal:** Worker Policy가 "이미 방문했던 노드(Revisiting)"를 자발적으로 기피하는 정책을 학습하도록, 명확한 음의 보상(Negative Reward)을 부여합니다.
+- `step_batch()` 함수 내부 수정:
+  ```python
+  if self.visited_nodes[b, action_idx] == 1.0:
+      rewards[b] -= 5.0  # 재방문 시 강력한 패널티 부여
+  ```
+- 이 수정을 통해 워커는 `visited_nodes` (5번째 채널)을 보고 해당 노드를 피해야 한다는 것을 PPO 그라디언트를 통해 배우게 됩니다.
 
-### Proposed Changes
+### 1.2 `src/envs/hrl_env.py`
+**Goal:** 매니저가 새로운 서브 목표(Subgoal Zone)를 제시할 때마다 워커의 금지 구역(Visited Memory)을 백지화합니다.
+- 사용자의 피드백 반영: "이미 방문한 노드를 영구히 막으면, 나중에 다른 목적지로 갈 때 지나가야 하는 길목이 막혀버립니다."
+- `step_manager()` 함수 내의 워커 턴 시작 부분 수정:
+  ```python
+  self.env.visited_nodes[b].zero_()
+  self.env.visited_nodes[b, int(self.env.curr_nodes[b].item())] = 1.0
+  ```
+- 임시로 추가했던 `visited_mask * 1e5` Logit 페널티를 완전히 롤백하여 워커가 자율적으로 결정하도록 복구합니다.
 
-#### 1. `src/envs/hrl_env.py` (Zero-Copy Slicing)
-- **[MODIFY] `step_manager()`:**
-  - Replace `xs = torch.stack([st[b].to(device) for b in active])` with `xs = st[active].to(device)`
-  - Replace `ms = torch.stack([self.env.get_action_mask_batch()[b].to(device) for b in active])` with `ms = self.env.get_action_mask_batch()[active].to(device)`
-
-#### 2. `src/envs/worker_env.py` (Vectorized Tensor Operations)
-- **[MODIFY] Initialization:** 
-  - Convert `self._adj_list` into a dense boolean adjacency matrix tensor `self._adj_matrix_tensor` of shape `[N, N]` on the CPU.
-- **[MODIFY] `_get_state_batch()`:**
-  - Eliminate the `for b in range(B)` loop.
-  - Use PyTorch Advanced Indexing: `state[torch.arange(B), self.curr_nodes, 0] = 1.0`
-- **[MODIFY] `get_action_mask_batch()`:**
-  - Eliminate the `for b in range(B)` loop.
-  - Use `mask = self._adj_matrix_tensor[self.curr_nodes]` to fetch valid neighbors for all batches simultaneously in C++ backend.
+## 2. Training Strategy
+- `scripts/train_rl.py --stage worker --episodes 10000` 재실행.
+- 워커는 로컬한 단위에서만 학습하므로, Manager와 달리 10,000 에피소드만으로도 완벽하게 최적 경로(Loop-free)를 체득할 수 있습니다.
+- 워커 학습이 끝난 후, 이미 확보된 최고의 매니저 가중치(`best_manager.pt`)와 결합하여 검증합니다.

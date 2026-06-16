@@ -1,22 +1,25 @@
-# `src/envs/worker_env.py` Log
+# WorkerEnv - Detailed Architecture & Refactoring Log
 
-## 1. 코드 상세 설명
-- **역할**: Worker 에이전트의 Phase 1 개별 라우팅 제어 환경.
-- **핵심 로직 변경**:
-  - `apply_dynamic_disaster(self)` 함수 파라미터에서 `accumulate` 불리언 인자를 제거하였습니다. 이는 `disaster_map`의 로직이 하드코딩된 누적 방식으로 개선됨에 따라 서명을 본래의 깔끔한 상태로 되돌리기 위함입니다.
-  - 여전히 에피소드 진행 중(스텝 30, 스텝 60 등)에 함수가 호출되면 즉시 `disaster_map`을 통해 새로운 재난 피해를 누적 생성하고, `self._update_zone_graph_weights()`를 연쇄적으로 호출하여 상위 단위인 Zone Graph의 메타데이터 가중치도 즉시 동기화합니다.
-  - **[신규] 시간 기반(Time-based) 페널티 개편**: `self.STEP_PENALTY (-0.1)`를 상수로 부과하던 로직을 전면 폐기하고, 물리적 이동 시간인 `edge_weight`에 비례하는 `time_penalty = -0.1 * edge_weight`를 매 노드 스텝마다 부과합니다. 이로써 워커는 파괴된 도로(고비용)를 피해 가장 '빠른' 경로를 개척하도록 강제 학습됩니다.
-  - **[신규] 초고속 다익스트라 텐서 갱신 (`_update_dist_matrix`)**: `scipy.sparse.csgraph.shortest_path`를 도입하여 기존에 `O(V^3)`로 느렸던 플로이드-워셜 알고리즘을 밀리초(1ms 이하) 단위로 대체했습니다. 
-  - **[신규] 시각 상실(Blindness) 버그 픽스**: 기존에는 초기 재난(`disaster_prob > 0`)이 발생해도 워커의 입력 텐서인 `self.dist_matrix`가 초기화 시점의 깨끗한 매트릭스로 영구 고정되는 치명적인 버그가 있었습니다. 이제 `reset()` 호출 시 재난이 터지면 즉각 `_update_dist_matrix()`를 통해 실시간으로 파괴된 다익스트라 맵을 신경망에 넘깁니다.
-  - **[신규] 여진 발생 (`apply_aftershock`)**: 매니저의 지시를 덮어쓰지 않고 맵의 가중치 텐서만 기습적으로 파괴하는 새로운 여진 전용 메소드를 신설했습니다.
+## 1. Overview
+`WorkerEnv`는 계층적 라우팅 환경의 하위 계층(Worker)의 학습 환경을 담당합니다. 초창기에는 파이썬 리스트 컴프리헨션과 `torch.stack()`을 활용하여 각 배치(Agent) 별로 순차적(Sequential)인 상태 변환 연산을 수행했습니다. 하지만 Manager와 함께 동작하는 `HRLEnv` 구조 안에서 초당 수만 개의 그래프 어텐션 스텝(GATv2)이 처리되어야 할 때, 이러한 파이썬 루프는 극단적인 **CPU Starvation (1300% 로드율)**과 **GPU Util 저하 (< 20%)**라는 성능 병목을 발생시켰습니다.
 
-## 2. 알고리즘 & 텐서 로직
-- 변경된 텐서 입출력은 없음. 기존의 `self.dist_matrix`는 가중치 기반 물리적 시간 거리를 캐싱하고, `self.hop_matrix` (존재할 시)는 칸 수를 담당함을 재확인.
-- 워커의 상태 텐서(`is_curr`, `is_tgt`, `zone_info`, `dist`)에는 명시적 시계(`time`)가 제공되지 않으나, 다익스트라 최단 거리 텐서(`dist`)에 이미 소요 시간 정보가 모두 녹아있어 최적 경로를 판단할 수 있음.
-- `self.max_dist`는 매 갱신 시마다 커지지 않도록 초기 클린 맵 기준값을 고정시켜, 신경망 정규화 스케일의 일관성을 완벽히 보장합니다.
+## 2. Vectorization Optimization (v7.2)
+이 병목을 부수기 위해 `_get_state_batch` 및 `get_action_mask_batch` 함수를 C++ 백엔드에서 일괄 처리되는 **풀 벡터화(Full Vectorization)** 아키텍처로 개편했습니다.
 
-## 3. Trial & Error (Troubleshooting)
-- [Issue 1] `edge_weight` 기반 시간 패널티를 도입하면서 `edge_weight`가 0(Self-loop)인 노드에서의 무한 대기 현상 우려.
-- [Fix 1] 워커 환경의 `action_idx == curr_idx`인 경우 `INVALID_PENALTY(-10.0)`와 함께 에피소드를 강제 종료하는 Stagnation 예외 처리 로직이 이미 견고하게 동작 중이므로 안전성을 확인.
-- [Issue 2] 워커가 파괴된 도로를 보고도 돌진하는 현상 원인 규명.
-- [Fix 2] `dist_matrix`가 한 번도 갱신되지 않았던 Blindness 버그를 확인하고 `Scipy`를 이용해 초고속 실시간 텐서 동기화 파이프라인으로 해결했습니다.
+### 2.1. 사전 캐싱 (Initialization)
+- `self._adj_matrix_tensor`: `[N, N]` 크기의 Boolean Dense Tensor를 GPU에 할당하여, 노드 간 물리적 연결성을 `O(1)` 슬라이싱으로 즉시 파악합니다.
+- `self._zone_adj_matrix_tensor`: Manager Action Masking 전용으로 `[K, K]` 인접 행렬 텐서를 GPU에 상주시켜, CPU의 NetworkX 탐색 부하를 원천 제거했습니다.
+- `self._node_zone_tensor`: `[N]` 크기 텐서를 `device` 파라미터를 통해 GPU에 바로 탑재함으로써, 상태 벡터 추출 시 CPU-GPU간의 통신 페널티를 없앴습니다.
+
+### 2.2. O(1) Tensor Operations
+- 기존의 `for b in range(B): state[b, curr_nodes[b]] = 1.0` 코드는 파이토치의 Advanced Indexing `state[batch_idx, curr_nodes, 0] = 1.0` 단 한 줄로 교체되었습니다.
+- PBRS 보상을 위한 Dijkstra `dist_matrix` 조회 역시 `dist_tensor[curr_nodes, target_nodes]` 와 같은 인덱스 배열 전송 기법을 사용하여, 256명 분량의 로그 스케일 거리 정규화를 GPU 커널 위에서 단숨에(1ms 이하) 처리해 냅니다.
+
+## 3. Trial & Error (Debugging Memory)
+- **Device Mismatch Error**: 벡터화 도중 `hrl_env.py`의 `reset()` 로직 내부에서 `.clone()` 을 수행하며 텐서가 GPU로 자동 캐스팅되어, CPU 상에 남아있던 배열과의 형 불일치 인덱스 에러(`RuntimeError: indices should be either on cpu or on the same device`)가 발생했습니다.
+- **해결 방안**: `get_zone_adj_mask` 메서드 내에서 인덱스 텐서를 `.cpu()`로 명시적 캐스팅함으로써 불확실한 Device 캐스팅 버그를 완전히 차단했습니다. 최종적으로 94%의 극한 GPU 활용률(Utilization) 달성에 성공했습니다.
+
+## 4. Phase 1 Worker Retraining (Revisit Penalty)
+- **무한 루프 버그 발생**: 이전 버전에서는 워커가 벽(끊어진 다리 등)에 막혔을 때, 이미 방문했던 노드를 반복해서 맴도는(Stagnation) 심각한 버그가 있었습니다.
+- **해결 (Revisit Penalty 추가)**: `step_batch` 내부에서 `visited_nodes == 1.0`인 노드를 향해 이동하려고 할 경우 즉각적으로 **-5.0**의 거대한 패널티를 부여하도록 수학적 제약을 걸었습니다.
+- **결과 (PPO의 진화)**: 워커가 초기에는 엄청난 패널티 폭탄(-47점)을 맞았으나, 10,000 에피소드 이후 "한 번 밟은 땅은 다시 밟지 않는다"는 룰을 스스로 깨닫고 일직선 주행(Rw=52.9)을 마스터하며 무한 루프가 근절되었습니다.

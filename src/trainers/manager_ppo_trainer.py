@@ -91,6 +91,7 @@ class ManagerPPOTrainer:
             target_mask = self.env.get_target_mask()[active] # [A, N]
             target_zones = self.env.target_zones[active] # [A, N]
             zone_adj_mask = self.env.get_zone_adj_mask()[active] # [A, K_zones]
+            zone_dist_matrix = self.env.zone_dist_matrix.unsqueeze(0).expand(A, -1, -1) # [A, K, K]
             
             elapsed = self.env.current_time[active].unsqueeze(1) / self.env.max_time
             rescued = self.env.num_rescued[active].unsqueeze(1).float() / num_targets
@@ -130,7 +131,12 @@ class ManagerPPOTrainer:
             
             z_ai = torch.arange(A, device=self.device).repeat_interleave(K_zones)
             selected_t_emb = t_emb_dense[torch.arange(A), t_act]
-            z_logits, z_inv = self.manager.get_zone_logits(query, selected_t_emb, zone_emb, zone_adj_mask.view(-1), z_ai)
+            
+            selected_tz = target_zones[torch.arange(A), t_act]
+            z_logits, z_inv = self.manager.get_zone_logits(
+                query, selected_t_emb, zone_emb, zone_adj_mask.view(-1), z_ai, 
+                selected_tz, zone_dist_matrix
+            )
             z_dist = Categorical(logits=z_logits)
             z_act = z_dist.sample()
             z_log_prob = z_dist.log_prob(z_act)
@@ -334,7 +340,13 @@ class ManagerPPOTrainer:
                 
                 z_ai = torch.arange(A, device=self.device).repeat_interleave(K_zones)
                 selected_t_emb = t_emb_dense[torch.arange(A), mb_t_acts]
-                z_logits, z_inv = self.manager.get_zone_logits(query, selected_t_emb, zone_emb, mb_zam.view(-1), z_ai)
+                
+                mb_selected_tz = mb_tz[torch.arange(A), mb_t_acts]
+                mb_zone_dist_matrix = self.env.zone_dist_matrix.unsqueeze(0).expand(A, -1, -1).to(self.device)
+                z_logits, z_inv = self.manager.get_zone_logits(
+                    query, selected_t_emb, zone_emb, mb_zam.view(-1), z_ai,
+                    mb_selected_tz, mb_zone_dist_matrix
+                )
                 z_dist = Categorical(logits=z_logits)
                 new_z_log_prob = z_dist.log_prob(mb_z_acts)
                 

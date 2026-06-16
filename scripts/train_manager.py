@@ -19,7 +19,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--map', type=str, default='Anaheim')
     parser.add_argument('--worker_ckpt', type=str, required=True)
-    parser.add_argument('--episodes', type=int, default=10000)
+    parser.add_argument('--episodes', type=int, default=20000)
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--mini_batch_size', type=int, default=2048)
     parser.add_argument('--num_targets', type=int, default=10)
@@ -71,19 +71,24 @@ def main():
     best_reward = -float('inf')
     
     from tqdm import tqdm
+    import random
     print(f"🚀 Manager PPO Training Start (Worker: {args.worker_ckpt})")
     num_steps = (args.episodes + args.batch_size - 1) // args.batch_size
     
     with tqdm(total=args.episodes, desc="Manager PPO", ncols=140, unit="ep") as pbar:
         for step in range(1, num_steps + 1):
-            logs = trainer.train_step(batch_size=args.batch_size, num_targets=args.num_targets)
+            current_num_targets = random.randint(5, 15)
+            logs = trainer.train_step(batch_size=args.batch_size, num_targets=current_num_targets)
+            
+            sr = (logs['mean_rescued'] / current_num_targets) * 100.0 if current_num_targets > 0 else 0.0
             
             pbar.set_postfix({
                 'Loss': f"{logs.get('loss', 0):.4f}",
                 'P': f"{logs.get('policy_loss', 0):.4f}",
                 'V': f"{logs.get('value_loss', 0):.4f}",
                 'Rw': f"{logs['mean_reward']:.2f}",
-                'Rsc': f"{logs['mean_rescued']:.1f}/{args.num_targets}",
+                'Rsc': f"{logs['mean_rescued']:.1f}/{current_num_targets}",
+                'SR': f"{sr:.1f}%",
                 'Trn': f"{logs['mean_manager_turns']:.1f}",
                 'WStp': f"{logs['mean_worker_steps']:.1f}"
             })
