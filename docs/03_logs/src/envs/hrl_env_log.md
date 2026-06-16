@@ -20,3 +20,7 @@
 - **문제점**: 워커에 재방문 패널티(`-5.0`)를 추가한 결과, 다중 타겟 환경(Phase 2)에서 **과거 타겟으로 가기 위해 밟았던 정상적인 경로**마저 영구적으로 금지되어 길을 잃는 부작용이 발견될 뻔했습니다.
 - **해결 방안 (Setup Loop Reset)**: 매니저가 새로운 구역(Zone)과 최종 목적지(Target)를 워커에게 부여하는 `step_manager()` 루프(Setup Loop) 진입 시, **워커의 과거 방문 이력(`visited_nodes`)을 깨끗하게 0.0으로 초기화**하도록 강제했습니다.
 - **예외 처리**: 단, 워커가 현재 서 있는 현재 위치(Current Node)는 `1.0`으로 다시 마스킹하여, 이동 시작 직후 곧바로 뒤로 돌아가는 제자리 루프를 방지했습니다. 이를 통해 워커는 오직 **'현재 매니저가 부여한 단일 과제'**에만 집중하는 이상적인 HRL 철학을 유지할 수 있게 되었습니다.
+
+## 6. Phase 2 Manager Retraining Compatibility (v7.3)
+- `ManagerTrainer` 구조는 싱글 타겟 `ManagerEnv`를 기준으로 설계되었기에 내부적으로 `self.env.zone_dist_matrix`를 호출하여 Zone 단위의 거리 지표를 상태 표현에 추가합니다.
+- `train_manager.py`를 다중 타겟 환경(`HRLEnv`)에 직결 시 해당 프로퍼티가 없어 크래시가 발생하는 것을 방지하기 위해, `HRLEnv.__init__`에서 NetworkX `ZG` 그래프의 다익스트라(APSP)를 수행하여 `zone_dist_matrix` 텐서를 사전 계산하여 캐싱하도록 동적 확장을 구현했습니다.

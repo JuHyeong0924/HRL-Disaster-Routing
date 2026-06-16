@@ -13,7 +13,7 @@ def main():
     
     map_name = 'Anaheim'
     worker_ckpt_path = 'logs/rl_worker_stage/2026-06-16_142234_worker/best.pt'
-    manager_ckpt_path = 'logs/rl_manager_stage/2026-06-16_020215_manager_ppo/best_manager.pt'
+    manager_ckpt_path = 'logs/rl_manager_stage/2026-06-16_145108_manager_ppo/best_manager.pt'
     
     print(f"Loading WorkerEnv...")
     worker_env = WorkerEnv(
