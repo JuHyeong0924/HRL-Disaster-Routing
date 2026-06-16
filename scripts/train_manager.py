@@ -78,11 +78,33 @@ def main():
     with tqdm(total=args.episodes, desc="Manager PPO", ncols=140, unit="ep") as pbar:
         for step in range(1, num_steps + 1):
             current_num_targets = random.randint(5, 15)
-            logs = trainer.train_step(batch_size=args.batch_size, num_targets=current_num_targets)
+            current_ep = step * args.batch_size
+            if current_ep <= int(args.episodes * 0.25):
+                hrl_env.env.disaster_prob = 0.0
+                hrl_env.env.dynamic_disaster = False
+                phase_str = 'P1:Normal'
+            elif current_ep <= int(args.episodes * 0.50):
+                hrl_env.env.disaster_prob = 0.2
+                hrl_env.env.dynamic_disaster = False
+                phase_str = 'P2:Static'
+            else:
+                hrl_env.env.disaster_prob = 0.2
+                hrl_env.env.dynamic_disaster = True
+                phase_str = 'P3:Dynamic'
+                
+            # 동적 엔트로피 감가 적용 (0.05 -> 0.01)
+            current_ent_coef = max(0.01, 0.05 - 0.04 * (step / num_steps))
+            
+            logs = trainer.train_step(
+                batch_size=args.batch_size, 
+                num_targets=current_num_targets,
+                current_ent_coef=current_ent_coef
+            )
             
             sr = (logs['mean_rescued'] / current_num_targets) * 100.0 if current_num_targets > 0 else 0.0
             
             pbar.set_postfix({
+                'Phase': phase_str,
                 'Loss': f"{logs.get('loss', 0):.4f}",
                 'P': f"{logs.get('policy_loss', 0):.4f}",
                 'V': f"{logs.get('value_loss', 0):.4f}",

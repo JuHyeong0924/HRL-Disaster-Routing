@@ -189,11 +189,13 @@ class WorkerEnv:
             self._update_dist_matrix()
             
         for b in range(batch_size):
-            # 무작위 시종착점 선택 (서로 다른 Zone에 속하도록)
+            # 무작위 시종착점 선택 (서로 다른 Zone이면서 도달 가능한 노드)
             while True:
                 s = random.choice(self.nodes)
                 t = random.choice(self.nodes)
-                if s != t and self.n2z[s] != self.n2z[t]:
+                s_idx = self.node_to_idx[s]
+                t_idx = self.node_to_idx[t]
+                if s != t and self.n2z[s] != self.n2z[t] and self.dist_matrix[s_idx, t_idx] < float('inf'):
                     break
             
             self.curr_nodes[b] = self.node_to_idx[s]
@@ -229,19 +231,21 @@ class WorkerEnv:
         return self._get_state_batch()
         
     def _update_zone_graph_weights(self):
-        """재난 발생으로 인한 Edge damage를 기반으로 Zone Graph의 weight 갱신"""
-        for u_z, v_z in self.ZG.edges():
+        """재난 발생으로 인한 Edge damage를 기반으로 Zone Graph의 weight 갱신.
+        모든 cross-zone 간선이 제거된 경우 weight=inf로 설정."""
+        for u_z, v_z in list(self.ZG.edges()):
             cross_damages = []
             for node_u in self.z2n[u_z]:
                 for node_v in self.z2n[v_z]:
                     if self.G.has_edge(node_u, node_v):
                         cross_damages.append(self.G[node_u][node_v].get('damage', 0.0))
-            avg_damage = sum(cross_damages) / max(len(cross_damages), 1)
             
-            # 원래 weight에 비례하여 증가 (baseline: uniform weight 1.0)
-            base_weight = 1.0
-                
-            self.ZG[u_z][v_z]['weight'] = base_weight * (1 + avg_damage * 10)
+            if not cross_damages:
+                # 모든 물리적 cross-zone 간선 제거됨 → Zone 간 연결 불가
+                self.ZG[u_z][v_z]['weight'] = float('inf')
+            else:
+                avg_damage = sum(cross_damages) / len(cross_damages)
+                self.ZG[u_z][v_z]['weight'] = 1.0 * (1 + avg_damage * 10)
             
     def _update_dist_matrix(self):
         """Scipy를 사용하여 O(V^3) 플로이드 워셜을 밀리초 단위로 초고속 수행하여 dist_matrix 실시간 최신화"""
@@ -330,6 +334,8 @@ class WorkerEnv:
         curr_val = torch.log1p(dist_tensor[curr_nodes, target_nodes]).unsqueeze(1)
         scale = 3.0
         rel = (curr_val - raw)
+        # NaN 방어 (inf - inf 방지)
+        rel = torch.where(torch.isnan(rel), torch.zeros_like(rel), rel)
         rel = torch.clamp(rel, -scale, scale) / scale
         state[:, :, 3] = rel
                 
@@ -409,7 +415,10 @@ class WorkerEnv:
                     ti = int(self.subgoal_nodes[b].item())
                 else:
                     ti = int(self.target_nodes[b].item())
-                prev_dists[b] = float(np.log1p(self.dist_matrix[ci, ti]))
+                d = self.dist_matrix[ci, ti]
+                if d == float('inf') or np.isinf(d):
+                    d = self.max_dist
+                prev_dists[b] = float(np.log1p(d))
         
         for b in range(B):
             if self.dones[b]:
@@ -467,11 +476,18 @@ class WorkerEnv:
                     is_oob = True
             
             # Update current nodes
-            self.curr_nodes[b] = action_idx
-            # 물리적 이동 거리 누적
             u_node = self.idx_to_node[curr_idx]
             v_node = self.idx_to_node[action_idx]
-            edge_weight = self.G[u_node][v_node].get('weight', 1.0)
+            # 방어: aftershock로 간선이 제거된 경우 이동 무효 (self-loop 처리)
+            if u_node != v_node and not self.G.has_edge(u_node, v_node):
+                action_idx = curr_idx  # 이동 취소
+                v_node = u_node
+            self.curr_nodes[b] = action_idx
+            # 물리적 이동 거리 누적
+            if u_node == v_node:
+                edge_weight = 1.0  # self-loop fallback
+            else:
+                edge_weight = self.G[u_node][v_node].get('weight', 1.0)
             self.total_dist[b] += edge_weight
             if not self.dones[b]:
                 self.visited_nodes[b, action_idx] = 1.0
@@ -522,7 +538,10 @@ class WorkerEnv:
                     ti = int(self.subgoal_nodes[b].item())
                 else:
                     ti = int(self.target_nodes[b].item())
-                new_dist = float(np.log1p(self.dist_matrix[ci, ti]))
+                d = self.dist_matrix[ci, ti]
+                if d == float('inf') or np.isinf(d):
+                    d = self.max_dist
+                new_dist = float(np.log1p(d))
                 # PBRS: Φ(s) = -dist → 가까워지면 양수, 멀어지면 음수
                 scale_factor = 0.5  # log 스케일에서는 hop과 유사한 범위
                 pbrs = (prev_dists[b].item() - new_dist) * scale_factor

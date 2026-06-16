@@ -74,15 +74,22 @@ class HRLEnv:
         self.worker_steps = torch.zeros(batch_size, dtype=torch.long, device=self.env.device)
 
         for b in range(batch_size):
-            s = random.choice(self.env.nodes)
-            self.env.curr_nodes[b] = self.env.node_to_idx[s]
+            # 연결된 노드가 충분히 많은 출발지 선택
+            while True:
+                s = random.choice(self.env.nodes)
+                s_idx = self.env.node_to_idx[s]
+                reachable = [n for n in self.env.nodes if self.env.dist_matrix[s_idx, self.env.node_to_idx[n]] < float('inf')]
+                if len(reachable) > num_targets:
+                    break
+                    
+            self.env.curr_nodes[b] = s_idx
             self.env.visited_nodes[b, int(self.env.curr_nodes[b])] = 1.0
             
-            # 타겟 N개 생성
+            # 타겟 N개 생성 (도달 가능한 노드 중에서만)
             selected = set([s])
             for i in range(num_targets):
                 while True:
-                    t = random.choice(self.env.nodes)
+                    t = random.choice(reachable)
                     if t not in selected:
                         selected.add(t)
                         self.targets[b, i] = self.env.node_to_idx[t]
@@ -189,6 +196,14 @@ class HRLEnv:
             for vn in v_nodes:
                 vz = self.env.n2z[self.env.idx_to_node[int(vn)]]
                 feats[b, vz, 2] = 1.0
+            
+            # disaster_intensity (Zone 내 간선의 평균 damage)
+            for z in range(K_zones):
+                damages = []
+                for n in self.env.z2n[z]:
+                    for nbr in self.env.G.neighbors(n):
+                        damages.append(self.env.G[n][nbr].get('damage', 0.0))
+                feats[b, z, 3] = (sum(damages) / len(damages)) if damages else 0.0
                 
             # dist_from_curr (centroid 거리 기반)
             p1 = self.env.zone_centroids[c_zone]
@@ -224,6 +239,8 @@ class HRLEnv:
                 d = self.deadlines[b, i]
                 rem = d - self.current_time[b]
                 dist = self.env.dist_matrix[c_idx, t_idx]
+                if dist == float('inf') or np.isinf(dist):
+                    dist = self.env.max_dist
                 
                 feats[b, i, 0] = d / self.max_time
                 feats[b, i, 1] = rem / self.max_time
@@ -261,6 +278,8 @@ class HRLEnv:
         zone_actions: [B] zone index (0 ~ K-1)
         
         선택된 Zone으로 Worker를 진행시킵니다.
+        Manager가 zone을 지정하면, Worker는 해당 zone에 도착하거나
+        타겟을 구출하거나 Trap될 때까지 진행합니다.
         """
         B = self.batch_size
         self.curr_target_idx = target_actions
@@ -272,21 +291,19 @@ class HRLEnv:
         
         for b in range(B):
             if not self.dones[b]:
-                # ---------------------------------------------
-                # [CRITICAL FIX] Manager 턴이 새로 시작될 때마다 Worker의 내부 상태를 초기화합니다.
+                # Worker 내부 상태 초기화
                 self.env.dones[b] = False
                 self.env.steps_count[b] = 0
                 
                 # 매 턴마다 방문 이력 리셋 (단, 현재 위치는 방문 처리)
                 self.env.visited_nodes[b].zero_()
                 self.env.visited_nodes[b, int(self.env.curr_nodes[b].item())] = 1.0
-                # ---------------------------------------------
                 
                 self.manager_turns[b] += 1
                 t_idx = self.curr_target_idx[b].item()
                 self.env.target_nodes[b] = self.targets[b, t_idx]
                 
-            # Worker에게 다음 가야할 zone sequence를 설정 (done이어도 shape 맞추기 위해 추가)
+            # Worker에게 다음 가야할 zone sequence를 설정
             c_node = self.env.idx_to_node[int(self.env.curr_nodes[b])]
             c_zone = self.env.n2z[c_node]
             z_act = self.curr_zone_action[b].item()
@@ -294,36 +311,27 @@ class HRLEnv:
             
         # Worker Execution Loop
         events = ['none'] * B
-        
-        # [Phase 2 Stage 3] 여진(Aftershock) 동적 발생
-        import random
-        if self.env.dynamic_disaster and random.random() < 0.05: # 매 턴마다 5% 확률로 여진 발생
-            self.env.apply_aftershock()
-            
         worker_done = self.dones.clone()
+        need_rebuild = True  # 첫 반복에서 반드시 구축
         
-        # Graph data for worker
-        el = [(self.env.node_to_idx[u], self.env.node_to_idx[v]) for u, v in self.env.G.edges()]
-        bidir = el + [(v, u) for u, v in el]
-        edge_index = torch.tensor(bidir, dtype=torch.long).t().to(self.env.device)
-        N_nodes = self.env.num_nodes
+        # 이전 Zone 추적 (aftershock 트리거용)
+        prev_zones = {}
+        for b in range(B):
+            c = self.env.idx_to_node[int(self.env.curr_nodes[b])]
+            prev_zones[b] = self.env.n2z[c]
         
-        ea = []
-        for ui, vi in bidir:
-            u, v = self.env.idx_to_node[ui], self.env.idx_to_node[vi]
-            d = self.env.dm.graph[u][v]
-            ea.append([d.get('length', 0.0)])
-        edge_attr = torch.tensor(ea, dtype=torch.float).to(self.env.device)
-        mn = edge_attr.min(0,keepdim=True)[0]; mx = edge_attr.max(0,keepdim=True)[0]
-        edge_attr = (edge_attr - mn) / (mx - mn).clamp(min=1e-8)
-
-        # Execute Worker
-        for _ in range(50): # max inner steps
+        for step in range(50):  # max inner steps
             if worker_done.all():
                 break
+            
+            # 그래프 데이터 (재)구축
+            if need_rebuild:
+                edge_index, edge_attr = self._build_graph_data()
+                need_rebuild = False
                 
             active = [b for b in range(B) if not worker_done[b]]
             A = len(active)
+            N_nodes = self.env.num_nodes
             
             st = self.env._get_state_batch()
             xs = torch.stack([st[b].to(self.env.device) for b in active])
@@ -356,31 +364,60 @@ class HRLEnv:
                 prev_n = self.env.idx_to_node[int(prev_nodes[b])]
                 new_n = self.env.idx_to_node[int(self.env.curr_nodes[b])]
                 if prev_n == new_n:
-                    edge_w = 1.0 # Self-loop fallback
+                    edge_w = 1.0  # Self-loop fallback
                 else:
-                    edge_w = self.env.G[prev_n][new_n].get('weight', 1.0)
+                    if self.env.G.has_edge(prev_n, new_n):
+                        edge_w = self.env.G[prev_n][new_n].get('weight', 1.0)
+                    else:
+                        edge_w = 1.0  # Fallback if edge was removed mid-batch by another agent's disaster event
                     
                 self.worker_steps[b] += 1
                 self.current_time[b] += edge_w
+                
                 # Check events
                 c_node = self.env.idx_to_node[int(self.env.curr_nodes[b])]
                 c_zone = self.env.n2z[c_node]
                 target_node = self.env.idx_to_node[int(self.env.target_nodes[b])]
                 target_idx_in_list = self.curr_target_idx[b].item()
                 
+                # 1. 타겟 도착 체크
                 if c_node == target_node:
                     events[b] = 'target_rescued'
                     self.target_rescued[b, target_idx_in_list] = True
                     self.num_rescued[b] += 1
                     worker_done[b] = True
-                elif c_zone != self.env.zone_sequences[b][0]:
+                    continue
+                
+                # 2. Zone 전환 체크 — 여진 + Trap 판정
+                if c_zone != prev_zones[b]:
+                    if self.env.dynamic_disaster and random.random() < 0.05:
+                        # ⚡ TRAP CHECK: Danger 등급 간선 위에서 여진
+                        if prev_n != new_n and self.env.G.has_edge(prev_n, new_n):
+                            edge_dmg = self.env.G[prev_n][new_n].get('damage', 0.0)
+                            if edge_dmg > 0.5:  # Danger 이상
+                                self.current_time[b] += 30.0  # 시간 페널티
+                                self.env.curr_nodes[b] = prev_nodes[b]  # 이전 노드로 복귀
+                                events[b] = 'agent_trapped'
+                                worker_done[b] = True
+                                # 트랩된 간선 제거
+                                if self.env.G.has_edge(prev_n, new_n):
+                                    self.env.G.remove_edge(prev_n, new_n)
+                                need_rebuild = True
+                                continue
+                        
+                        # aftershock 적용 (추가 damage + 간선 제거 가능)
+                        self.env.apply_aftershock()
+                        need_rebuild = True
+                    
+                    # Zone 도착/이탈 판정
                     if c_zone == self.curr_zone_action[b].item():
                         events[b] = 'zone_arrived'
                     else:
                         events[b] = 'zone_escaped'
                     worker_done[b] = True
+                    prev_zones[b] = c_zone
                 elif step_dones[b].item():
-                    # OOB
+                    # OOB 등
                     events[b] = 'zone_escaped'
                     worker_done[b] = True
                     
@@ -398,3 +435,24 @@ class HRLEnv:
                 self.dones[b] = True
                 
         return events, self.dones.clone()
+    
+    def _build_graph_data(self):
+        """현재 그래프 상태 기반 edge_index, edge_attr 구축 [length, damage]."""
+        el = [(self.env.node_to_idx[u], self.env.node_to_idx[v])
+              for u, v in self.env.G.edges()]
+        bidir = el + [(v, u) for u, v in el]
+        edge_index = torch.tensor(bidir, dtype=torch.long).t().to(self.env.device)
+        
+        ea = []
+        for ui, vi in bidir:
+            u, v = self.env.idx_to_node[ui], self.env.idx_to_node[vi]
+            d = self.env.G[u][v]
+            ea.append([d.get('length', 0.0), d.get('damage', 0.0)])
+        edge_attr = torch.tensor(ea, dtype=torch.float).to(self.env.device)
+        
+        # Per-channel min-max normalization
+        mn = edge_attr.min(0, keepdim=True)[0]
+        mx = edge_attr.max(0, keepdim=True)[0]
+        edge_attr = (edge_attr - mn) / (mx - mn).clamp(min=1e-8)
+        
+        return edge_index, edge_attr

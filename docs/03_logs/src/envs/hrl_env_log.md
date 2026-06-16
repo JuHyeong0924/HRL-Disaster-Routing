@@ -24,3 +24,9 @@
 ## 6. Phase 2 Manager Retraining Compatibility (v7.3)
 - `ManagerTrainer` 구조는 싱글 타겟 `ManagerEnv`를 기준으로 설계되었기에 내부적으로 `self.env.zone_dist_matrix`를 호출하여 Zone 단위의 거리 지표를 상태 표현에 추가합니다.
 - `train_manager.py`를 다중 타겟 환경(`HRLEnv`)에 직결 시 해당 프로퍼티가 없어 크래시가 발생하는 것을 방지하기 위해, `HRLEnv.__init__`에서 NetworkX `ZG` 그래프의 다익스트라(APSP)를 수행하여 `zone_dist_matrix` 텐서를 사전 계산하여 캐싱하도록 동적 확장을 구현했습니다.
+
+## 7. Dynamic Disaster NaN Bug Fix (Isolated Targets)
+- **문제점**: 동적 재난 시나리오(`dynamic_disaster=True`)나 원본 맵 상의 고립된 서브그래프 문제로 인해, 시작 위치에서 도달할 수 없는 노드가 무작위 타겟으로 선정되는 치명적 버그가 존재했습니다. 이 경우 다익스트라(Dijkstra) 거리가 `inf`로 반환되어 `log1p(inf) - log1p(inf) = NaN` 형태의 연산이 모델 내부로 전파되고 가중치를 폭파시켰습니다.
+- **해결 방안 1 (방어 로직)**: `step_manager()` 내부 PBRS 보상 연산과 `get_target_features()` 피처 추출 시 `dist_matrix`가 `inf`이면 `self.env.max_dist`로 치환하는 1차 방어막을 구축했습니다.
+- **해결 방안 2 (근본 수정)**: `reset()` 단계에서 단순히 `random.choice(nodes)`를 하는 대신, 출발 노드(`s_idx`)로부터 다익스트라 거리가 유한한(`dist < inf`) 즉, 물리적으로 도달 가능한 노드 리스트(`reachable`)를 미리 구한 뒤 그 중에서만 타겟을 추출하도록 전면 수정했습니다. 출발지가 너무 외진 곳이라 도달 가능한 노드 수가 타겟 개수보다 적으면 즉시 출발지부터 다시 뽑도록 강제하여 `NaN`의 근본 원인을 제거했습니다.
+- **예외 처리 보강**: 또한 `step_manager()` 중 동적 재난으로 인해 엣지가 삭제되어 워커가 이동하려는 엣지가 사라지는 상황에 대비하여, `G.has_edge(c_node, v_node)` 체크 로직을 보강하여 `KeyError` 발생을 막았습니다.

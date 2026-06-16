@@ -119,6 +119,9 @@ class DisasterMap:
             
         # 3. 건물 데이터 생성
         self._generate_building_data()
+        
+        # 4. 원본 간선 백업 (리셋 시 복원용, 빌딩 데이터 포함)
+        self._original_edges = {(u, v): dict(d) for u, v, d in self.graph.edges(data=True)}
 
     def _generate_building_data(self):
         for u, v in self.graph.edges():
@@ -138,11 +141,15 @@ class DisasterMap:
     def apply_disaster_damage(self, damage_prob=0.3):
         is_reset = (damage_prob <= 0.0)
         
-        for u, v in self.graph.edges():
-            edge = self.graph[u][v]
-            
-            # 초기화 (Reset) 모드
-            if is_reset:
+        # ── 리셋 모드: 제거된 간선 복원 후 어트리뷰트 초기화 ──
+        if is_reset:
+            # 1단계: 제거된 간선 복원
+            for (u, v), attrs in self._original_edges.items():
+                if not self.graph.has_edge(u, v):
+                    self.graph.add_edge(u, v, **attrs)
+            # 2단계: 모든 간선 어트리뷰트 초기화
+            for u, v in self.graph.edges():
+                edge = self.graph[u][v]
                 edge['damage'] = 0.0
                 edge['status'] = 'Normal'
                 edge['weight'] = edge['base_weight']
@@ -150,43 +157,45 @@ class DisasterMap:
                 edge['injured'] = 0
                 if edge['has_building']:
                     edge['healthy'] = edge['total_people']
-                continue
+            return
+        
+        # ── 데미지 모드: 누적 데미지 + Closed(>0.8) 간선 제거 ──
+        edges_to_remove = []
+        for u, v in list(self.graph.edges()):  # list()로 복사: 반복 중 제거 방지
+            edge = self.graph[u][v]
             
-            # 1. Damage Event Trigger
             if random.random() < damage_prob:
                 severity_roll = random.random()
                 if severity_roll < 0.40:
-                    damage = random.uniform(0.01, 0.2)
+                    new_damage = random.uniform(0.01, 0.2)
                 elif severity_roll < 0.70:
-                    damage = random.uniform(0.2, 0.5)
+                    new_damage = random.uniform(0.2, 0.5)
                 elif severity_roll < 0.95:
-                    damage = random.uniform(0.5, 0.8)
+                    new_damage = random.uniform(0.5, 0.8)
                 else:
-                    damage = random.uniform(0.8, 1.0)
+                    new_damage = random.uniform(0.8, 1.0)
                 
-                # 무조건 기존 데미지와 누적 합산 (최대 1.0)
-                damage = min(1.0, edge.get('damage', 0.0) + damage)
-                
+                # 기존 데미지와 누적 합산 (최대 1.0)
+                damage = min(1.0, edge.get('damage', 0.0) + new_damage)
                 edge['damage'] = damage
                 base_w = edge['base_weight']
                 base_t = edge['base_time']
                 
-                # 3. Status Assignment (HAZUS)
+                # HAZUS 등급 기반 상태 할당
                 if damage > 0.8:
-                    edge['status'] = 'Closed' # Complete
-                    edge['weight'] = base_w * 50.0
-                    edge['travel_time'] = base_t * 50.0
+                    # Closed (Complete) → 간선 제거 예약
+                    edges_to_remove.append((u, v))
                 elif damage > 0.5:
-                    edge['status'] = 'Danger' # Extensive
+                    edge['status'] = 'Danger'   # Extensive
                     edge['weight'] = base_w * 20.0
                     edge['travel_time'] = base_t * 20.0
                 elif damage > 0.2:
-                    edge['status'] = 'Caution' # Moderate
+                    edge['status'] = 'Caution'  # Moderate
                     edge['weight'] = base_w * 5.0
                     edge['travel_time'] = base_t * 5.0
                 else:
-                    edge['status'] = 'Normal' # Slight
-                    edge['weight'] = base_w * 2.0 
+                    edge['status'] = 'Normal'   # Slight
+                    edge['weight'] = base_w * 2.0
                     edge['travel_time'] = base_t * 2.0
                     
                 if edge['has_building']:
@@ -195,6 +204,10 @@ class DisasterMap:
                     num_injured = int(total_pop * injury_rate)
                     edge['injured'] = num_injured
                     edge['healthy'] = total_pop - num_injured
+        
+        # 루프 종료 후 Closed 간선 물리적 제거 (iteration-safe)
+        for u, v in edges_to_remove:
+            self.graph.remove_edge(u, v)
 
     def get_shortest_path(self, start_node, end_node):
         try:

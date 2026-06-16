@@ -77,6 +77,7 @@ class ManagerPPOTrainer:
         # 초기 h_last
         h_last_dict = {b: torch.zeros(128, device=self.device) for b in range(B)}
         prev_start_zones = {b: -1 for b in range(B)}
+        prev_z_acts = {b: -1 for b in range(B)}
         
         # Manager Turns Execution Loop
         while not all(done_flags):
@@ -169,7 +170,10 @@ class ManagerPPOTrainer:
                 # PBRS용: 현재 위치에서 타겟까지의 초기 다익스트라 거리
                 t_idx = t_act[i].item()
                 target_node_idx = int(self.env.targets[b, t_idx].item())
-                prev_dist_to_target[b] = self.env.env.dist_matrix[c_node_idx, target_node_idx]
+                d_prev = self.env.env.dist_matrix[c_node_idx, target_node_idx]
+                if d_prev == float('inf') or np.isinf(d_prev):
+                    d_prev = self.env.env.max_dist
+                prev_dist_to_target[b] = d_prev
             
             # 액션 적용 (Active 배치에 대해서만 추출하여 패스)
             act_t_act = torch.zeros(B, dtype=torch.long, device=self.device)
@@ -193,7 +197,10 @@ class ManagerPPOTrainer:
                 c_node_idx_after = int(self.env.env.curr_nodes[b].item())
                 t_idx = t_act[i].item()
                 target_node_idx = int(self.env.targets[b, t_idx].item())
-                curr_dist_to_target = self.env.env.dist_matrix[c_node_idx_after, target_node_idx]
+                d_curr = self.env.env.dist_matrix[c_node_idx_after, target_node_idx]
+                if d_curr == float('inf') or np.isinf(d_curr):
+                    d_curr = self.env.env.max_dist
+                curr_dist_to_target = d_curr
                 
                 # 거리 스케일 폭주 방지를 위해 log1p 정규화 적용 (최대 거리가 80000이어도 11.3으로 압축됨)
                 reward_pbrs = (np.log1p(prev_dist_to_target[b]) - np.log1p(curr_dist_to_target)) * 2.0
@@ -207,6 +214,13 @@ class ManagerPPOTrainer:
                 # 재방문(Tabu) 페널티 부여 (직전 출발 구역으로 되돌아가라고 지시했을 때)
                 if z_act[i].item() == prev_start_zones[b]:
                     turn_reward -= 1.0
+                    
+                # 정체 감점(Stagnation Penalty) 부여
+                # 직전 턴에 지시했던 Zone을 다시 지시했는데, 워커가 아무것도 구조하지 못했다면 무한 루프로 간주
+                if z_act[i].item() == prev_z_acts[b] and reward_rescued <= 0:
+                    turn_reward -= 2.0
+                    
+                prev_z_acts[b] = z_act[i].item()
                     
                 # 다음 턴을 위해 현재 출발 구역을 과거 구역으로 갱신
                 prev_start_zones[b] = curr_start_zones[b]
@@ -278,7 +292,7 @@ class ManagerPPOTrainer:
         }
         return buffer, stats
 
-    def train_step(self, batch_size=32, num_targets=10):
+    def train_step(self, batch_size=32, num_targets=10, current_ent_coef=0.01):
         """PPO Update"""
         buffer, stats = self._run_batch_episodes(batch_size, num_targets)
         
@@ -363,7 +377,7 @@ class ManagerPPOTrainer:
                 
                 value_loss = nn.functional.mse_loss(value, mb_returns)
                 
-                loss = policy_loss + self.vf_coeff * value_loss - self.entropy_coeff * entropy
+                loss = policy_loss + self.vf_coeff * value_loss - current_ent_coef * entropy
                 
                 if torch.isnan(loss):
                     continue

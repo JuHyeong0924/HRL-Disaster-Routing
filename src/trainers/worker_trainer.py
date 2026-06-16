@@ -45,15 +45,29 @@ class HRLWorkerTrainer:
         self.save_dir = getattr(config, 'save_dir', 'logs/rl_worker_stage')
         os.makedirs(self.save_dir, exist_ok=True)
         
-        # 정적 엣지 인덱스/속성 캐싱
-        edge_list = []
-        for u, v in env.G.edges():
-            ui = env.node_to_idx[u]
-            vi = env.node_to_idx[v]
-            edge_list.append((ui, vi))
-            edge_list.append((vi, ui))
-        self.edge_index = torch.tensor(edge_list, dtype=torch.long).t().to(self.device)
-        self.edge_attr = torch.zeros((self.edge_index.size(1), 1), dtype=torch.float32).to(self.device)
+        # 그래프 데이터 (동적 재구축 필요 시 _build_graph_data 호출)
+        self.edge_index, self.edge_attr = self._build_graph_data()
+    
+    def _build_graph_data(self):
+        """현재 그래프 상태를 반영한 edge_index, edge_attr 구축 (damage 채널 포함)."""
+        el = [(self.env.node_to_idx[u], self.env.node_to_idx[v])
+              for u, v in self.env.G.edges()]
+        bidir = el + [(v, u) for u, v in el]
+        edge_index = torch.tensor(bidir, dtype=torch.long).t().to(self.device)
+        
+        ea = []
+        for ui, vi in bidir:
+            u, v = self.env.idx_to_node[ui], self.env.idx_to_node[vi]
+            d = self.env.G[u][v]
+            ea.append([d.get('length', 0.0), d.get('damage', 0.0)])
+        edge_attr = torch.tensor(ea, dtype=torch.float32).to(self.device)
+        
+        # Per-channel min-max normalization
+        mn = edge_attr.min(0, keepdim=True)[0]
+        mx = edge_attr.max(0, keepdim=True)[0]
+        edge_attr = (edge_attr - mn) / (mx - mn).clamp(min=1e-8)
+        
+        return edge_index, edge_attr
         
     def _compute_gae(self, rewards: List[float], values: List[float]) -> torch.Tensor:
         """GAE (Generalized Advantage Estimation) 계산"""
@@ -289,16 +303,20 @@ class HRLWorkerTrainer:
             while ep_count < episodes:
                 
                 # ---------------------------------------------------------
-                # HRL 단계별 커리큘럼 전환 로직 (1:1:1 비율)
+                # HRL 단계별 커리큘럼 전환 로직 (25% : 25% : 50% 비율)
                 # ---------------------------------------------------------
-                if ep_count < episodes // 3:
+                if ep_count <= int(episodes * 0.25):
                     self.env.disaster_prob = 0.0
                     self.env.dynamic_disaster = False
-                elif ep_count < (episodes // 3) * 2:
-                    self.env.disaster_prob = 0.5
+                    phase_str = 'P1:Normal'
+                elif ep_count <= int(episodes * 0.50):
+                    self.env.disaster_prob = 0.2
                     self.env.dynamic_disaster = False
+                    phase_str = 'P2:Static'
                 else:
+                    self.env.disaster_prob = 0.2
                     self.env.dynamic_disaster = True
+                    phase_str = 'P3:Dynamic'
 
                 # 이번 배치에서 시뮬레이션할 에피소드 수 (마지막 배치를 위해)
                 current_batch_size = min(B, episodes - ep_count)
@@ -318,6 +336,7 @@ class HRLWorkerTrainer:
                 
                 # Update progress bar
                 pbar.set_postfix({
+                    'Phase': phase_str,
                     'SR': f"{avg_success*100:.1f}%",
                     'Rw': f"{avg_reward:.1f}",
                     'P-Loss': f"{loss_info['policy_loss']:.3f}",

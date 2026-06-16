@@ -23,7 +23,7 @@ class Worker(nn.Module):
         self.use_jk_net = use_jk_net
         # 1. Spatial Encoder
         self.convs = nn.ModuleList()
-        edge_dim = 1  # length
+        edge_dim = 2  # [length, damage]
         self.convs.append(GATv2Conv(node_dim, hidden_dim, heads=4, concat=False, dropout=dropout, edge_dim=edge_dim))
         self.input_proj = nn.Linear(node_dim, hidden_dim)
         
