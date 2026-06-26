@@ -6,13 +6,13 @@ from torch_geometric.nn import GATv2Conv, GraphNorm, global_mean_pool
 class Worker(nn.Module):
     """
     HRL Worker (Model D 지원)
-    - Base (4-dim): [is_curr, is_tgt, zone_info, dist]
-    - +is_visited (5-dim): 방문 노드 이력 → 순환 방지
+    - Base (5-dim): [is_curr, is_tgt, zone_info, dist_to_tgt, dist_to_next_z]
+    - +is_visited (6-dim): 방문 노드 이력 → 순환 방지
     - +global_pool: Critic에 전역 그래프 맥락 주입
     - Spatial: 2-Layer GATv2 + GraphNorm + Residual
     - Temporal: Linear 투영
     """
-    def __init__(self, node_dim: int = 5, hidden_dim: int = 256, num_layers: int = 2,
+    def __init__(self, node_dim: int = 6, hidden_dim: int = 256, num_layers: int = 2,
                  dropout: float = 0.2, use_checkpoint: bool = False,
                  use_jk_net: bool = False):
         super(Worker, self).__init__()

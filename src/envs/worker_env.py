@@ -114,18 +114,45 @@ class WorkerEnv:
             self._adj_list[ui].append(vi)
             self._adj_list[vi].append(ui)
             
-        # Dense Adjacency Matrix Tensor 생성 (Vectorized Masking용)
-        self._adj_matrix_tensor = torch.zeros((self.num_nodes, self.num_nodes), dtype=torch.bool, device=device)
-        for u in range(self.num_nodes):
-            for v in self._adj_list[u]:
-                self._adj_matrix_tensor[u, v] = True
-                
-        # Zone Adjacency Matrix Tensor 생성 (Manager Masking용)
+        # ===== Dense Matrix Tensors 생성 (런타임 NetworkX 제거용) =====
+        N = self.num_nodes
+        self._adj_matrix_tensor = torch.zeros((N, N), dtype=torch.bool, device=device)
+        self._weight_matrix = torch.zeros((N, N), dtype=torch.float32, device=device)
+        self._base_weight_matrix = torch.zeros((N, N), dtype=torch.float32, device=device)
+        self._base_time_matrix = torch.zeros((N, N), dtype=torch.float32, device=device)
+        self._damage_matrix = torch.zeros((N, N), dtype=torch.float32, device=device)
+        self._status_matrix = torch.zeros((N, N), dtype=torch.int8, device=device)
+        self._length_matrix = torch.zeros((N, N), dtype=torch.float32, device=device)
+
+        # STATUS_MAP: 문자열 status → 정수 (런타임에서 정수로만 비교)
+        self._STATUS_MAP = {'Normal': 0, 'Caution': 1, 'Danger': 2, 'Closed': 3}
+
+        for u, v, data in self.G.edges(data=True):
+            ui, vi = self.node_to_idx[u], self.node_to_idx[v]
+            w = data.get('weight', 1.0)
+            bw = data.get('base_weight', w)
+            bt = data.get('base_time', 1.0)
+            ln = data.get('length', 0.0)
+            dmg = data.get('damage', 0.0)
+            st = self._STATUS_MAP.get(data.get('status', 'Normal'), 0)
+            for i, j in [(ui, vi), (vi, ui)]:  # 양방향
+                self._adj_matrix_tensor[i, j] = True
+                self._weight_matrix[i, j] = w
+                self._base_weight_matrix[i, j] = bw
+                self._base_time_matrix[i, j] = bt
+                self._length_matrix[i, j] = ln
+                self._damage_matrix[i, j] = dmg
+                self._status_matrix[i, j] = st
+
+        # Zone Adjacency Matrix Tensor (Manager Masking용) — 변경 없음
         self._zone_adj_matrix_tensor = torch.zeros((self.k, self.k), dtype=torch.bool, device=device)
         for u in self.ZG.nodes():
             self._zone_adj_matrix_tensor[u, u] = True # 자기 자신도 허용
             for v in self.ZG.neighbors(u):
                 self._zone_adj_matrix_tensor[u, v] = True
+
+        # dist_matrix GPU 캐싱 (매 step마다 NumPy→Tensor 변환 제거)
+        self._dist_matrix_tensor = torch.from_numpy(self.dist_matrix).float().to(device)
                 
         # 보상 설정
         self.GOAL_REWARD = 50.0
@@ -178,15 +205,15 @@ class WorkerEnv:
         self.total_dist = torch.zeros(batch_size, dtype=torch.float)  # 물리적 이동 거리 누적
         
         # [Phase 1 Stage 2] 정적 재난 (에피소드 시작 시)
-        if self.disaster_prob > 0 and not self.dynamic_disaster:
-            self.dm.apply_disaster_damage(damage_prob=self.disaster_prob)
-            self._update_zone_graph_weights()
-            self._update_dist_matrix()
-        elif self.dynamic_disaster:
-            # 동적 모드일 경우 시작 시엔 재난 없이 시작
+        if self.disaster_prob > 0:
             self.dm.apply_disaster_damage(damage_prob=0.0)
-            self._update_zone_graph_weights()
+            self.dm.apply_disaster_damage(damage_prob=self.disaster_prob)
+            self.sync_tensors_from_graph()        # ← 추가: 텐서 먼저 동기화
+            self._update_zone_graph_weights()     # ← 텐서 기반으로 Zone weight 갱신
             self._update_dist_matrix()
+        else:
+            # 재난 없는 경우에도 reset 시 텐서 초기 상태 보장
+            self.sync_tensors_from_graph()
             
         for b in range(batch_size):
             # 무작위 시종착점 선택 (서로 다른 Zone이면서 도달 가능한 노드)
@@ -230,32 +257,58 @@ class WorkerEnv:
             
         return self._get_state_batch()
         
+    def sync_tensors_from_graph(self):
+        """NetworkX 그래프의 현재 상태를 Dense Matrix Tensor로 동기화.
+        
+        호출 시점: aftershock/dynamic_disaster 후 1회.
+        DisasterMap이 NetworkX를 수정한 뒤, 이 메서드로 텐서를 갱신한다.
+        """
+        # 리셋 (현재 그래프에 존재하는 간선만 반영)
+        self._adj_matrix_tensor.zero_()
+        self._weight_matrix.zero_()
+        self._damage_matrix.zero_()
+        self._status_matrix.zero_()
+        
+        for u, v, data in self.G.edges(data=True):
+            ui, vi = self.node_to_idx[u], self.node_to_idx[v]
+            w = data.get('weight', 1.0)
+            dmg = data.get('damage', 0.0)
+            st = self._STATUS_MAP.get(data.get('status', 'Normal'), 0)
+            for i, j in [(ui, vi), (vi, ui)]:
+                self._adj_matrix_tensor[i, j] = True
+                self._weight_matrix[i, j] = w
+                self._damage_matrix[i, j] = dmg
+                self._status_matrix[i, j] = st
+        
+        # dist_matrix GPU 텐서 갱신
+        self._dist_matrix_tensor = torch.from_numpy(self.dist_matrix).float().to(self.device)
+
     def _update_zone_graph_weights(self):
-        """재난 발생으로 인한 Edge damage를 기반으로 Zone Graph의 weight 갱신.
-        모든 cross-zone 간선이 제거된 경우 weight=inf로 설정."""
+        """재난 발생으로 인한 Edge damage를 기반으로 Zone Graph의 weight 갱신 (텐서 기반)."""
         for u_z, v_z in list(self.ZG.edges()):
-            cross_damages = []
-            for node_u in self.z2n[u_z]:
-                for node_v in self.z2n[v_z]:
-                    if self.G.has_edge(node_u, node_v):
-                        cross_damages.append(self.G[node_u][node_v].get('damage', 0.0))
-            
-            if not cross_damages:
-                # 모든 물리적 cross-zone 간선 제거됨 → Zone 간 연결 불가
-                self.ZG[u_z][v_z]['weight'] = float('inf')
-            else:
-                avg_damage = sum(cross_damages) / len(cross_damages)
+            u_indices = [self.node_to_idx[n] for n in self.z2n[u_z]]
+            v_indices = [self.node_to_idx[n] for n in self.z2n[v_z]]
+            # Tensor slicing으로 cross-zone 간선 조회
+            sub_adj = self._adj_matrix_tensor[u_indices][:, v_indices]  # [len_u, len_v]
+            if sub_adj.any():
+                sub_dmg = self._damage_matrix[u_indices][:, v_indices]
+                avg_damage = sub_dmg[sub_adj].mean().item()
                 self.ZG[u_z][v_z]['weight'] = 1.0 * (1 + avg_damage * 10)
+            else:
+                self.ZG[u_z][v_z]['weight'] = float('inf')
             
     def _update_dist_matrix(self):
         """Scipy를 사용하여 O(V^3) 플로이드 워셜을 밀리초 단위로 초고속 수행하여 dist_matrix 실시간 최신화"""
         adj = nx.to_scipy_sparse_array(self.G, weight='weight')
         self.dist_matrix = shortest_path(csgraph=adj, directed=False)
         # 주의: 신경망 정규화 스케일 안정을 위해 self.max_dist는 초기 깨끗한 맵 기준값을 유지합니다.
+        # GPU 텐서 갱신 추가
+        self._dist_matrix_tensor = torch.from_numpy(self.dist_matrix).float().to(self.device)
             
     def apply_dynamic_disaster(self):
         """[Phase 1 Stage 3] 에피소드 진행 중 동적 재난 발생 시뮬레이션"""
         self.dm.apply_disaster_damage(damage_prob=self.disaster_prob)
+        self.sync_tensors_from_graph()        # ← 텐서 먼저 동기화
         self._update_zone_graph_weights()
         self._update_dist_matrix()
         
@@ -278,7 +331,8 @@ class WorkerEnv:
     def apply_aftershock(self):
         """[Phase 2 HRL] 에피소드 진행 중 동적 재난(여진) 발생 시뮬레이션 (Manager 경로 덮어쓰기 방지)"""
         self.dm.apply_disaster_damage(damage_prob=self.disaster_prob)
-        self._update_zone_graph_weights()
+        self.sync_tensors_from_graph()       # ← 텐서 먼저 동기화
+        self._update_zone_graph_weights()    # ← 텐서 기반으로 Zone weight 갱신
         self._update_dist_matrix()
         # 주의: HRL 구조에서는 zone_sequences를 재계산하지 않음 (Manager의 z_act를 유지하기 위함)
                 
@@ -300,7 +354,7 @@ class WorkerEnv:
         """배치 Worker 입력 상태 구성 [B, N, D] (Fully Vectorized)."""
         B = self.batch_size
         N = self.num_nodes
-        state_dim = 5
+        state_dim = 6
         state = torch.zeros(B, N, state_dim, device=self.device)
         
         curr_z, next_z = self._get_current_and_next_zone_batch()
@@ -324,23 +378,37 @@ class WorkerEnv:
             subgoal_nodes = self.subgoal_nodes.to(self.device)
             state[batch_idx, subgoal_nodes, 2] = 1.0
             
-        # dist (Ch.3): Dijkstra (Normalized) 일괄 연산
-        dist_tensor = torch.from_numpy(self.dist_matrix).float().to(self.device)
+        # dist (Ch.3): Dijkstra (Normalized) 일괄 연산 - 최종 타겟까지의 거리
+        dist_tensor = self._dist_matrix_tensor
         
-        # raw: 타겟 노드에서 모든 노드까지의 거리 [B, N]
-        raw = torch.log1p(dist_tensor[:, target_nodes].T) 
-        
-        # curr_val: 현재 노드에서 타겟 노드까지의 거리 [B, 1]
-        curr_val = torch.log1p(dist_tensor[curr_nodes, target_nodes]).unsqueeze(1)
+        raw_tgt = torch.log1p(dist_tensor[:, target_nodes].T) 
+        curr_val_tgt = torch.log1p(dist_tensor[curr_nodes, target_nodes]).unsqueeze(1)
         scale = 3.0
-        rel = (curr_val - raw)
-        # NaN 방어 (inf - inf 방지)
-        rel = torch.where(torch.isnan(rel), torch.zeros_like(rel), rel)
-        rel = torch.clamp(rel, -scale, scale) / scale
-        state[:, :, 3] = rel
+        rel_tgt = (curr_val_tgt - raw_tgt)
+        rel_tgt = torch.where(torch.isnan(rel_tgt), torch.zeros_like(rel_tgt), rel_tgt)
+        rel_tgt = torch.clamp(rel_tgt, -scale, scale) / scale
+        state[:, :, 3] = rel_tgt
+        
+        # dist_to_next_z (Ch.4): 서브존(next_z) 내 가장 가까운 노드까지의 거리
+        for b in range(B):
+            if self.subgoal_mode == 'zone':
+                nz_mask = (nz_tensor == next_z[b])
+                if nz_mask.any():
+                    dist_to_z, _ = dist_tensor[:, nz_mask].min(dim=1)
+                else:
+                    dist_to_z = dist_tensor[:, target_nodes[b]]
+            else:
+                dist_to_z = dist_tensor[:, subgoal_nodes[b]]
                 
-        # is_visited 채널
-        state[:, :, 4] = self.visited_nodes
+            raw_z = torch.log1p(dist_to_z)
+            curr_val_z = torch.log1p(dist_to_z[curr_nodes[b]])
+            rel_z = (curr_val_z - raw_z)
+            rel_z = torch.where(torch.isnan(rel_z), torch.zeros_like(rel_z), rel_z)
+            rel_z = torch.clamp(rel_z, -scale, scale) / scale
+            state[b, :, 4] = rel_z
+                
+        # is_visited 채널 (Ch.5)
+        state[:, :, 5] = self.visited_nodes
             
         return state
     
@@ -364,6 +432,16 @@ class WorkerEnv:
         
         # Dense 인접 행렬을 통해 모든 에이전트의 인접 노드 일괄 마스킹
         mask = self._adj_matrix_tensor[curr_nodes].clone().float() # [B, N]
+        
+        # ⚡ Dynamic Edge Masking: aftershock로 제거된 간선 반영 (텐서 기반)
+        for b in range(B):
+            if self.dones[b]:
+                continue
+            c_idx = int(curr_nodes[b].item())
+            for n_idx in self._adj_list[c_idx]:
+                if mask[b, n_idx] > 0:
+                    if not self._adj_matrix_tensor[c_idx, n_idx]:
+                        mask[b, n_idx] = 0.0
         
         # 하드 마스킹 제약 추가
         if self.masking_mode == 'hard':
@@ -415,7 +493,7 @@ class WorkerEnv:
                     ti = int(self.subgoal_nodes[b].item())
                 else:
                     ti = int(self.target_nodes[b].item())
-                d = self.dist_matrix[ci, ti]
+                d = self._dist_matrix_tensor[ci, ti].item()
                 if d == float('inf') or np.isinf(d):
                     d = self.max_dist
                 prev_dists[b] = float(np.log1p(d))
@@ -475,19 +553,19 @@ class WorkerEnv:
                 if action_zone not in allowed:
                     is_oob = True
             
-            # Update current nodes
-            u_node = self.idx_to_node[curr_idx]
-            v_node = self.idx_to_node[action_idx]
-            # 방어: aftershock로 간선이 제거된 경우 이동 무효 (self-loop 처리)
-            if u_node != v_node and not self.G.has_edge(u_node, v_node):
-                action_idx = curr_idx  # 이동 취소
-                v_node = u_node
+            # 방어: aftershock로 간선이 제거된 경우 이동 무효 및 파괴 판정
+            if curr_idx != action_idx and not self._adj_matrix_tensor[curr_idx, action_idx]:
+                rewards[b] = self.INVALID_PENALTY
+                self.dones[b] = True
+                infos[b] = {'reason': 'destroyed', 'path_len': int(self.steps_count[b].item())}
+                continue
+                
             self.curr_nodes[b] = action_idx
             # 물리적 이동 거리 누적
-            if u_node == v_node:
+            if curr_idx == action_idx:
                 edge_weight = 1.0  # self-loop fallback
             else:
-                edge_weight = self.G[u_node][v_node].get('weight', 1.0)
+                edge_weight = self._weight_matrix[curr_idx, action_idx].item()
             self.total_dist[b] += edge_weight
             if not self.dones[b]:
                 self.visited_nodes[b, action_idx] = 1.0
@@ -538,7 +616,7 @@ class WorkerEnv:
                     ti = int(self.subgoal_nodes[b].item())
                 else:
                     ti = int(self.target_nodes[b].item())
-                d = self.dist_matrix[ci, ti]
+                d = self._dist_matrix_tensor[ci, ti].item()
                 if d == float('inf') or np.isinf(d):
                     d = self.max_dist
                 new_dist = float(np.log1p(d))

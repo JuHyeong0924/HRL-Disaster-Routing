@@ -1,14 +1,40 @@
-# 📝 Train RL Script Log (`scripts/train_rl.py`)
+# train_rl.py — 변경 로그
 
-## 1. Intent & Purpose (Detailed Functional Specs)
-*   **Role:** 강화학습(Worker, Manager)의 메인 훈련 진입점(Entry Point). 환경 초기화, 모델/체크포인트 로딩, 및 트레이너 구동을 통제합니다.
-*   **Architecture & Workflow:**
-    1.  **Hardware Optimization:** 시작 시 `torch.set_num_threads(8)`, `cudnn.benchmark = True`, `allow_tf32 = True` 등을 통해 GPU(특히 Ada/Ampere 아키텍처)의 훈련 속도를 극한으로 끌어올립니다.
-    2.  **Stage Router:** `--stage worker` 또는 `--stage manager` (기존 PPO) 옵션에 따라 각기 다른 서브 함수(`_run_worker_stage`, `_run_manager_stage`)로 제어권을 넘깁니다.
-    3.  **Checkpoint Compatibility:** `_load_state_compat` 함수를 통해 구조가 변경된(예: node_dim 확장 등) 체크포인트에서도 텐서 크기가 일치하는 가중치만 안전하게 부분 로드하여, 과거의 훈련 성과를 최대한 재활용하도록 설계되었습니다.
+## Phase 2E: 커리큘럼 확장 + target_dim 업데이트 (2026-06-24)
 
-## 2. Trial & Error (Debugging History)
+### 변경 개요
+Manager 생성자 `target_dim=6`, 커리큘럼 4→5 Phases로 확장.
 
-### [2026-06-15] 🧐 코드 리뷰 (Code Review): 구조적 안정성 검증
-*   `/code_review` 및 `mcp:sequential-thinking` 심층 분석 수행 결과, 체크포인트 로딩 안정성 및 커맨드라인 인자(CLI args) 전달 구조가 매우 견고하게 짜여 있음을 확인했습니다.
-*   학습 파라미터(Curriculum Learning 로직: 에피소드 진행도에 따른 `disaster_prob` 증가 및 `dynamic_disaster` 활성화)가 자연스럽게 연결되어 있어, 추후 훈련 시 이상 없이 작동할 것임을 보증합니다.
+### 커리큘럼 구성
+| Phase | 에피소드 범위 | 타겟 수 | disaster_prob | dynamic | 의도 |
+|-------|------------|---------|--------------|---------|------|
+| P1:Single | 0~5000 | 1 | 0.0 | ✗ | 단일 타겟 기본 학습 |
+| P2:Multi | 5001~15000 | 3~7 | 0.0 | ✗ | 다중 타겟 탐색 |
+| P3:Static | 15001~25000 | 5~10 | 0.15 | ✗ | HAZUS 정적 재해 |
+| P4:Dynamic | 25001~35000 | 5~12 | 0.15 | ✓ | Continuous Aftershock |
+| P5:Full | 35001~50000 | 5~15 | 0.2 | ✓ | 전체 범위 강력 재해 |
+
+### 변경 근거
+- Phase 3/4 분리: 정적 재해에서 먼저 HAZUS 가중치에 적응한 후 동적 여진 도입
+- disaster_prob 0.2→0.15 (P3/P4): 학습 초반 과도한 난이도 방지
+
+### Trial & Error
+- **오류 없음**
+
+## Manager 학습 완료 보고 (2026-06-25)
+*   **학습 결과**: 50,000 에피소드 전체 커리큘럼 완료.
+*   **최종 에피소드 파라미터 (P5: Full)**:
+    *   타겟 수: 5~15개 무작위
+    *   재난 확률: 0.2
+    *   동적 재난: 활성화 (Continuous Aftershock)
+*   **최종 학습 지표**:
+    *   **전체 평균 속도**: 1.12s/ep (최적화 전 약 10s/ep 대비 8.9배 단축)
+    *   **총 소요 시간**: 15시간 32분 (최적화 전 기준 130시간 이상 소요되었을 분량)
+    *   **Best Reward**: 182.18
+    *   **최종 Reward (Rw)**: 145.14
+    *   **구출 성능 (Rsc)**: 평균 8.6개 타겟 구출 (최대 14~15개 기준)
+    *   **성공률 (SR)**: **61.2%** (복잡한 동적 재해 및 UGV 파괴 위험 상황에서 매우 안정적인 회복 성능 도달)
+    *   **평균 Manager Turn 수**: 26.6 턴
+    *   **평균 Worker Step 수**: 64.4 스텝
+*   **체크포인트 저장 위치**: `logs/rl_manager_stage/2026-06-24_180420_manager/best_manager.pt`
+

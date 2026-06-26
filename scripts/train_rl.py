@@ -26,13 +26,9 @@ torch.backends.cudnn.allow_tf32 = True
 # [Active Models & Trainers]
 from src.models.worker import Worker
 from src.trainers.worker_trainer import HRLWorkerTrainer  # [HRL Phase 1]
-
-# [Manager v2] 비자기회귀 + PPO + PBRS Re-planning
-from src.models.manager import Manager
-from src.models.manager import Manager
-from src.trainers.manager_trainer import ManagerTrainer
-from src.envs.manager_env import ManagerEnv
 from src.envs.worker_env import WorkerEnv
+
+
 
 
 class Config:
@@ -163,7 +159,7 @@ def _build_config(args, loaded_checkpoint_paths):
     )
 
 
-def _init_worker_env(args):
+def _init_worker_env(args, device='cpu'):
     """Phase 1 Worker 학습용 HRLZoneEnv 환경 초기화."""
     zone_json = f'data/grid_{args.map}_node_to_zone.json'
     zone_graph_json = f'data/grid_{args.map}_zone_graph.json'
@@ -176,6 +172,7 @@ def _init_worker_env(args):
         masking_mode=getattr(args, 'masking_mode', 'soft_flex'),
         subgoal_mode=getattr(args, 'subgoal_mode', 'zone'),
         oob_penalty=getattr(args, 'oob_penalty', -1.0),
+        device=device
     )
     env.zone_progress_reward = getattr(args, 'zone_progress_reward', False)
     env.disaster_prob = getattr(args, 'disaster_prob', 0.0)
@@ -209,15 +206,15 @@ def _run_worker_stage(args) -> None:
     print(f"🚀 Stage [WORKER] 학습 시작 ({args.episodes} episodes)")
     print(f"{'='*60}")
 
-    print("Initializing Environment...")
-    env = _init_worker_env(args)
-
     device = _get_device()
+
+    print("Initializing Environment...")
+    env = _init_worker_env(args, device=str(device))
 
     # Worker 생성
     num_layers = getattr(args, 'num_layers', 2)
     use_jk_net = getattr(args, 'use_jk_net', False)
-    node_dim = 5
+    node_dim = 6
     worker = Worker(
         node_dim=node_dim,
         hidden_dim=args.hidden_dim,
@@ -257,13 +254,19 @@ def _run_manager_stage(args) -> None:
     print(f"🚀 Stage [MANAGER] 학습 시작 ({args.episodes} episodes)")
     print(f"{'='*60}")
 
+    from src.models.manager import Manager
+    from src.trainers.manager_trainer import ManagerTrainer
+    from src.envs.hrl_env import HRLEnv
+    import random
+    from tqdm import tqdm
+
     device = _get_device()
     loaded_checkpoint_paths = []
 
     # Worker 생성 및 체크포인트 로드
     num_layers = getattr(args, 'num_layers', 2)
     use_jk_net = getattr(args, 'use_jk_net', False)
-    node_dim = 5
+    node_dim = 6
     worker = Worker(
         node_dim=node_dim,
         hidden_dim=args.hidden_dim,
@@ -276,33 +279,96 @@ def _run_manager_stage(args) -> None:
     wkr_ckpt = args.worker_ckpt if getattr(args, 'worker_ckpt', None) else _get_latest_ckpt(os.path.join('logs', 'rl_worker_stage'), 'best.pt')
     if not _load_worker_checkpoint(wkr_ckpt, worker, device, loaded_checkpoint_paths):
         print("⚠️ Worker 체크포인트 없음. Worker는 랜덤 초기 상태로 사용됩니다.")
+    worker.eval()
 
-    # Manager 생성
-    node_dim = 7  # is_curr, is_tgt, is_visited, zone_hop_dist, distance_from_curr, zone_node_count
+    # Init WorkerEnv
+    worker_env = _init_worker_env(args, device=str(device))
+
+    # Init HRLEnv
+    hrl_env = HRLEnv(worker, worker_env)
+
+    # Init Manager
     manager_model = Manager(
-        node_dim=node_dim, hidden_dim=args.hidden_dim,
-        num_layers=num_layers, dropout=0.0,
+        zone_dim=6, target_dim=6, hidden_dim=256,  # [Phase 2B] target_dim 4→6
+        num_gat_layers=3, gat_heads=4, num_transformer_layers=3, transformer_heads=4
     ).to(device)
-    print(f"📋 Manager v2: Manager (node_dim={node_dim}, hidden={args.hidden_dim})")
+    print(f"📋 Manager: (hidden=256)")
     print(f"   파라미터 수: {sum(p.numel() for p in manager_model.parameters()):,}")
 
-    # Closed-loop 환경 생성
-    node_file = f"data/{args.map}_node.tntp"
-    net_file = f"data/{args.map}_net.tntp"
-    cl_env = ManagerEnv(
-        node_file=node_file,
-        net_file=net_file,
-        worker=worker, c_max=20,
-        device=str(device),
-    )
-
-    # PPO Trainer 생성 및 학습
+    # Init Trainer
     config = _build_config(args, loaded_checkpoint_paths)
     os.makedirs(config.save_dir, exist_ok=True)
-    ppo_trainer = ManagerTrainer(cl_env, manager_model, config)
-    ppo_trainer.train(args.episodes)
+    trainer = ManagerTrainer(manager_model, hrl_env, config=args)
 
-    print(f"\n✅ Stage [MANAGER_V2] 학습 완료!")
+    best_reward = -float('inf')
+    num_steps = (args.episodes + args.batch_size - 1) // args.batch_size
+    
+    with tqdm(total=args.episodes, desc="Manager PPO", ncols=140, unit="ep") as pbar:
+        for step in range(1, num_steps + 1):
+            current_ep = step * args.batch_size
+            
+            # [Phase 2E] Curriculum Learning (5 Phases, total 50000 episodes)
+            if current_ep <= 5000:
+                # Phase 1: 단일 타겟, 무재해
+                current_num_targets = 1
+                hrl_env.env.disaster_prob = 0.0
+                hrl_env.env.dynamic_disaster = False
+                phase_str = 'P1:Single'
+            elif current_ep <= 15000:
+                # Phase 2: 다중 타겟, 무재해
+                current_num_targets = random.randint(3, 7)
+                hrl_env.env.disaster_prob = 0.0
+                hrl_env.env.dynamic_disaster = False
+                phase_str = 'P2:Multi'
+            elif current_ep <= 25000:
+                # Phase 3: 다중 타겟, 정적 재해 (HAZUS 가중치)
+                current_num_targets = random.randint(5, 10)
+                hrl_env.env.disaster_prob = 0.15
+                hrl_env.env.dynamic_disaster = False
+                phase_str = 'P3:Static'
+            elif current_ep <= 35000:
+                # Phase 4: 다수 타겟, 동적 재해 (Continuous Aftershock)
+                current_num_targets = random.randint(5, 12)
+                hrl_env.env.disaster_prob = 0.15
+                hrl_env.env.dynamic_disaster = True
+                phase_str = 'P4:Dynamic'
+            else:
+                # Phase 5: 전체 범위, 강력한 동적 재해
+                current_num_targets = random.randint(5, 15)
+                hrl_env.env.disaster_prob = 0.2
+                hrl_env.env.dynamic_disaster = True
+                phase_str = 'P5:Full'
+                
+            # 동적 엔트로피 감가 적용 (0.05 -> 0.01)
+            current_ent_coef = max(0.01, 0.05 - 0.04 * (step / num_steps))
+            
+            logs = trainer.train_step(
+                batch_size=args.batch_size, 
+                num_targets=current_num_targets,
+                current_ent_coef=current_ent_coef
+            )
+            
+            sr = (logs['mean_rescued'] / current_num_targets) * 100.0 if current_num_targets > 0 else 0.0
+            
+            pbar.set_postfix({
+                'Phase': phase_str,
+                'Loss': f"{logs.get('loss', 0):.4f}",
+                'P': f"{logs.get('policy_loss', 0):.4f}",
+                'V': f"{logs.get('value_loss', 0):.4f}",
+                'Rw': f"{logs['mean_reward']:.2f}",
+                'Rsc': f"{logs['mean_rescued']:.1f}/{current_num_targets}",
+                'SR': f"{sr:.1f}%",
+                'Trn': f"{logs['mean_manager_turns']:.1f}",
+                'WStp': f"{logs['mean_worker_steps']:.1f}"
+            })
+            pbar.update(args.batch_size)
+            
+            if logs['mean_reward'] > best_reward:
+                best_reward = logs['mean_reward']
+                torch.save(manager_model.state_dict(), os.path.join(config.save_dir, 'best_manager.pt'))
+                tqdm.write(f"  => Best model saved (Reward: {best_reward:.2f})")
+                
+    print(f"\n✅ Stage [MANAGER] 학습 완료! Best Reward: {best_reward:.2f}")
     print(f"   저장 위치: {config.save_dir}")
 
 
@@ -342,8 +408,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="HRL-Disaster-Routing RL Training")
     parser.add_argument("--map", default="Anaheim")
     parser.add_argument("--data", default="data", help="Data Directory")
-    parser.add_argument("--episodes", type=int, default=None,
-                        help="총 에피소드 수 (--steps 미지정 시 사용, 기본 5000)")
+    parser.add_argument("--episodes", type=int, default=30000,
+                        help="총 에피소드 수 (--steps 미지정 시 사용, 기본 30000)")
     parser.add_argument("--steps", type=int, default=None,
                         help="총 gradient 업데이트 스텝 수 (지정 시 --episodes보다 우선)")
     parser.add_argument("--batch_size", type=int, default=32,
@@ -397,7 +463,7 @@ if __name__ == "__main__":
     parser.add_argument("--worker_ckpt", type=str, default=None, help="Path to specific worker checkpoint")
     
     # [Phase 1 Stage 2,3 Disaster Settings]
-    parser.add_argument("--disaster_prob", type=float, default=0.0, help="에피소드 내 재난 발생 확률 (Stage 2)")
+    parser.add_argument("--disaster_prob", type=float, default=0.2, help="에피소드 내 재난 발생 확률 (Stage 2)")
     parser.add_argument("--dynamic_disaster", action="store_true", help="에피소드 진행 중 동적 재난 발생 활성화 (Stage 3)")
 
     args = parser.parse_args()

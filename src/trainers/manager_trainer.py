@@ -1,349 +1,420 @@
 """
-Manager v2 PPO Trainer: 비자기회귀 Manager를 PPO + GAE로 학습.
+Phase 2: Manager HRL 트레이너 (정통 PPO 도입 버전)
 
-핵심 설계:
-- SL(A* 모방) 완전 제거, 순수 RL만으로 학습
-- Rollout Buffer로 에피소드 데이터 수집
-- GAE로 토큰별(턴별) Advantage 계산
-- PPO Clipped Objective로 안정적 정책 업데이트
-- HRLClosedLoopEnv와 연동: Manager → Worker → PBRS → 반복
+- POMO의 K-복제 롤아웃을 제거하고 단일 궤적 기반 PPO로 전환.
+- 타겟(Target)과 구역(Zone) 선택에 대한 Actor-Critic PPO 업데이트 수행.
+- GAE(Generalized Advantage Estimation)를 활용하여 안정적인 학습 도모.
 """
-import os
-import json
-import time
-from collections import deque
-from datetime import datetime
-from typing import Dict, List, Optional
 
-import numpy as np
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
-from tqdm import tqdm
-
-
-class RolloutBuffer:
-    def __init__(self) -> None:
-        self.states: List[Dict] = []
-        self.actions: List[int] = []
-        self.rewards: List[float] = []
-        self.values: List[float] = []
-        self.log_probs: List[float] = []
-        self.dones: List[bool] = []
-        self.truncations: List[bool] = []
-        self.next_values: List[float] = []
-
-        self.advantages: Optional[torch.Tensor] = None
-        self.returns: Optional[torch.Tensor] = None
-
-    def store(
-        self,
-        state_info: Dict,
-        action: int,
-        reward: float,
-        value: float,
-        log_prob: float,
-        done: bool,
-        truncated: bool = False,
-        next_value: float = 0.0,
-    ) -> None:
-        self.states.append(state_info)
-        self.actions.append(action)
-        self.rewards.append(reward)
-        self.values.append(value)
-        self.log_probs.append(log_prob)
-        self.dones.append(done)
-        self.truncations.append(truncated)
-        self.next_values.append(next_value)
-
-    def compute_gae(self, gamma: float = 0.99, lam: float = 0.95) -> None:
-        n = len(self.rewards)
-        advantages = np.zeros(n, dtype=np.float32)
-        gae = 0.0
-
-        for t in reversed(range(n)):
-            if self.dones[t]:
-                gae = 0.0
-                next_val = self.next_values[t] if self.truncations[t] else 0.0
-            else:
-                next_val = self.values[t+1]
-
-            delta = self.rewards[t] + gamma * next_val - self.values[t]
-            gae = delta + gamma * lam * gae
-            advantages[t] = gae
-
-        self.advantages = torch.tensor(advantages, dtype=torch.float32)
-        self.returns = self.advantages + torch.tensor(self.values, dtype=torch.float32)
-
-        if len(advantages) > 1:
-            self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
-            # 🚨 [삭제] 아래 self.returns 정규화 코드는 무조건 삭제하세요!
-            # self.returns = (self.returns - self.returns.mean()) / (self.returns.std() + 1e-8)
-
-    def clear(self) -> None:
-        self.states.clear()
-        self.actions.clear()
-        self.rewards.clear()
-        self.values.clear()
-        self.log_probs.clear()
-        self.dones.clear()
-        self.truncations.clear()
-        self.next_values.clear()
-        self.advantages = None
-        self.returns = None
-
-    def __len__(self) -> int:
-        return len(self.rewards)
-
+import numpy as np
+from typing import Dict, List, Any
+from torch.distributions import Categorical
 
 class ManagerTrainer:
-    def __init__(self, env, manager: nn.Module, config) -> None:
-        self.env = env
+    def __init__(self, manager, hrl_env, K=1, lr=1e-4, max_grad_norm=1.0, config=None):
         self.manager = manager
-        self.config = config
-        self.device = next(manager.parameters()).device
-
-        self.lr = getattr(config, 'lr', 3e-4)
-        self.optimizer = optim.Adam(manager.parameters(), lr=self.lr)
-
+        self.env = hrl_env
+        self.K = K # K=1 (PPO rollout)
+        self.device = next(self.manager.parameters()).device
+        
+        # PPO Hyperparameters
+        if config is None:
+            config = type('Config', (), {})()
+            
+        self.lr = getattr(config, 'lr', lr)
         self.gamma = getattr(config, 'gamma', 0.99)
         self.gae_lambda = getattr(config, 'gae_lambda', 0.95)
-        self.clip_range = getattr(config, 'clip_range', 0.2)
-        self.n_epochs = getattr(config, 'n_epochs', 4)
-        self.value_coeff = getattr(config, 'value_coeff', 0.5)
-        self.entropy_coeff = getattr(config, 'entropy_coeff', 0.0)
+        self.clip_ratio = getattr(config, 'clip_ratio', 0.2)
+        self.entropy_coeff = getattr(config, 'entropy_coeff', 0.01)
+        self.vf_coeff = getattr(config, 'vf_coeff', 0.5)
+        self.ppo_epochs = getattr(config, 'ppo_epochs', 4)
+        self.mini_batch_size = getattr(config, 'mini_batch_size', 64)
+        self.max_grad_norm = getattr(config, 'max_grad_norm', max_grad_norm)
         
-        # [수정] 사용자님의 제안대로 SAC 스타일 자동 튜닝을 복구하되,
-        # 이산 행동 공간에 맞게 target_entropy를 양수로 설정. (마스킹된 유효 액션 3~5개 기준 적절한 양수인 0.5로 설정)
-        self.target_entropy = 0.5
-        init_alpha = getattr(config, 'entropy_coeff', 0.02)
-        safe_init_alpha = max(init_alpha, 1e-8)
-        self.log_alpha = torch.tensor(np.log(safe_init_alpha), dtype=torch.float32,
-                                       device=self.device, requires_grad=True)
-        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
-        
-        self.max_grad_norm = getattr(config, 'max_grad_norm', 0.5)
-        self.batch_size = getattr(config, 'batch_size', 16)
+        self.optimizer = optim.Adam(self.manager.parameters(), lr=self.lr)
 
-        self.n_rollout_episodes = getattr(config, 'num_pomo', 16)
-        self.save_dir = getattr(config, 'save_dir', 'logs/rl_manager_stage')
-        os.makedirs(self.save_dir, exist_ok=True)
+    def _compute_gae(self, rewards: List[float], values: List[float]) -> torch.Tensor:
+        advantages = []
+        gae = 0.0
+        next_value = 0.0
+        for r, v in zip(reversed(rewards), reversed(values)):
+            delta = r + self.gamma * next_value - v
+            gae = delta + self.gamma * self.gae_lambda * gae
+            advantages.insert(0, gae)
+            next_value = v
+        return torch.tensor(advantages, dtype=torch.float32, device=self.device)
 
-        self.buffer = RolloutBuffer()
-
-    def collect_rollouts(self, pbar=None) -> Dict:
-        """에피소드 n_rollout_episodes개를 수집하여 버퍼에 저장."""
+    @torch.no_grad()
+    def _run_batch_episodes(self, batch_size=32, num_targets=10):
         self.manager.eval()
-        self.buffer.clear()
-
-        episode_rewards = []
-        episode_successes = []
-        episode_turns = []
-        episode_worker_steps = []
-        episode_worker_successes = []
-
-        for _ in range(self.n_rollout_episodes):
-            current_idx, goal_idx = self.env.reset()
-            ep_reward = 0.0
-            worker_successes = 0
-            manager_steps = 0
+        self.env.reset(batch_size=batch_size, num_targets=num_targets)
+        B = batch_size
+        
+        # 에피소드 궤적
+        ep_zone_features = [[] for _ in range(B)]
+        ep_target_features = [[] for _ in range(B)]
+        ep_target_mask = [[] for _ in range(B)]
+        ep_target_zones = [[] for _ in range(B)]
+        ep_zone_adj_mask = [[] for _ in range(B)]
+        
+        # [Phase 2F] h_last 제거 → num_feasible, avg_urgency로 교체
+        ep_num_feasible = [[] for _ in range(B)]
+        ep_avg_urgency = [[] for _ in range(B)]
+        ep_elapsed = [[] for _ in range(B)]
+        ep_rescued = [[] for _ in range(B)]
+        
+        ep_t_acts = [[] for _ in range(B)]
+        ep_z_acts = [[] for _ in range(B)]
+        
+        ep_rewards = [[] for _ in range(B)]
+        ep_values = [[] for _ in range(B)]
+        ep_log_probs = [[] for _ in range(B)]
+        
+        done_flags = [False] * B
+        
+        # 초기 상태
+        prev_start_zones = {b: -1 for b in range(B)}
+        prev_z_acts = {b: -1 for b in range(B)}
+        prev_target_failed = {b: self.env.target_failed[b].clone() for b in range(B)}
+        
+        # Manager Turns Execution Loop
+        while not all(done_flags):
+            active = [b for b in range(B) if not done_flags[b]]
+            A = len(active)
+            if A == 0: break
             
-            while not self.env.done:
-                x = self.env.get_manager_state()
-                candidate_mask = self.env.get_candidate_mask()
-
-                # 유효 후보가 없으면 강제 종료
-                if candidate_mask.sum() == 0:
-                    self.buffer.store(
-                        state_info={'x': x.cpu(), 'curr_z': 0, 'goal_z': 0, 'mask': candidate_mask.cpu()},
-                        action=0, reward=-1.0, value=0.0, log_prob=0.0, done=True
-                    )
-                    self.env.done = True
-                    break
-
-                curr_z = int(self.env._node_zone_tensor[self.env.current_idx].item())
-                goal_z = int(self.env._node_zone_tensor[self.env.goal_idx].item())
+            # 피처 추출
+            zone_features = self.env.get_zone_features()[active] # [A, K_zones, 6]
+            zone_edge_index = self.env.get_zone_edge_index() # [2, E]
+            target_features = self.env.get_target_features()[active] # [A, N, 6]
+            target_mask = self.env.get_target_mask()[active] # [A, N]
+            target_zones = self.env.target_zones[active] # [A, N]
+            zone_adj_mask = self.env.get_zone_adj_mask()[active] # [A, K_zones]
+            zone_dist_matrix = self.env.zone_dist_matrix.unsqueeze(0).expand(A, -1, -1) # [A, K, K]
+            
+            elapsed = self.env.current_time[active].unsqueeze(1) / self.env.max_time
+            rescued = self.env.num_rescued[active].unsqueeze(1).float() / num_targets
+            
+            # [Phase 2F] num_feasible, avg_urgency 계산
+            num_feasible = target_mask.sum(dim=-1, keepdim=True).float() / num_targets  # [A, 1]
+            urgency_ch = target_features[:, :, 3]  # [A, N] urgency_ratio
+            mask_float = target_mask.float()  # [A, N]
+            avg_urgency = (urgency_ch * mask_float).sum(dim=-1, keepdim=True) / mask_float.sum(dim=-1, keepdim=True).clamp(min=1)  # [A, 1]
+            
+            # 버퍼에 저장 (CPU)
+            for i, b in enumerate(active):
+                ep_zone_features[b].append(zone_features[i].clone().cpu())
+                ep_target_features[b].append(target_features[i].clone().cpu())
+                ep_target_mask[b].append(target_mask[i].clone().cpu())
+                ep_target_zones[b].append(target_zones[i].clone().cpu())
+                ep_zone_adj_mask[b].append(zone_adj_mask[i].clone().cpu())
+                ep_num_feasible[b].append(num_feasible[i].clone().cpu())
+                ep_avg_urgency[b].append(avg_urgency[i].clone().cpu())
+                ep_elapsed[b].append(elapsed[i].clone().cpu())
+                ep_rescued[b].append(rescued[i].clone().cpu())
                 
-                # Manager 정책으로 순수하게 액션 선택 (Heuristic 없음)
-                action, log_prob, value, entropy = self.manager.select_action(
-                    x, self.env.zone_edge_index, curr_z,
-                    goal_z, candidate_mask,
-                )
+            # ── 모델 추론 (No Grad) ──
+            K_zones = self.env.env.k
+            flat_zf = zone_features.view(A * K_zones, 6)
+            ai = torch.arange(A, device=self.device).repeat_interleave(K_zones)
+            aei = torch.cat([zone_edge_index + i*K_zones for i in range(A)], dim=1)
+            
+            zone_emb = self.manager.encode_zones(flat_zf, aei, batch=ai) # [A * K_zones, 128]
+            
+            t_ai = torch.arange(A, device=self.device).repeat_interleave(num_targets)
+            act_offsets = torch.arange(A, device=self.device).repeat_interleave(num_targets) * K_zones
+            flat_tz_idx = act_offsets + target_zones.view(-1)
+            
+            t_emb = self.manager.get_target_embeddings(zone_emb, target_features.view(-1, 6), flat_tz_idx)
+            
+            # [Phase 2F] context generator: h_last 제거
+            query = self.manager.generate_context(elapsed, rescued, num_feasible, avg_urgency)
+            
+            t_logits, t_inv, t_emb_dense = self.manager.get_target_logits(query, t_emb, target_mask.view(-1), t_ai)
+            t_dist = Categorical(logits=t_logits)
+            t_act = t_dist.sample()
+            t_log_prob = t_dist.log_prob(t_act)
+            
+            z_ai = torch.arange(A, device=self.device).repeat_interleave(K_zones)
+            selected_t_emb = t_emb_dense[torch.arange(A), t_act]
+            
+            selected_tz = target_zones[torch.arange(A), t_act]
+            z_logits, z_inv = self.manager.get_zone_logits(
+                query, selected_t_emb, zone_emb, zone_adj_mask.view(-1), z_ai, 
+                selected_tz, zone_dist_matrix
+            )
+            z_dist = Categorical(logits=z_logits)
+            z_act = z_dist.sample()
+            z_log_prob = z_dist.log_prob(z_act)
+            
+            # Value
+            value = self.manager.get_value(query)
+            
+            full_log_prob = t_log_prob + z_log_prob
+            
+            for i, b in enumerate(active):
+                ep_t_acts[b].append(t_act[i].item())
+                ep_z_acts[b].append(z_act[i].item())
+                ep_log_probs[b].append(full_log_prob[i].item())
+                ep_values[b].append(value[i].item())
+            
+            # 환경 진행 전의 리워드 스냅샷
+            prev_manager_turns = self.env.manager_turns.clone()
+            prev_worker_steps = self.env.worker_steps.clone()
+            prev_rescued = self.env.num_rescued.clone()
+            prev_elapsed_time = self.env.current_time.clone()
+            
+            # 액션 적용 전: 이번 턴의 출발 구역 기록 (재방문 판별용) 및 PBRS 거리 스냅샷
+            curr_start_zones = {}
+            prev_dist_to_target = {}
+            for i, b in enumerate(active):
+                c_node_idx = int(self.env.env.curr_nodes[b].item())
+                c_node = self.env.env.idx_to_node[c_node_idx]
+                curr_start_zones[b] = self.env.env.n2z[c_node]
+                
+                # PBRS용: 현재 위치에서 타겟까지의 초기 다익스트라 거리
+                t_idx = t_act[i].item()
+                target_node_idx = int(self.env.targets[b, t_idx].item())
+                d_prev = self.env.env.dist_matrix[c_node_idx, target_node_idx]
+                if d_prev == float('inf') or np.isinf(d_prev):
+                    d_prev = self.env.env.max_dist
+                prev_dist_to_target[b] = d_prev
+            
+            # 액션 적용 (Active 배치에 대해서만 추출하여 패스)
+            act_t_act = torch.zeros(B, dtype=torch.long, device=self.device)
+            act_z_act = torch.zeros(B, dtype=torch.long, device=self.device)
+            for i, b in enumerate(active):
+                act_t_act[b] = t_act[i]
+                act_z_act[b] = z_act[i]
+                
+            events, new_dones = self.env.step_manager(act_t_act, act_z_act)
+            
+            # [Phase 2C] 보상 재설계 — HAZUS 환경에 맞는 reward shaping
+            for i, b in enumerate(active):
+                # 1. 구출 보상 증폭: 10.0 → 20.0
+                reward_rescued = (self.env.num_rescued[b].item() - prev_rescued[b].item()) * 20.0
+                reward_turns = (self.env.manager_turns[b].item() - prev_manager_turns[b].item()) * -0.5
+                
+                # 워커 이동 횟수(Step) 대신 물리적 소요 시간(Time) 기준 페널티
+                elapsed_time = self.env.current_time[b].item() - prev_elapsed_time[b].item()
+                reward_time = elapsed_time * -0.1
+                
+                # PBRS: 계수 축소 5.0 → 2.0 (과도한 밀집 보상이 스파스 보상을 압도하는 문제 해결)
+                c_node_idx_after = int(self.env.env.curr_nodes[b].item())
+                t_idx = t_act[i].item()
+                target_node_idx = int(self.env.targets[b, t_idx].item())
+                d_curr = self.env.env.dist_matrix[c_node_idx_after, target_node_idx]
+                if d_curr == float('inf') or np.isinf(d_curr):
+                    d_curr = self.env.env.max_dist
+                curr_dist_to_target = d_curr
+                reward_pbrs = (np.log1p(prev_dist_to_target[b]) - np.log1p(curr_dist_to_target)) * 2.0
+                
+                turn_reward = reward_rescued + reward_turns + reward_time + reward_pbrs
+                
+                # [Phase 2C] 데드라인 만료 페널티 (-5.0 per newly expired target)
+                for ti in range(num_targets):
+                    if (not self.env.target_rescued[b, ti] and
+                        not prev_target_failed[b][ti] and
+                        self.env.target_failed[b, ti]):
+                        turn_reward -= 5.0
+                
+                # [Phase 2C] 여유 시간 보너스 (데드라인 내 충분한 여유로 구출 시)
+                if reward_rescued > 0:
+                    t_idx_for_slack = t_act[i].item()
+                    slack = self.env.deadlines[b, t_idx_for_slack].item() - self.env.current_time[b].item()
+                    if slack > 0:
+                        turn_reward += min(slack / self.env.max_time * 5.0, 3.0)
+                
+                # 명령 불복종(제자리 이탈) 페널티
+                if events[b] == 'zone_escaped':
+                    turn_reward -= 2.0
+                    
+                # 재방문(Tabu) 페널티
+                if z_act[i].item() == prev_start_zones[b]:
+                    turn_reward -= 1.0
+                    
+                # 정체 감점(Stagnation Penalty)
+                if z_act[i].item() == prev_z_acts[b] and reward_rescued <= 0:
+                    turn_reward -= 2.0
+                    
+                prev_z_acts[b] = z_act[i].item()
+                prev_start_zones[b] = curr_start_zones[b]
+                prev_target_failed[b] = self.env.target_failed[b].clone()
+                
+                ep_rewards[b].append(turn_reward)
+                done_flags[b] = new_dones[b].item()
 
-                reward, done, info = self.env.step(action)
-                ep_reward += reward
-                manager_steps += 1
-                if info.get('reached_subgoal', False):
-                    worker_successes += 1
-
-                truncated = False
-                next_val = 0.0
-                if done and info.get('reason') == 'max_turns':
-                    truncated = True
-                    # Truncation 시 next value bootstrap
-                    nx_x = self.env.get_manager_state()
-                    nx_mask = self.env.get_candidate_mask()
-                    nx_curr_z = int(self.env._node_zone_tensor[self.env.current_idx].item())
-                    nx_goal_z = int(self.env._node_zone_tensor[self.env.goal_idx].item())
-                    with torch.no_grad():
-                        _, n_val, _ = self.manager.forward(
-                            nx_x, self.env.zone_edge_index, 
-                            torch.tensor(nx_curr_z, device=self.device), 
-                            torch.tensor(nx_goal_z, device=self.device), 
-                            nx_mask
-                        )
-                        next_val = n_val.item()
-
-                self.buffer.store(
-                    state_info={'x': x.cpu(), 'curr_z': curr_z, 'goal_z': goal_z, 'mask': candidate_mask.cpu()},
-                    action=action,
-                    reward=reward,
-                    value=value.item() if isinstance(value, torch.Tensor) else value,
-                    log_prob=log_prob.item() if isinstance(log_prob, torch.Tensor) else log_prob,
-                    done=done,
-                    truncated=truncated,
-                    next_value=next_val
-                )
-
-            episode_rewards.append(ep_reward)
-            episode_successes.append(1.0 if info.get('reason') == 'success' else 0.0)
-            episode_turns.append(self.env.manager_turns)
-            episode_worker_steps.append(self.env.total_worker_steps)
-            episode_worker_successes.append(worker_successes / max(1, manager_steps))
-
-            if pbar is not None:
-                pbar.update(1)
-
-        self.buffer.compute_gae(gamma=self.gamma, lam=self.gae_lambda)
-
-        return {
-            'mean_reward': np.mean(episode_rewards),
-            'success_rate': np.mean(episode_successes),
-            'worker_success_rate': np.mean(episode_worker_successes),
-            'mean_turns': np.mean(episode_turns),
-            'mean_worker_steps': np.mean(episode_worker_steps),
+        # GAE 계산 및 버퍼 취합
+        buffer = {
+            'zone_features': [], 'target_features': [], 'target_mask': [], 'target_zones': [],
+            'zone_adj_mask': [], 'num_feasible': [], 'avg_urgency': [], 'elapsed': [], 'rescued': [],
+            't_acts': [], 'z_acts': [], 'old_log_probs': [], 'returns': [], 'advantages': []
         }
+        
+        batch_mean_reward = 0
+        batch_mean_rescued = 0
+        batch_mean_turns = 0
+        batch_mean_steps = 0
+        
+        for b in range(B):
+            r_list = ep_rewards[b]
+            v_list = ep_values[b]
+            adv_tensor = self._compute_gae(r_list, v_list)
+            v_tensor = torch.tensor(v_list, dtype=torch.float32, device=self.device)
+            ret_tensor = adv_tensor + v_tensor
+            
+            buffer['zone_features'].extend(ep_zone_features[b])
+            buffer['target_features'].extend(ep_target_features[b])
+            buffer['target_mask'].extend(ep_target_mask[b])
+            buffer['target_zones'].extend(ep_target_zones[b])
+            buffer['zone_adj_mask'].extend(ep_zone_adj_mask[b])
+            buffer['num_feasible'].extend(ep_num_feasible[b])
+            buffer['avg_urgency'].extend(ep_avg_urgency[b])
+            buffer['elapsed'].extend(ep_elapsed[b])
+            buffer['rescued'].extend(ep_rescued[b])
+            buffer['t_acts'].extend(ep_t_acts[b])
+            buffer['z_acts'].extend(ep_z_acts[b])
+            buffer['old_log_probs'].extend(ep_log_probs[b])
+            buffer['returns'].extend(ret_tensor.cpu().numpy())
+            buffer['advantages'].extend(adv_tensor.cpu().numpy())
+            
+            batch_mean_reward += sum(r_list)
+            batch_mean_rescued += self.env.num_rescued[b].item()
+            batch_mean_turns += self.env.manager_turns[b].item()
+            batch_mean_steps += self.env.worker_steps[b].item()
+            
+        # 텐서 스택
+        for k in buffer.keys():
+            if k in ['t_acts', 'z_acts']:
+                buffer[k] = torch.tensor(buffer[k], dtype=torch.long)
+            elif k in ['old_log_probs', 'returns', 'advantages']:
+                buffer[k] = torch.tensor(buffer[k], dtype=torch.float32)
+            else:
+                buffer[k] = torch.stack(buffer[k])
+                
+        # Advantage 정규화
+        adv = buffer['advantages']
+        if adv.numel() > 1:
+            buffer['advantages'] = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
+        else:
+            buffer['advantages'] = adv - adv.mean()
+            
+        stats = {
+            'mean_reward': batch_mean_reward / B,
+            'mean_rescued': batch_mean_rescued / B,
+            'mean_manager_turns': batch_mean_turns / B,
+            'mean_worker_steps': batch_mean_steps / B
+        }
+        return buffer, stats
 
-    def update(self) -> Dict:
-        """PPO Clipped Objective로 Manager 정책 업데이트."""
+    def train_step(self, batch_size=32, num_targets=10, current_ent_coef=0.01):
+        """PPO Update"""
+        buffer, stats = self._run_batch_episodes(batch_size, num_targets)
+        
         self.manager.train()
-
-        total_actor_loss = 0.0
-        total_critic_loss = 0.0
-        total_entropy = 0.0
-        n_updates = 0
-
-        # PyG DataLoader용 데이터셋 구성
-        dataset = []
-        for i in range(len(self.buffer)):
-            state = self.buffer.states[i]
-            data = Data(x=state['x'], edge_index=self.env.zone_edge_index.cpu())
-            data.curr_z = torch.tensor(state['curr_z'], dtype=torch.long)
-            data.goal_z = torch.tensor(state['goal_z'], dtype=torch.long)
-            data.mask = state['mask']
-            data.action = torch.tensor(self.buffer.actions[i], dtype=torch.long)
-            data.old_log_prob = torch.tensor(self.buffer.log_probs[i], dtype=torch.float32)
-            data.advantage = self.buffer.advantages[i].clone().detach()
-            data.target_return = self.buffer.returns[i].clone().detach()
-            dataset.append(data)
-
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-
-        for epoch in range(self.n_epochs):
-            for batch_data in loader:
-                batch_data = batch_data.to(self.device)
-
-                if (batch_data.mask == 0).all():
-                    continue
-
-                probs, value, logits = self.manager.forward(
-                    batch_data.x, 
-                    batch_data.edge_index, 
-                    batch_data.curr_z, 
-                    batch_data.goal_z, 
-                    batch_data.mask,
-                    batch_data.batch
+        T_total = buffer['t_acts'].size(0)
+        indices = np.arange(T_total)
+        
+        num_targets = buffer['target_features'].size(1)
+        K_zones = self.env.env.k
+        zone_edge_index = self.env.get_zone_edge_index()
+        
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy_loss = 0.0
+        num_updates = 0
+        
+        for _ in range(self.ppo_epochs):
+            np.random.shuffle(indices)
+            for start in range(0, T_total, self.mini_batch_size):
+                end = start + self.mini_batch_size
+                mb_idx = indices[start:end]
+                
+                # 미니배치 데이터 로드 (GPU)
+                mb_zf = buffer['zone_features'][mb_idx].to(self.device)
+                mb_tf = buffer['target_features'][mb_idx].to(self.device)
+                mb_tm = buffer['target_mask'][mb_idx].to(self.device)
+                mb_tz = buffer['target_zones'][mb_idx].to(self.device)
+                mb_zam = buffer['zone_adj_mask'][mb_idx].to(self.device)
+                mb_num_feasible = buffer['num_feasible'][mb_idx].to(self.device)
+                mb_avg_urgency = buffer['avg_urgency'][mb_idx].to(self.device)
+                mb_elapsed = buffer['elapsed'][mb_idx].to(self.device)
+                mb_rescued = buffer['rescued'][mb_idx].to(self.device)
+                
+                mb_t_acts = buffer['t_acts'][mb_idx].to(self.device)
+                mb_z_acts = buffer['z_acts'][mb_idx].to(self.device)
+                mb_old_log_probs = buffer['old_log_probs'][mb_idx].to(self.device)
+                mb_returns = buffer['returns'][mb_idx].to(self.device)
+                mb_advantages = buffer['advantages'][mb_idx].to(self.device)
+                
+                A = mb_zf.size(0)
+                
+                # GNN 포워드 (미분 활성화)
+                flat_zf = mb_zf.view(A * K_zones, 6)
+                ai = torch.arange(A, device=self.device).repeat_interleave(K_zones)
+                aei = torch.cat([zone_edge_index + i*K_zones for i in range(A)], dim=1)
+                
+                zone_emb = self.manager.encode_zones(flat_zf, aei, batch=ai)
+                
+                t_ai = torch.arange(A, device=self.device).repeat_interleave(num_targets)
+                act_offsets = torch.arange(A, device=self.device).repeat_interleave(num_targets) * K_zones
+                flat_tz_idx = act_offsets + mb_tz.view(-1)
+                
+                t_emb = self.manager.get_target_embeddings(zone_emb, mb_tf.view(-1, 6), flat_tz_idx)
+                
+                query = self.manager.generate_context(mb_elapsed, mb_rescued, mb_num_feasible, mb_avg_urgency)
+                
+                t_logits, t_inv, t_emb_dense = self.manager.get_target_logits(query, t_emb, mb_tm.view(-1), t_ai)
+                t_dist = Categorical(logits=t_logits)
+                new_t_log_prob = t_dist.log_prob(mb_t_acts)
+                
+                z_ai = torch.arange(A, device=self.device).repeat_interleave(K_zones)
+                selected_t_emb = t_emb_dense[torch.arange(A), mb_t_acts]
+                
+                mb_selected_tz = mb_tz[torch.arange(A), mb_t_acts]
+                mb_zone_dist_matrix = self.env.zone_dist_matrix.unsqueeze(0).expand(A, -1, -1).to(self.device)
+                z_logits, z_inv = self.manager.get_zone_logits(
+                    query, selected_t_emb, zone_emb, mb_zam.view(-1), z_ai,
+                    mb_selected_tz, mb_zone_dist_matrix
                 )
-
-                # logits로 Categorical 분포 생성
-                dist = torch.distributions.Categorical(logits=logits)
-                new_log_prob = dist.log_prob(batch_data.action)
-                entropy = dist.entropy().mean()
-
-                # PPO Clipped Surrogate Objective
-                ratio = torch.exp(new_log_prob - batch_data.old_log_prob)
-                surr1 = ratio * batch_data.advantage
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_range, 1.0 + self.clip_range) * batch_data.advantage
-                actor_loss = -torch.min(surr1, surr2).mean()
-
-                # Critic Loss (MSE)
-                critic_loss = nn.functional.mse_loss(value.squeeze(-1) if value.dim() > 1 else value, batch_data.target_return)
-
-                # 자동 alpha 적용
-                # alpha = self.log_alpha.exp().detach()
-                loss = actor_loss + self.value_coeff * critic_loss - self.entropy_coeff * entropy
-
+                z_dist = Categorical(logits=z_logits)
+                new_z_log_prob = z_dist.log_prob(mb_z_acts)
+                
+                value = self.manager.get_value(query)
+                
+                new_log_probs = new_t_log_prob + new_z_log_prob
+                entropy = (t_dist.entropy() + z_dist.entropy()).mean()
+                
+                # PPO Objective
+                ratio = torch.exp(new_log_probs - mb_old_log_probs)
+                surr1 = ratio * mb_advantages
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * mb_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                value_loss = nn.functional.mse_loss(value, mb_returns)
+                
+                loss = policy_loss + self.vf_coeff * value_loss - current_ent_coef * entropy
+                
+                if torch.isnan(loss):
+                    continue
+                    
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.manager.parameters(), self.max_grad_norm)
                 self.optimizer.step()
-
-                # 🚨 [삭제] 아래 4줄의 alpha_loss 및 optimizer 로직을 반드시 전체 주석 처리하세요!
-                # alpha_loss = self.log_alpha * (entropy.detach() - self.target_entropy)
-                # self.alpha_optimizer.zero_grad()
-                # alpha_loss.backward()
-                # self.alpha_optimizer.step()
-
-                total_actor_loss += actor_loss.item()
-                total_critic_loss += critic_loss.item()
-                total_entropy += entropy.item()
-                n_updates += 1
-
-        if n_updates == 0:
-            return {'actor_loss': 0.0, 'critic_loss': 0.0, 'entropy': 0.0}
-
-        return {
-            'actor_loss': total_actor_loss / n_updates,
-            'critic_loss': total_critic_loss / n_updates,
-            'entropy': total_entropy / n_updates,
-        }
-
-    def train(self, total_episodes: int) -> None:
-        best_sr = -1.0
-        t_start = time.time()
-
-        pbar = tqdm(total=total_episodes, desc="Mgr-PPO", smoothing=0.1)
-
-        episodes_done = 0
-        epoch = 0
-        while episodes_done < total_episodes:
-            stats = self.collect_rollouts(pbar=pbar)
-            update_info = self.update()
-
-            t_elapsed = time.time() - t_start
-            alpha_val = self.log_alpha.exp().item()
-            
-            pbar.set_postfix({
-                'Rwd': f"{stats['mean_reward']:.2f}",
-                'MgrS': f"{stats['success_rate']*100:.1f}%",
-                'WkrS': f"{stats['worker_success_rate']*100:.1f}%",
-                'Trn': f"{stats['mean_turns']:.1f}",
-                'WStp': f"{stats['mean_worker_steps']:.1f}",
-                'Loss': f"{update_info['actor_loss']:.2f}/{update_info['critic_loss']:.2f}",
-                'Ent': f"{update_info['entropy']:.2f}",
-                'α': f"{alpha_val:.4f}"
-            })
-
-            episodes_done += self.n_rollout_episodes
-            epoch += 1
-
-            sr = stats['success_rate'] * 100
-            if sr > best_sr:
-                best_sr = sr
-                torch.save(self.manager.state_dict(), os.path.join(self.save_dir, 'best.pt'))
-
-        pbar.close()
-        torch.save(self.manager.state_dict(), os.path.join(self.save_dir, 'final.pt'))
+                
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy_loss += entropy.item()
+                num_updates += 1
+                
+        stats['loss'] = total_policy_loss / max(num_updates, 1) + self.vf_coeff * total_value_loss / max(num_updates, 1)
+        stats['policy_loss'] = total_policy_loss / max(num_updates, 1)
+        stats['value_loss'] = total_value_loss / max(num_updates, 1)
+        stats['entropy'] = total_entropy_loss / max(num_updates, 1)
+        
+        return stats

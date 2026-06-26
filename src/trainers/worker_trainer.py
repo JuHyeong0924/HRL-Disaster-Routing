@@ -85,6 +85,8 @@ class HRLWorkerTrainer:
     def _run_batch_episodes(self, batch_size: int) -> tuple:
         """초고속 Rollout (No Grad) — 계산 그래프 없이 데이터만 수집."""
         state = self.env.reset(batch_size=batch_size)  # [B, N, 4]
+        # [BUG FIX] Phase 전환 시 재난 damage가 edge_attr에 반영되도록 매 배치 재구축
+        self.edge_index, self.edge_attr = self._build_graph_data()
         B = batch_size
         N = state.shape[1]
 

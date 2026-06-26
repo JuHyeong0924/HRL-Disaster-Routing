@@ -1,18 +1,12 @@
-# `src/utils/visualizer.py` Log
+# `src/utils/visualizer.py` 로그
 
-## 1. 코드 상세 설명
-- **역할**: Matplotlib 기반 물리적 도로망, 타겟, 워커 이동 시각화.
-- **핵심 로직 변경 (Continuous Time Update)**:
-  - `plot_state` 함수 서명을 변경하여, 0.5초 틱 기반의 `global_time`, 워커가 위치한 현재 간선 정보 `worker_edge`, 그리고 간선 위 이동 비율 `worker_progress`를 전달받아 시각화하도록 업그레이드하였습니다.
-  - 핵심 로직 - Target 오버레이(Time Window): `ax.text` 대신 `ax.annotate`와 `textcoords='offset points'`, `xytext=(0, 15)`를 도입하여 맵의 스케일 크기(Anaheim, Berlin 등)에 구애받지 않고 항상 미션 타겟 아이콘의 정중앙 상단에 15픽셀 띄운 상태로 안정적으로 텍스트가 따라다니게 하였습니다.
-  - Failure 시각화: 시간이 초과되어 `target_failed`가 True가 된 목표물은 지도 위에서 렌더링을 완전히 생략(`continue`)시켜, 미션 목록에서 폐기(삭제)되었음을 직관적으로 알림.
-  - 기존에는 단순히 특정 노드(`curr_node`)에 고정된 형태로 워커를 점프시키듯 그렸으나, 이제는 선형 보간식을 도입해 워커 아이콘을 부드럽게 렌더링합니다.
-  - UI 텍스트 상단의 "Time" 지표를 홉 스텝 수가 아닌 물리적 실수형 타이머(`global_time`)로 표시합니다.
+## 상세 코드 설명
+- **역할**: 재난 맵의 네트워크 구조, 노드의 구역, UGV 에이전트의 이동 경로, 붕괴된 도로 등을 matplotlib을 이용해 정교하게 시각화(Animation GIF)합니다.
+- **주요 변경 로직**:
+  - `draw_network` 메서드 내에서 모든 간선(Edge)을 순회하며 `dm.edge_damage` 값을 참조합니다.
+  - 파괴도(Damage)가 일정 수치(0.0)를 넘어가면 노란색 $\rightarrow$ 붉은색 그라데이션으로 표시하며 굵기(`lw`)를 키웁니다.
+  - 파괴도 임계치(`0.8`)를 넘겨 UGV의 통행을 원천 차단하는 치명적 붕괴 구간의 경우 일반 점선(`--`)이 아닌 굵고 진한 붉은 실선(`-`) 위에 X 텍스트 마커(`💥` 혹은 붉은 X 표식)를 오버레이하여 유저에게 극강의 가시성을 제공하도록 개편했습니다.
 
-## 2. 시각화 알고리즘
-- 파괴된 간선의 선 두께를 `1.0`에서 `3.0`으로 증가시켜, 노란색~검붉은색(`YlOrRd`) 그라데이션 컬러맵 점선의 시인성을 대폭 강화.
-- 워커 이동 애니메이션 보간식: `wx = ux + (vx - ux) * worker_progress` (y좌표도 동일). `worker_edge` 파라미터가 유효하면 간선 위의 점을 도출하여 렌더링하고, 유효하지 않은 경우 정수 노드 위에 워커를 렌더링합니다.
-
-## 3. Trial & Error (Troubleshooting)
-- **이슈 1**: 연속 시간(Continuous Time) 모델 도입에 따른 렌더링 부자연스러움 해소 필요.
-  - **해결**: 워커의 이동률(Progress) 파라미터를 추가로 입력받아 Matplotlib의 X/Y 좌표를 동적으로 보간계산(Interpolate)함으로써 애니메이션이 뚝뚝 끊기지 않고 부드럽게 가시화되도록 고도화.
+## 시행착오 (Trial & Error)
+- **가시성 문제**: 이전 버전에서는 단순히 `alpha` 값과 약간의 두께만 조절해 맵 전체를 볼 때 어떤 도로가 끊겼는지 시각적으로 파악하기 어려웠습니다.
+- **해결 (`implementation` 단계)**: NetworkX의 `nx.draw_networkx_edges` 호출 시 스타일(`style`)을 분기하고, 극도로 파괴된 구간을 위한 전용 렌더링 오버레이를 덧씌우는 방식을 통해 매우 직관적인 애니메이션 결과(`Anaheim_dynamic_routing.gif`)를 도출해 냈습니다.

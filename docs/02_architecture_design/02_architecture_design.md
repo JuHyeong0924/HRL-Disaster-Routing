@@ -7,8 +7,17 @@
 ### 1.1. Environment Modules (`src/envs/`)
 
 #### `disaster_map.py` & `disaster_env.py`
-- **역할**: TNTP 기반의 도로망 데이터를 NetworkX 그래프로 로드하고 관리합니다. 그래프 구조에 Zone 메타데이터를 통합하여 물리적 라우팅 환경의 기반을 제공합니다.
-- **주요 기능**: `apply_disaster_damage()`를 통해 노드/간선에 재난(지진 등) 피해를 확률적으로 부여하며, **HAZUS 기반 가중치 패널티(Closed 10배, Danger 5배, Caution 3배, Normal 1.5배)**를 동적으로 반영합니다. `is_reset` 모드가 아닐 경우 재난 피해도는 기존 피해와 물리적으로 누적(`min(1.0, current + new)`)됩니다.
+- **역할**: TNTP 기반의 도로망 데이터를 NetworkX 그래프로 로드하고 관리합니다.
+- **HAZUS Soft Closure (Phase 1A)**: `apply_disaster_damage()`는 FEMA HAZUS Earthquake Model의 Residual Capacity 기반 가중치 체계를 적용합니다. **간선을 절대 제거하지 않아** 그래프 연결성을 항상 보장합니다.
+  - **Damage → Status → Weight Multiplier 매핑**:
+    | Damage 범위 | HAZUS 등급 | Residual Capacity | Weight Multiplier | UGV 파괴 확률 |
+    |-----------|----------|------------------|------------------|--------------|
+    | 0.0~0.2 | Slight (Normal) | 100% | ×1.0 | 0% |
+    | 0.2~0.5 | Moderate (Caution) | 50% | ×2.0 | 0% |
+    | 0.5~0.8 | Extensive (Danger) | 25% | ×4.0 | 10% (Trap) |
+    | 0.8~1.0 | Complete (Closed) | ~5% | ×20.0 | 30% |
+  - **Severity Roll 분포**: 40% Slight, 30% Moderate, 25% Extensive, 5% Complete
+  - **데미지 누적**: `damage = min(1.0, 기존 + 신규)`. `is_reset` 모드에서 전체 초기화.
 
 #### `worker_env.py` (`WorkerEnv`)
 - **역할**: Worker 단독 학습(Phase 1)을 위한 라우팅 환경. 하나의 Zone 내부 혹은 근접 인접 Zone으로 이동하는 세부 노드 스텝을 제어. 실제 물리적 거리(Dijkstra APSP, `weight='weight'`)를 기반으로 한 상태 공간과 보상 체계를 제공.
@@ -19,12 +28,19 @@
   - `dist` (Channel 3): 목표까지의 물리적 최단 거리. 학습 안정성을 위해 정규화 (`torch.clamp(dists, max=100000.0) / max(self.max_dist, 1.0)` 또는 `use_relative_hop` 사용 시 상대적 거리 감소폭)
   - `is_visited` (Channel 4, 선택적): 과거 방문한 노드 여부(순환 궤적 방지용, `use_is_visited=True` 일 때 활성화)
 - **Action Schema**: 현재 노드와 연결된 직접적인 이웃 노드(Neighbor Node ID). Masking을 통해 연결되지 않은 노드는 Logit = `-inf` 처리.
+  - **Neighbor-Scoped Masking Loop (최적화)**: `get_action_mask_batch()` 내에서 전체 노드 $N=416$개를 선형 스캔하는 대신, 초기 인접 노드 리스트 `self._adj_list[c_idx]` 상의 노드들만 순회 검사하여 복잡도를 $O(N)$에서 $O(\text{deg}(v))$로 개선.
 - **Reward Schema**: 
   - Sparse Reward (Goal): 최종 타겟 또는 목표 구역 도달 시 강력한 양의 보상(`+50.0`, `+5.0`) 부여.
   - Base Penalty (Time): 소모되는 물리적 거리(Edge weight)에 비례하는 지속적인 타임 패널티(`-0.1 * weight`).
   - Constraint Penalty (Revisit): 탐색 과정의 무한 루프(Stagnation)를 방지하기 위해, 이미 방문했던 노드(`visited_nodes == 1.0`)로 되돌아가려 할 경우 강력한 마이너스 보상(`-5.0`)을 즉각 부여.
   - Dense Reward (PBRS): 목표 노드까지의 물리적 거리를 기반으로 한 Potential-Based Reward Shaping. 거리가 줄어들면 양(+)의 보상, 멀어지면 음(-)의 보상을 주어 탐색 유도 (식: $\Phi(s) = max\_dist - dist\_to\_goal$).
-- **Vectorization (병목 혁신)**: 기존 파이썬 기반 `for` 루프와 `torch.stack` 슬라이싱을 완전 폐기하고, 사전 캐싱된 `[N, N]` Dense Boolean Adjacency 텐서와 `batch_idx = torch.arange(B)`를 활용한 Zero-Copy PyTorch 고급 인덱싱 문법을 도입하여 C++ 백엔드 레벨에서 모든 환경의 상태, 보상, 마스크, 전이를 `O(1)` 병렬 연산으로 풀 벡터화(Full-Vectorization)하였습니다. 이로 인해 CPU Starvation이 사라지고 GPU UTL이 94%에 육박하는 극단적인 연산 최적화를 달성했습니다.
+- **Vectorization & Tensor Memory (병목 혁신)**: 기존 NetworkX 기반의 파이썬 Dictionary 룩업(`G[u][v]`, `G.has_edge()`)에 의존하던 환경 시뮬레이션을 전면 폐기하였습니다. 대신 환경 초기화 및 재난 이벤트(Aftershock) 직후 `sync_tensors_from_graph()` 메서드를 호출하여 Graph topology를 GPU 상의 고밀도 매트릭스 텐서군으로 동기화합니다. 
+  - `_adj_matrix_tensor` `[N, N]` bool: 연결성 캐싱.
+  - `_weight_matrix` `[N, N]` float32: 실시간 물리적 간선 가중치 캐싱.
+  - `_damage_matrix` `[N, N]` float32: 파괴 정도(Damage) 캐싱.
+  - `_status_matrix` `[N, N]` int8: 도로 상태(0=Normal, 1=Caution, 2=Danger, 3=Closed) 캐싱.
+  - `_dist_matrix_tensor` `[N, N]` float32: Dijkstra APSP 최단 경로 거리 행렬.
+  이를 통해 환경의 전이(State Transition), 보상, 피처 추출 로직에서 루프 연산을 `O(1)` 행렬 인덱싱으로 대체하여 CPU Starvation 병목을 완전히 해결했습니다.
 
 #### `manager_env.py` (`ManagerEnv`)
 - **역할**: Manager 학습(Phase 2)을 위한 비자기회귀(Non-autoregressive) Closed-loop 계층 환경. 매크로 관점에서 전체 Zone Graph를 탐색하여 최적의 다음 Subgoal Zone을 결정하며, 결정 이후엔 내장된 Worker가 실제로 이동함.
@@ -45,8 +61,24 @@
 - **Vectorization**: `ManagerEnv`의 이너 워커 루프(`step_manager` 내 `for _ in range(50)`) 역시 WorkerEnv의 풀 벡터화 아키텍처를 그대로 상속받으며, CPU-GPU Device 캐스팅 비용을 최소화하기 위해 모든 Zone 추적 텐서(`_node_zone_tensor` 등)를 GPU VRAM에 상주시키고, 인덱싱 연산을 통합하여 실행 속도를 10~50배 이상 비약적으로 향상시켰습니다.
 
 #### `hrl_env.py` (`HRLEnv`)
-- **역할**: Manager가 여러 개의 타겟(Multi-OD)을 동시다발적으로 처리하고 데드라인(Deadline)을 관리할 수 있도록 래핑한 최상위 통합 환경. Worker와 Manager 모델을 동시에 탑재하여 전체 End-to-End 시뮬레이션을 통제합니다.
-- **Key Breakthrough (Manager-Turn Scoped Memory)**: 워커에 적용된 '재방문 패널티(-5.0)'가 다중 타겟 환경에서 **과거 타겟을 찾기 위해 지나왔던 정상적인 교차로**마저 영구 통제구역으로 만들어버리는 버그를 막기 위해, 매니저가 새로운 목표를 하달하는 턴(Turn) 단위마다 **워커의 내부 방문 이력(`visited_nodes`)을 깨끗하게 0.0으로 초기화**합니다. 이를 통해 워커는 오직 '매니저가 지금 내린 단일 임무'에만 집중하는 이상적인 HRL 철학을 수학적으로 유지합니다.
+- **역할**: Manager가 여러 개의 타겟(Multi-OD)을 동시다발적으로 처리하고 데드라인(Deadline)을 관리할 수 있도록 래핑한 최상위 통합 환경.
+- **Phase 1B — 시간 기반 Continuous Aftershock**: 여진은 Manager/Worker 턴과 무관하게 `current_time` 축에서 독립적으로 발생 (Omori's Law 근거). `reset()` 시 8~15회 여진 스케줄 생성, Worker 루프 내에서 `aftershock_cursor`로 진행.
+- **Phase 1C — UGV 파괴 판정**: Worker step 직후 통과한 간선의 status 확인. Closed 간선 30% 파괴, Danger 간선 10% Trap(시간 페널티 +30.0, 복귀).
+- **Phase 2A — Target Features `[B, N, 6]`**:
+  | Channel | 의미 | 범위 |
+  |---------|------|------|
+  | 0 | deadline (정규화) | [0, 1] |
+  | 1 | time_remaining (정규화) | [-∞, 1] |
+  | 2 | dist_from_curr (정규화) | [0, 1] |
+  | 3 | urgency_ratio (dist/rem) | [0, 5] |
+  | 4 | feasibility (도달 가능) | {0, 1} |
+  | 5 | normalized_slack (여유) | [-1, 1] |
+- **Manager-Turn Scoped Memory**: 매 턴마다 Worker의 `visited_nodes`를 초기화하여 단일 임무에만 집중. 이를 통해 워커는 오직 '매니저가 지금 내린 단일 임무'에만 집중하는 이상적인 HRL 철학을 수학적으로 유지합니다.
+- **Vectorization & Graph Tensor Memory (최적화)**: 
+  * GNN에 필요한 `edge_index` 및 노드 정보(`bidir_nodes`)를 `__init__` 시점에 캐싱하여 `_build_graph_data()` 연산(CPU-GPU 전송 및 NetworkX 구조 조회)을 최소화. 특히 간선 속성(`edge_attr`) 추출 시 기존 Python 룩업을 제거하고 캐싱된 텐서(`_bidir_src`, `_bidir_dst`)를 통한 다차원 슬라이싱(`self.env._damage_matrix[src, dst]`)으로 풀-벡터화 달성.
+  * `step_manager()` 내에서 NetworkX 간선 확인(`G.has_edge`)을 GPU 텐서(`_adj_matrix_tensor`, `_status_matrix`)로 완전히 대체.
+  * Zone Features, Target Features, Masks 생성 로직(기존 3중 Python for loop)을 PyTorch 브로드캐스팅 및 행렬 곱(`@`)을 통한 $O(1)$ 연산으로 리팩토링. $O(A \times B \times N)$ 제곱배 병목을 완전히 제거.
+
 
 ### 1.2. Simulation Engine & Continuous Time Model (SMDP)
 - **시간 흐름(Time Tick) 설계**: 기존의 1-Hop = 1-Step 방식에서 탈피하여, 물리적 가중치 거리(`edge_weight`)에 기반해 실제 소요 시간을 계산하는 **연속 시간(Continuous Time) 모델**로 개편되었습니다.
@@ -67,25 +99,31 @@
   - `value`: 현재 상태의 Critic Value (V).
 - **Features**: `use_jk_net` (Jumping Knowledge), `use_global_pool` (Global Mean Pooling) 등의 확장을 지원하여 수용장(Receptive Field) 확장을 제어.
 
-#### `manager_unified.py` (`ManagerUnified`)
-- **Architecture**: Multi-Level Encoder 구조. Local Topology는 GATv2(2 Layers)로 처리하고, Global Topology는 Transformer Encoder로 장기 의존성을 파악합니다. Dual-Head Actor (Target/Zone) + Critic Head.
+#### `manager.py` (`Manager`)
+- **Architecture**: GATv2(3 Layers) + Transformer Encoder(3 Layers) + Dual-Head Actor (Target/Zone) + Critic Head.
 - **Inputs**:
   - `zone_features`: `[K, 6]` (GATv2 인코딩 입력)
   - `zone_edge_index`: `[2, E_zone]` (Zone 간 연결)
-  - `target_features`: `[N, 4]`
+  - `target_features`: `[N, 6]` **(Phase 2A: 4→6)** — deadline, time_remaining, dist, urgency_ratio, feasibility, slack
   - `zone_dist_matrix`: `[B, K, K]` (최단 경로 물리적 거리, Dijkstra)
+- **Context Generator (Phase 2B)**: `generate_context(elapsed, rescued, num_feasible, avg_urgency)` → `[B, 4]` → `context_proj(Linear(4, 256))` → query `[B, 256]`. **h_last 제거** (항상 0으로 노이즈만 추가하던 문제 해결).
 - **Outputs**:
   - `target_logits`: 다음으로 향할 구출 대상 타겟 선택.
-  - `zone_logits`: 선택된 타겟을 향해 나아갈 다음 Subgoal Zone의 Softmax 확률.
-- **Key Breakthrough**: 기존의 단순 GNN 구조에서 벗어나, `zone_score_net`의 최종 Logit 계산 시 `zone_dist_matrix`의 거리(`target_dists` 차원: `[B, K, 1]`)를 직접 Concat하여 결합함으로써 수학적으로 확실하게 타겟 방향의 최단 경로 Zone을 선택할 수 있는 지리적 감각(Spatial Awareness)을 확보했습니다.
+  - `zone_logits`: 선택된 타겟을 향해 나아갈 다음 Subgoal Zone.
+- **Key Feature**: `zone_score_net`의 Logit 계산 시 `zone_dist_matrix` 거리를 직접 Concat하여 지리적 감각(Spatial Awareness) 확보.
 
 ### 1.3. Trainers (`src/trainers/`)
 - **Trainer 기반 구조**: PPO (Proximal Policy Optimization)
-- **`worker_trainer.py` & `manager_trainer.py`**:
-  - `rollout()` 단계에서 병렬 에피소드를 수집(Mini-batching).
-  - GAE(Generalized Advantage Estimation)를 계산하여 Value 손실과 Policy 손실(Surrogate Objective)을 최적화.
-  - Entropy Bonus를 통해 탐색(Exploration) 장려 (`entropy_coeff`).
-  - Learning Rate Scheduling 기능 내장.
+- **`worker_trainer.py`**: Worker PPO 학습. GAE 기반 어드밴티지 계산.
+- **`manager_trainer.py` (Phase 2C, 2F)**:
+  - **Context 생성**: `generate_context(elapsed, rescued, num_feasible, avg_urgency)` — h_last 제거
+  - **보상 체계 (Phase 2C)**:
+    - 구출 보상: ×20.0 (기존 ×10.0)
+    - PBRS: `(log1p(prev) - log1p(curr)) × 2.0` (기존 ×5.0, 스파스 보상 압도 방지)
+    - 데드라인 만료 페널티: -5.0 per expired target (NEW)
+    - 여유 시간 보너스: `min(slack/max_time × 5.0, 3.0)` (NEW)
+  - **커리큐럼 (Phase 2E)**: 5 Phases, P1:Single → P2:Multi → P3:Static → P4:Dynamic → P5:Full
+  - Entropy Bonus를 통해 탐색 장려. Learning Rate Scheduling 내장.
 
 ## 2. API Flow & Execution Pipeline
 
@@ -97,10 +135,8 @@
 
 2. **학습 루프 (`train_rl.py`)**:
    - **Stage: Worker**: `python scripts/train_rl.py --stage worker --map Anaheim`
-     $\rightarrow$ `WorkerEnv` 초기화 $\rightarrow$ `Worker` 모델 무작위 가중치 생성 $\rightarrow$ `HRLWorkerTrainer` 호출 $\rightarrow$ `logs/rl_worker_stage/` 에 `best.pt` 체크포인트 기록.
    - **Stage: Manager**: `python scripts/train_rl.py --stage manager --map Anaheim`
-     $\rightarrow$ 이전 단계의 `best.pt` Worker 로드 및 동결 $\rightarrow$ `ManagerEnv` (Closed-loop) 초기화 $\rightarrow$ `ManagerTrainer` 호출 $\rightarrow$ `logs/rl_manager_stage/` 에 Manager `best.pt` 기록.
 
-3. **평가 루프 (`evaluate.py`)**:
-   - `python tests/evaluate.py --map all --cross_map`
-   - 학습된 체크포인트를 불러와 HRL 환경에서 성능 평가. Cross-map 모드시 재학습 없이 Manager/Worker 모델이 다른 맵(Zero-shot)에서 라우팅 성능(Success Rate, Path Expansion Ratio 등)을 도출 및 시각화(`hrl_path_*.png` 출력).
+3. **벤치마크 평가 (`evaluate_algorithms.py`)**:
+   - `python scripts/evaluate_algorithms.py --episodes 100 --map Anaheim`
+   - HRL(Neural), GA-Neural, ALNS-Neural, GA-Dijkstra, ALNS-Dijkstra 5개 모델에 대해 Rescue Rate, Latency, Recomputes, UGV Destroys 지표를 정량 비교. `src/models/heuristics.py`에 구현된 고전적 휴리스틱 매니저(GA, ALNS) 및 워커(Dijkstra)와 HRL 신경망을 동일한 시드 하에서 대결시켜 성능을 검증합니다.

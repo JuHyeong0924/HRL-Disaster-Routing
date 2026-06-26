@@ -1,19 +1,19 @@
-# `src/envs/disaster_map.py` Log
+# disaster_map.py — 변경 로그
 
-## 1. 코드 상세 설명
-- **역할**: TNTP 기반 도로망 구조를 `nx.Graph` 무방향 그래프로 로드하고 관리하며, 환경 내 발생할 수 있는 동적 재난 피해 로직을 관장합니다.
-- **핵심 로직 변경**:
-  - `apply_disaster_damage(self, damage_prob=0.3)` 함수를 호출할 때 파라미터 기반 `accumulate` 처리 방식을 삭제하고, `damage_prob > 0.0`일 때는 **무조건 데미지가 누적되도록 하드코딩**하였습니다. 이는 재난 초기화 모드(`damage_prob <= 0.0`)와 재난 발생 모드를 논리적으로 엄격히 분리하여, 여진 발생 시 데미지가 0으로 리셋되는 버그를 원천 차단하기 위함입니다.
-  - 가중치 패널티(HAZUS 랭크)를 조정하여 `Closed`(50.0배), `Danger`(20.0배), `Caution`(5.0배), `Normal`(2.0배)로 재할당하여, 워커가 경로 탐색 시 파괴된 경로를 유연하면서도 확실하게 우회할 수 있도록 현실성을 높였습니다.
+## Phase 1A: HAZUS Soft Closure (2026-06-24)
 
-## 2. 알고리즘 & 텐서 로직
-- **그래프 구조**: `self.graph = nx.Graph()`는 양방향이 완전히 동일한 속성을 공유하는 **무방향 그래프(Undirected Graph)**입니다. 한 번의 재난 적용으로 간선 `(u, v)`에 피해가 가해지면, 이는 역방향인 `(v, u)`에도 동일하게 적용되어 파괴도의 비대칭 현상이 발생하지 않습니다.
-- **누적 연산**: `damage = min(1.0, edge.get('damage', 0.0) + damage)` (스칼라 한도 적용)
+### 변경 개요
+`apply_disaster_damage()` 메서드의 등급별 가중치 체계를 HAZUS Earthquake Model 기반으로 전면 재설계.
 
-## 3. Trial & Error (Troubleshooting)
-- **이슈 1**: 연속 시간(Continuous Time) 도입 후, 프레임이 너무 느리게 렌더링되며 시간 스케일이 과도하게 커지는 문제 (TNTP 기본 `length` 사용 시 1스텝에 5000단위 소모).
-  - **해결**: 차량의 이동 속도를 현실적인 **시속 30km/h (약 1640.42 ft/min)** 로 고정하고, 이에 따라 길이를 분(minute) 단위 소요 시간으로 변환하는 `travel_time_min = length / 1640.42` 수식을 적용하여 시뮬레이터 틱과 완벽히 동기화되도록 수정했습니다.
-- **이슈 2**: 스텝 60에서 약한 여진(0.1 확률)이 발생할 때 나머지 90%의 간선들이 확률 판정에 탈락해 데미지가 0.0으로 덮어씌워지며 맵이 "치료"되는 현상 발생.
-  - **해결**: `is_reset` 플래그를 도입하여 `damage_prob`이 0일 때만 초기화하고, 그 외의 재난 상황에서는 데미지가 물리적으로 단순 덧셈 되도록 하드코딩.
-- **이슈 3**: 워커가 왜 끊어진 도로를 지나가느냐는 사용자의 오해.
-  - **해결**: 양방향 모델이 아니라 무방향 모델이기 때문에 데미지가 단방향으로 적용된 것이 아님을 설명하였고, 실제 문제는 `visualize_heuristic.py`의 매니저가 가중치(Weight)가 아닌 순수 칸 수(Hop)만 보고 타겟을 할당해서 발생한 문제였음을 파악하여 Manager 쪽에서 수정함.
+### 핵심 변경 사항
+1. **간선 제거 코드 삭제**: `edges_to_remove` 리스트 및 `graph.remove_edge()` 루프 완전 제거
+2. **가중치 배율 확대**: ×1.1/1.2/1.5 → ×1.0/2.0/4.0/20.0 (HAZUS Residual Capacity 역수)
+3. **Complete 간선 Soft Closure**: `status='Closed'`, `weight = base_w * 20.0` 설정 (제거 대신)
+
+### 설계 근거
+- **FEMA HAZUS**: Residual Capacity (100%/50%/25%/0%) → Weight Multiplier = 1/RC
+- **UGV 특수성**: Complete 등급에서 민간 차량은 통과 불가(0%)이나, UGV는 특수 구조 장비로 강행 돌파 가능. 대신 30% 파괴 확률 부여 (hrl_env.py에서 판정).
+- **그래프 연결성**: `nx.is_connected(G)` 항상 보장 → Dijkstra 경로 탐색 실패 방지
+
+### Trial & Error
+- **오류 없음**: 첫 구현에서 8/8 테스트 통과

@@ -159,9 +159,12 @@ class DisasterMap:
                     edge['healthy'] = edge['total_people']
             return
         
-        # ── 데미지 모드: 누적 데미지 + Closed(>0.8) 간선 제거 ──
-        edges_to_remove = []
-        for u, v in list(self.graph.edges()):  # list()로 복사: 반복 중 제거 방지
+        # ── 데미지 모드: 누적 데미지 + HAZUS Residual Capacity 기반 Soft Closure ──
+        # [HAZUS Earthquake Model Technical Manual, Transportation Systems Chapter]
+        # Weight Multiplier = 1 / Residual Capacity
+        # Complete(>0.8) 간선은 제거하지 않고 가중치를 극대화 (Soft Closure)
+        # → UGV(무인 지상 차량)는 특수 구조 장비로 강행 돌파 가능하나 파괴 위험 극심
+        for u, v in list(self.graph.edges()):  # list()로 복사: 반복 중 변경 방지
             edge = self.graph[u][v]
             
             if random.random() < damage_prob:
@@ -181,22 +184,28 @@ class DisasterMap:
                 base_w = edge['base_weight']
                 base_t = edge['base_time']
                 
-                # HAZUS 등급 기반 상태 할당
+                # HAZUS Residual Capacity 기반 등급 & 가중치 할당
                 if damage > 0.8:
-                    # Closed (Complete) → 간선 제거 예약
-                    edges_to_remove.append((u, v))
-                elif damage > 0.5:
-                    edge['status'] = 'Danger'   # Extensive
+                    # Complete (Closed): Residual Capacity ~5% (UGV 강행 돌파)
+                    # UGV 통과 시 30% 파괴 확률 (hrl_env.py에서 판정)
+                    edge['status'] = 'Closed'
                     edge['weight'] = base_w * 20.0
                     edge['travel_time'] = base_t * 20.0
+                elif damage > 0.5:
+                    # Extensive (Danger): Residual Capacity 25%
+                    edge['status'] = 'Danger'
+                    edge['weight'] = base_w * 4.0
+                    edge['travel_time'] = base_t * 4.0
                 elif damage > 0.2:
-                    edge['status'] = 'Caution'  # Moderate
-                    edge['weight'] = base_w * 5.0
-                    edge['travel_time'] = base_t * 5.0
-                else:
-                    edge['status'] = 'Normal'   # Slight
+                    # Moderate (Caution): Residual Capacity 50%
+                    edge['status'] = 'Caution'
                     edge['weight'] = base_w * 2.0
                     edge['travel_time'] = base_t * 2.0
+                else:
+                    # Slight (Normal): Residual Capacity 100%
+                    edge['status'] = 'Normal'
+                    edge['weight'] = base_w * 1.0
+                    edge['travel_time'] = base_t * 1.0
                     
                 if edge['has_building']:
                     total_pop = edge['total_people']
@@ -204,10 +213,6 @@ class DisasterMap:
                     num_injured = int(total_pop * injury_rate)
                     edge['injured'] = num_injured
                     edge['healthy'] = total_pop - num_injured
-        
-        # 루프 종료 후 Closed 간선 물리적 제거 (iteration-safe)
-        for u, v in edges_to_remove:
-            self.graph.remove_edge(u, v)
 
     def get_shortest_path(self, start_node, end_node):
         try:

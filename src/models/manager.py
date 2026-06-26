@@ -1,223 +1,183 @@
-"""
-Manager v2: 비자기회귀 단일 서브골 예측 모델 (Manager)
-
-Worker와 통일된 GATv2 + Dual Head(Actor/Critic) 아키텍처.
-Transformer Decoder를 제거하고, 매 턴마다 K-hop 반경 내에서
-서브골 1개를 선택하는 비자기회귀(Non-autoregressive) 방식.
-
-핵심 설계:
-- GATv2Conv × 2L + GraphNorm + Residual (Worker와 동일)
-- Actor Head: h_curr ∥ h_goal ∥ h_candidate → MLP → Score
-- Critic Head: h_curr ∥ h_goal → MLP → V(s)
-- K-hop 마스킹으로 행동 공간 제한
-"""
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv, GraphNorm
-from typing import Tuple, Optional
-
+from torch_geometric.utils import to_dense_batch
 
 class Manager(nn.Module):
-    """비자기회귀 단일 서브골 예측 Manager.
-
-    매 턴마다 전체 그래프를 GATv2로 인코딩한 후,
-    K-hop 반경 내의 후보 노드 중 최적의 서브골 1개를 선택한다.
-    PPO 학습을 위해 Actor/Critic Dual Head 구조를 갖는다.
-
-    Args:
-        node_dim: 구역(Zone) 피처 차원 (기본 7차원: is_curr, is_tgt, is_visited, zone_dist, node_dist, disaster_intensity, cos_sim)
-        hidden_dim: GNN 및 MLP 히든 차원
-        num_layers: GATv2 레이어 수
-        gat_heads: GATv2 어텐션 헤드 수
-        dropout: 드롭아웃 비율
     """
-
-    def __init__(
-        self,
-        node_dim: int = 7,
-        hidden_dim: int = 256,
-        num_layers: int = 2,
-        gat_heads: int = 4,
-        dropout: float = 0.2,
-    ) -> None:
+    Zone-Aware Target & Route Selector.
+    
+    GATv2로 Zone Graph의 로컬 토폴로지를 인코딩하고,
+    Transformer Self-Attention으로 전역 컨텍스트를 추가한 뒤,
+    Dual Head 디코더로 Target과 Zone을 단계적으로 선택합니다.
+    """
+    def __init__(self, zone_dim=6, target_dim=6, hidden_dim=256,
+                 num_gat_layers=3, gat_heads=4, num_transformer_layers=3,
+                 transformer_heads=4, dropout=0.1):
         super().__init__()
-        self.node_dim = node_dim
         self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-
-        # ── GATv2 Spatial Encoder (Worker와 동일 구조) ──
-        self.convs = nn.ModuleList()
-        # 첫 레이어: node_dim → hidden_dim
-        self.convs.append(
-            GATv2Conv(node_dim, hidden_dim, heads=gat_heads, concat=False, dropout=dropout)
-        )
-        # 입력 차원 맞춤용 프로젝션 (Residual Connection용)
-        self.input_proj = nn.Linear(node_dim, hidden_dim)
-
-        # 나머지 레이어: hidden_dim → hidden_dim
-        for _ in range(num_layers - 1):
-            self.convs.append(
+        
+        # 1. Zone Encoder (GATv2)
+        self.zone_proj = nn.Linear(zone_dim, hidden_dim)
+        self.gat_layers = nn.ModuleList()
+        self.gat_norms = nn.ModuleList()
+        for _ in range(num_gat_layers):
+            self.gat_layers.append(
                 GATv2Conv(hidden_dim, hidden_dim, heads=gat_heads, concat=False, dropout=dropout)
             )
-
-        # GraphNorm: 레이어별 정규화 (Ablation v1에서 필수 컴포넌트로 확인됨)
-        self.graph_norms = nn.ModuleList(
-            [GraphNorm(hidden_dim) for _ in range(num_layers)]
+            self.gat_norms.append(GraphNorm(hidden_dim))
+            
+        # 2. Transformer Global Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=transformer_heads, 
+            dim_feedforward=hidden_dim * 4, dropout=dropout, batch_first=True
         )
-
-        # ── Actor Head: 후보 서브골 점수 산출 ──
-        # 입력: [h_curr ∥ h_goal ∥ h_candidate] = 3 * hidden_dim
-        self.actor = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=num_transformer_layers,
+            enable_nested_tensor=False
+        )
+        
+        # 3. Target Fusion MLP
+        self.target_fusion = nn.Sequential(
+            nn.Linear(hidden_dim + target_dim, hidden_dim),  # 256+6=262
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # 4. Context Generator
+        # [Phase 2B] h_last 제거 (항상 0 → 노이즈)
+        # 입력: elapsed_time(1) + num_rescued(1) + num_feasible(1) + avg_urgency(1) = 4
+        self.context_proj = nn.Linear(4, hidden_dim)
+        
+        # 5. Zone Score Network (Query + ZoneEmb + Dist)
+        self.zone_score_net = nn.Sequential(
+            nn.Linear(hidden_dim + hidden_dim + 1, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, 1)
         )
-
-        # ── Critic Head: 상태 가치 V(s) 추정 ──
-        # 입력: [h_curr ∥ h_goal] = 2 * hidden_dim
-        self.critic = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+        
+        # 6. Critic Head (Value Estimator)
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, 1)
         )
 
-    def _encode(
-        self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        batch: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """GATv2 공간 인코더 (Residual + GraphNorm).
-
-        Args:
-            x: [N_total, node_dim] 노드 피처 (배치 내 모든 그래프의 노드)
-            edge_index: [2, E_total] 엣지 인덱스
-            batch: [N_total] 각 노드가 속한 그래프 인덱스
-
-        Returns:
-            h: [N_total, hidden_dim] 인코딩된 노드 임베딩
+    def encode_zones(self, zone_features, zone_edge_index, batch=None):
         """
-        # Layer 0: node_dim → hidden_dim (input_proj로 Residual)
-        h = self.convs[0](x, edge_index)
-        if batch is not None:
-            h = self.graph_norms[0](h, batch)
-        else:
-            h = self.graph_norms[0](h)
-        h = torch.relu(h + self.input_proj(x))
-
-        # Layer 1+: hidden_dim → hidden_dim (직접 Residual)
-        for i in range(1, self.num_layers):
-            h_prev = h
-            h = self.convs[i](h, edge_index)
+        zone_features: [total_K, 6]
+        zone_edge_index: [2, E]
+        batch: [total_K] (PyG batch indicator)
+        Returns: [total_K, 128]
+        """
+        x = self.zone_proj(zone_features)
+        
+        for conv, norm in zip(self.gat_layers, self.gat_norms):
+            x_res = x
+            x = conv(x, zone_edge_index)
             if batch is not None:
-                h = self.graph_norms[i](h, batch)
+                x = norm(x, batch)
             else:
-                h = self.graph_norms[i](h)
-            h = torch.relu(h + h_prev)
-
-        return h
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        current_idx: torch.Tensor,
-        goal_idx: torch.Tensor,
-        candidate_mask: torch.Tensor,
-        batch: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # 1. GNN 인코딩
-        h = self._encode(x, edge_index, batch)  # [N_total, hidden_dim]
-
+                x = norm(x)
+            x = torch.relu(x)
+            x = x + x_res
+            
         if batch is not None:
-            # 배치 내 각 그래프별 노드 수 계산
-            num_nodes_per_graph = torch.bincount(batch)
-            batch_offsets = torch.cat([torch.tensor([0], device=x.device), num_nodes_per_graph.cumsum(dim=0)[:-1]])
-            
-            curr_idx_flat = current_idx + batch_offsets
-            goal_idx_flat = goal_idx + batch_offsets
-            
-            h_curr = h[curr_idx_flat] # [B, hidden_dim]
-            h_goal = h[goal_idx_flat] # [B, hidden_dim]
-            
-            h_curr_exp = h_curr[batch] # [N_total, hidden_dim]
-            h_goal_exp = h_goal[batch] # [N_total, hidden_dim]
-            
-            actor_input = torch.cat([h_curr_exp, h_goal_exp, h], dim=-1)
-            logits = self.actor(actor_input).squeeze(-1)
-            logits = logits.masked_fill(candidate_mask == 0, -1e9)
-            
-            # Softmax per graph using scatter_max or just reshape if sizes are equal
-            # Since all zone graphs have the same size K, we can reshape safely
-            B = current_idx.size(0)
-            K = x.size(0) // B
-            logits_reshaped = logits.view(B, K)
-            # 마스크 처리 안된 부분을 무시하기 위해 마스킹된 버전을 사용
-            probs_reshaped = torch.nn.functional.softmax(logits_reshaped, dim=-1)
-            probs = probs_reshaped.view(-1)
-            logits = logits_reshaped # PPO 업데이트 시 1D가 아닌 [B, K]가 반환되도록 교체
-            
-            critic_input = torch.cat([h_curr, h_goal], dim=-1)
-            value = self.critic(critic_input).squeeze(-1)
+            x_dense, mask = to_dense_batch(x, batch)  # [B, max_K, 128], [B, max_K]
         else:
-            h_curr = h[current_idx].unsqueeze(0)
-            h_goal = h[goal_idx].unsqueeze(0)
+            x_dense = x.unsqueeze(0)  # [1, K, 128]
+            mask = torch.ones(1, x.size(0), dtype=torch.bool, device=x.device)
             
-            N = h.size(0)
-            h_curr_exp = h_curr.expand(N, -1)
-            h_goal_exp = h_goal.expand(N, -1)
-            
-            actor_input = torch.cat([h_curr_exp, h_goal_exp, h], dim=-1)
-            logits = self.actor(actor_input).squeeze(-1)
-            logits = logits.masked_fill(candidate_mask == 0, -1e9)
-            
-            probs = torch.nn.functional.softmax(logits, dim=-1)
-            
-            critic_input = torch.cat([h_curr, h_goal], dim=-1)
-            value = self.critic(critic_input).squeeze(-1)
-
-        return probs, value, logits
-
-    def select_action(
-        self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        current_idx: int,
-        goal_idx: int,
-        candidate_mask: torch.Tensor,
-        batch: Optional[torch.Tensor] = None,
-        deterministic: bool = False,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """서브골 1개를 선택하고 PPO 학습에 필요한 정보를 반환.
-
-        Args:
-            deterministic: True면 가장 높은 확률의 노드 선택 (평가용)
-
-        Returns:
-            action: 선택된 서브골 노드 인덱스 (int)
-            log_prob: 선택된 액션의 로그 확률 [1]
-            value: 상태 가치 추정값 [1]
-            entropy: 정책 엔트로피 [1]
+        # Transformer는 padding mask를 ~mask 로 받음 (True가 무시할 곳)
+        x_global = self.transformer(x_dense, src_key_padding_mask=~mask)
+        
+        x_out = x_global[mask]  # [total_K, 128]
+        return x_out
+        
+    def get_target_embeddings(self, zone_embeddings, target_features, target_zone_idx):
         """
-        probs, value, logits = self.forward(
-            x, edge_index, current_idx, goal_idx, candidate_mask, batch
-        )
+        zone_embeddings: [total_K, 128]
+        target_features: [total_N, 6]  # [Phase 2A] 4→6
+        target_zone_idx: [total_N] (flattened index matching zone_embeddings)
+        Returns: [total_N, 128]
+        """
+        tz_emb = zone_embeddings[target_zone_idx]
+        concat = torch.cat([tz_emb, target_features], dim=-1)  # [total_N, 128+6=134]
+        return self.target_fusion(concat)
+        
+    def generate_context(self, elapsed_time, num_rescued, num_feasible, avg_urgency):
+        """
+        [Phase 2B] h_last 제거, 의미 있는 스칼라 피처 4개로 대체.
+        elapsed_time: [B, 1]   — 경과 시간 (정규화)
+        num_rescued: [B, 1]    — 구출 수 (정규화)
+        num_feasible: [B, 1]   — 도달 가능 타겟 비율
+        avg_urgency: [B, 1]    — 평균 긴급도
+        Returns: query [B, 128]
+        """
+        ctx_cat = torch.cat([elapsed_time, num_rescued, num_feasible, avg_urgency], dim=-1)  # [B, 4]
+        return self.context_proj(ctx_cat)
+        
+    def get_target_logits(self, query, target_embeddings, target_mask, target_batch):
+        """
+        query: [B, 128]
+        target_embeddings: [total_N, 128]
+        target_mask: [total_N] (1 for valid, 0 for invalid/rescued/timeout)
+        target_batch: [total_N]
+        
+        Returns: [B, max_N] logits, and the invalid mask [B, max_N]
+        """
+        t_emb_dense, mask_dense = to_dense_batch(target_embeddings, target_batch) # [B, max_N, 128]
+        t_mask_valid, _ = to_dense_batch(target_mask, target_batch) # [B, max_N]
+        
+        scores = torch.bmm(query.unsqueeze(1), t_emb_dense.transpose(1, 2)).squeeze(1) # [B, max_N]
+        scores = scores / (self.hidden_dim ** 0.5)
+        
+        invalid = (~mask_dense) | (t_mask_valid == 0)
+        scores.masked_fill_(invalid, float('-inf'))
+        return scores, invalid, t_emb_dense
+        
+    def get_zone_logits(self, query, selected_target_emb, zone_embeddings, zone_adj_mask, zone_batch, selected_target_zone_idx, zone_dist_matrix):
+        """
+        query: [B, 128]
+        selected_target_emb: [B, 128]
+        zone_embeddings: [total_K, 128]
+        zone_adj_mask: [total_K] (1 for valid adjacent zones, 0 for invalid)
+        zone_batch: [total_K]
+        selected_target_zone_idx: [B]
+        zone_dist_matrix: [B, K, K]
+        
+        Returns: [B, max_K] logits, and the invalid mask [B, max_K]
+        """
+        z_emb_dense, mask_dense = to_dense_batch(zone_embeddings, zone_batch) # [B, max_K, 128]
+        z_mask_valid, _ = to_dense_batch(zone_adj_mask, zone_batch) # [B, max_K]
+        
+        B, max_K, _ = z_emb_dense.shape
+        
+        # 1. Expand query & selected_target_emb to match max_K
+        query_expanded = query.unsqueeze(1).expand(B, max_K, -1) # [B, max_K, 128]
+        
+        # 2. Extract distance from each Zone to the Selected Target Zone
+        # dist_matrix: [B, K, K]. We want [B, K] where it's the distance to selected_target_zone_idx.
+        b_idx = torch.arange(B, device=query.device)
+        target_dists = zone_dist_matrix[b_idx, :, selected_target_zone_idx].unsqueeze(-1) # [B, K, 1]
+        
+        # Pad target_dists if max_K > K (although K is usually constant per batch)
+        if max_K > target_dists.size(1):
+            pad = torch.zeros(B, max_K - target_dists.size(1), 1, device=query.device)
+            target_dists = torch.cat([target_dists, pad], dim=1)
+            
+        # 3. Concatenate and score
+        combined = torch.cat([query_expanded, z_emb_dense, target_dists], dim=-1) # [B, max_K, 128 + 128 + 1]
+        scores = self.zone_score_net(combined).squeeze(-1) # [B, max_K]
+        
+        invalid = (~mask_dense) | (z_mask_valid == 0)
+        scores.masked_fill_(invalid, float('-inf'))
+        return scores, invalid
 
-        # 유효한 후보가 없는 경우 방어
-        if (candidate_mask == 0).all():
-            # 현재 위치를 반환 (에피소드 종료 트리거용)
-            return current_idx, torch.tensor(0.0, device=x.device), value, torch.tensor(0.0, device=x.device)
-
-        dist = torch.distributions.Categorical(probs)
-
-        if deterministic:
-            action = probs.argmax()
-        else:
-            action = dist.sample()
-
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
-
-        return int(action.item()), log_prob, value, entropy
+    def get_value(self, query):
+        """
+        query: [B, 128] generated from generate_context
+        Returns: [B] state value
+        """
+        return self.value_head(query).squeeze(-1)

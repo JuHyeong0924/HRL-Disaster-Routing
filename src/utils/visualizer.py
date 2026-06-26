@@ -84,14 +84,17 @@ class DisasterVisualizer:
         
         # 2. Draw Edges and Damages
         normal_edges = []
-        damaged_edges = []
-        damage_values = []
+        minor_damaged_edges = []
+        severe_damaged_edges = []
+        minor_damage_values = []
         
         for u, v, d in self.G.edges(data=True):
             dmg = d.get('damage', 0.0)
-            if dmg > 0.05:
-                damaged_edges.append((u, v))
-                damage_values.append(dmg)
+            if dmg > 0.8:
+                severe_damaged_edges.append((u, v))
+            elif dmg > 0.05:
+                minor_damaged_edges.append((u, v))
+                minor_damage_values.append(dmg)
             else:
                 normal_edges.append((u, v))
                 
@@ -101,17 +104,29 @@ class DisasterVisualizer:
             edge_color='lightgray', width=0.5, alpha=0.5, ax=ax
         )
         
-        # Damaged edges (Gradient colors, thicker dashed lines)
-        if damaged_edges:
+        # Minor damaged edges (Gradient colors, dashed lines)
+        if minor_damaged_edges:
             cmap = plt.get_cmap('YlOrRd')
-            norm = mcolors.Normalize(vmin=0, vmax=1.0)
-            edge_colors = [cmap(norm(val)) for val in damage_values]
+            norm = mcolors.Normalize(vmin=0, vmax=0.8)
+            edge_colors = [cmap(norm(val)) for val in minor_damage_values]
             
             nx.draw_networkx_edges(
-                self.G, self.pos, edgelist=damaged_edges, 
-                edge_color=edge_colors, width=3.0, style='dashed', ax=ax
+                self.G, self.pos, edgelist=minor_damaged_edges, 
+                edge_color=edge_colors, width=2.5, style='dashed', ax=ax
             )
             
+        # Severe damaged edges (Solid Red, Thick)
+        if severe_damaged_edges:
+            nx.draw_networkx_edges(
+                self.G, self.pos, edgelist=severe_damaged_edges, 
+                edge_color='red', width=5.0, style='solid', ax=ax
+            )
+            # Add an X marker in the middle of severe edges
+            for u, v in severe_damaged_edges:
+                x = (self.pos[u][0] + self.pos[v][0]) / 2
+                y = (self.pos[u][1] + self.pos[v][1]) / 2
+                ax.plot(x, y, marker='X', color='darkred', markersize=8)
+                
         # 3. Draw Grid Zones
         b = 0 # Batch 0만 시각화
         curr_idx = int(hrl_env.env.curr_nodes[b].item())
