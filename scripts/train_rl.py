@@ -214,7 +214,7 @@ def _run_worker_stage(args) -> None:
     # Worker 생성
     num_layers = getattr(args, 'num_layers', 2)
     use_jk_net = getattr(args, 'use_jk_net', False)
-    node_dim = 6
+    node_dim = 7
     worker = Worker(
         node_dim=node_dim,
         hidden_dim=args.hidden_dim,
@@ -266,7 +266,7 @@ def _run_manager_stage(args) -> None:
     # Worker 생성 및 체크포인트 로드
     num_layers = getattr(args, 'num_layers', 2)
     use_jk_net = getattr(args, 'use_jk_net', False)
-    node_dim = 6
+    node_dim = 7
     worker = Worker(
         node_dim=node_dim,
         hidden_dim=args.hidden_dim,
@@ -289,7 +289,7 @@ def _run_manager_stage(args) -> None:
 
     # Init Manager
     manager_model = Manager(
-        zone_dim=6, target_dim=6, hidden_dim=256,  # [Phase 2B] target_dim 4→6
+        zone_dim=7, target_dim=6, hidden_dim=256,  # [Phase 2B] target_dim 4→6
         num_gat_layers=3, gat_heads=4, num_transformer_layers=3, transformer_heads=4
     ).to(device)
     print(f"📋 Manager: (hidden=256)")
@@ -303,30 +303,31 @@ def _run_manager_stage(args) -> None:
     best_reward = -float('inf')
     num_steps = (args.episodes + args.batch_size - 1) // args.batch_size
     
-    with tqdm(total=args.episodes, desc="Manager PPO", ncols=140, unit="ep") as pbar:
+    with tqdm(total=args.episodes, desc="Manager PPO", ncols=200, unit="ep") as pbar:
         for step in range(1, num_steps + 1):
             current_ep = step * args.batch_size
             
-            # [Phase 2E] Curriculum Learning (5 Phases, total 50000 episodes)
-            if current_ep <= 5000:
+            # [Phase 2E] Curriculum Learning (5 Phases, 비율 기반)
+            # 10% : 20% : 20% : 20% : 30% 비율로 전환
+            if current_ep <= int(args.episodes * 0.10):
                 # Phase 1: 단일 타겟, 무재해
                 current_num_targets = 1
                 hrl_env.env.disaster_prob = 0.0
                 hrl_env.env.dynamic_disaster = False
                 phase_str = 'P1:Single'
-            elif current_ep <= 15000:
+            elif current_ep <= int(args.episodes * 0.30):
                 # Phase 2: 다중 타겟, 무재해
                 current_num_targets = random.randint(3, 7)
                 hrl_env.env.disaster_prob = 0.0
                 hrl_env.env.dynamic_disaster = False
                 phase_str = 'P2:Multi'
-            elif current_ep <= 25000:
+            elif current_ep <= int(args.episodes * 0.50):
                 # Phase 3: 다중 타겟, 정적 재해 (HAZUS 가중치)
                 current_num_targets = random.randint(5, 10)
                 hrl_env.env.disaster_prob = 0.15
                 hrl_env.env.dynamic_disaster = False
                 phase_str = 'P3:Static'
-            elif current_ep <= 35000:
+            elif current_ep <= int(args.episodes * 0.70):
                 # Phase 4: 다수 타겟, 동적 재해 (Continuous Aftershock)
                 current_num_targets = random.randint(5, 12)
                 hrl_env.env.disaster_prob = 0.15
@@ -358,8 +359,6 @@ def _run_manager_stage(args) -> None:
                 'Rw': f"{logs['mean_reward']:.2f}",
                 'Rsc': f"{logs['mean_rescued']:.1f}/{current_num_targets}",
                 'SR': f"{sr:.1f}%",
-                'Trn': f"{logs['mean_manager_turns']:.1f}",
-                'WStp': f"{logs['mean_worker_steps']:.1f}"
             })
             pbar.update(args.batch_size)
             
@@ -412,10 +411,10 @@ if __name__ == "__main__":
                         help="총 에피소드 수 (--steps 미지정 시 사용, 기본 30000)")
     parser.add_argument("--steps", type=int, default=None,
                         help="총 gradient 업데이트 스텝 수 (지정 시 --episodes보다 우선)")
-    parser.add_argument("--batch_size", type=int, default=32,
-                        help="배치 크기: 스텝당 동시 실행 에피소드 수 (기본 32)")
-    parser.add_argument("--mini_batch_size", type=int, default=256,
-                        help="PPO 미니배치 크기 (기본 256)")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="배치 크기 (Worker 기본: 32, Manager 기본: 256)")
+    parser.add_argument("--mini_batch_size", type=int, default=None,
+                        help="PPO 미니배치 크기 (Worker 기본: 192, Manager 기본: 2048)")
     parser.add_argument(
         "--stage",
         type=str,
@@ -436,19 +435,19 @@ if __name__ == "__main__":
     # [HRL Phase 1] Worker 학습 플래그
     parser.add_argument("--zone_progress_reward", action="store_true",
                         help="Zone 전환 시 중간 보상 부여")
-    parser.add_argument("--use_gae", action="store_true",
+    parser.add_argument("--use_gae", action="store_true", default=True,
                         help="GAE(λ) Advantage 사용")
     parser.add_argument("--gae_lambda", type=float, default=0.95,
                         help="GAE λ 파라미터 (기본 0.95)")
-    parser.add_argument("--entropy_coeff", type=float, default=0.0,
+    parser.add_argument("--entropy_coeff", type=float, default=0.01,
                         help="Entropy Bonus 계수 (0이면 비활성)")
-    parser.add_argument("--use_cosine_lr", action="store_true",
+    parser.add_argument("--use_cosine_lr", action="store_true", default=True,
                         help="Cosine LR Scheduler 사용")
     # [Worker 환경/모델 제어]
     parser.add_argument("--masking_mode", type=str, default="soft_curr_next",
                         choices=["hard", "hard_full_seq", "soft_curr_next", "soft_flex"],
                         help="Action Masking 모드 (hard/hard_full_seq/soft_curr_next/soft_flex)")
-    parser.add_argument("--num_layers", type=int, default=2,
+    parser.add_argument("--num_layers", type=int, default=4,
                         help="GATv2 레이어 수 (1~4)")
     parser.add_argument("--use_jk_net", action="store_true",
                         help="JK-Net (Jumping Knowledge) 활성")
@@ -463,8 +462,14 @@ if __name__ == "__main__":
     parser.add_argument("--worker_ckpt", type=str, default=None, help="Path to specific worker checkpoint")
     
     # [Phase 1 Stage 2,3 Disaster Settings]
-    parser.add_argument("--disaster_prob", type=float, default=0.2, help="에피소드 내 재난 발생 확률 (Stage 2)")
+    parser.add_argument("--disaster_prob", type=float, default=0.0, help="에피소드 내 재난 발생 확률 (Stage 2)")
     parser.add_argument("--dynamic_disaster", action="store_true", help="에피소드 진행 중 동적 재난 발생 활성화 (Stage 3)")
 
     args = parser.parse_args()
+    
+    if args.batch_size is None:
+        args.batch_size = 32 if args.stage == "worker" else 256
+    if args.mini_batch_size is None:
+        args.mini_batch_size = 192 if args.stage == "worker" else 1024
+
     train_rl(args)

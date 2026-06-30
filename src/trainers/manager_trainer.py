@@ -14,6 +14,8 @@ import numpy as np
 from typing import Dict, List, Any
 from torch.distributions import Categorical
 
+REWARD_SCALE = 0.1  # PPO 안정성을 위한 보상 스케일링 (Return 50~160 → 5~16)
+
 class ManagerTrainer:
     def __init__(self, manager, hrl_env, K=1, lr=1e-4, max_grad_norm=1.0, config=None):
         self.manager = manager
@@ -71,6 +73,7 @@ class ManagerTrainer:
         ep_z_acts = [[] for _ in range(B)]
         
         ep_rewards = [[] for _ in range(B)]
+        ep_raw_rewards = [[] for _ in range(B)]  # 스케일링 전 원본 보상 (리포팅용)
         ep_values = [[] for _ in range(B)]
         ep_log_probs = [[] for _ in range(B)]
         
@@ -119,7 +122,7 @@ class ManagerTrainer:
                 
             # ── 모델 추론 (No Grad) ──
             K_zones = self.env.env.k
-            flat_zf = zone_features.view(A * K_zones, 6)
+            flat_zf = zone_features.view(A * K_zones, 7)
             ai = torch.arange(A, device=self.device).repeat_interleave(K_zones)
             aei = torch.cat([zone_edge_index + i*K_zones for i in range(A)], dim=1)
             
@@ -156,11 +159,17 @@ class ManagerTrainer:
             
             full_log_prob = t_log_prob + z_log_prob
             
+            # [PERF] GPU-CPU Sync Lock 병목 제거: 일괄 다운로드
+            t_act_cpu = t_act.cpu().numpy()
+            z_act_cpu = z_act.cpu().numpy()
+            full_log_prob_cpu = full_log_prob.cpu().numpy()
+            value_cpu = value.cpu().numpy()
+            
             for i, b in enumerate(active):
-                ep_t_acts[b].append(t_act[i].item())
-                ep_z_acts[b].append(z_act[i].item())
-                ep_log_probs[b].append(full_log_prob[i].item())
-                ep_values[b].append(value[i].item())
+                ep_t_acts[b].append(int(t_act_cpu[i]))
+                ep_z_acts[b].append(int(z_act_cpu[i]))
+                ep_log_probs[b].append(float(full_log_prob_cpu[i]))
+                ep_values[b].append(float(value_cpu[i]))
             
             # 환경 진행 전의 리워드 스냅샷
             prev_manager_turns = self.env.manager_turns.clone()
@@ -171,14 +180,17 @@ class ManagerTrainer:
             # 액션 적용 전: 이번 턴의 출발 구역 기록 (재방문 판별용) 및 PBRS 거리 스냅샷
             curr_start_zones = {}
             prev_dist_to_target = {}
+            curr_nodes_cpu = self.env.env.curr_nodes[active].cpu().numpy()
+            targets_cpu = self.env.targets[active].cpu().numpy()
+            
             for i, b in enumerate(active):
-                c_node_idx = int(self.env.env.curr_nodes[b].item())
+                c_node_idx = int(curr_nodes_cpu[i])
                 c_node = self.env.env.idx_to_node[c_node_idx]
                 curr_start_zones[b] = self.env.env.n2z[c_node]
                 
                 # PBRS용: 현재 위치에서 타겟까지의 초기 다익스트라 거리
-                t_idx = t_act[i].item()
-                target_node_idx = int(self.env.targets[b, t_idx].item())
+                t_idx = int(t_act_cpu[i])
+                target_node_idx = int(targets_cpu[i, t_idx])
                 d_prev = self.env.env.dist_matrix[c_node_idx, target_node_idx]
                 if d_prev == float('inf') or np.isinf(d_prev):
                     d_prev = self.env.env.max_dist
@@ -194,19 +206,25 @@ class ManagerTrainer:
             events, new_dones = self.env.step_manager(act_t_act, act_z_act)
             
             # [Phase 2C] 보상 재설계 — HAZUS 환경에 맞는 reward shaping
+            num_rescued_cpu = self.env.num_rescued[active].cpu().numpy()
+            manager_turns_cpu = self.env.manager_turns[active].cpu().numpy()
+            current_time_cpu = self.env.current_time[active].cpu().numpy()
+            curr_nodes_after_cpu = self.env.env.curr_nodes[active].cpu().numpy()
+            deadlines_cpu = self.env.deadlines[active].cpu().numpy()
+
             for i, b in enumerate(active):
-                # 1. 구출 보상 증폭: 10.0 → 20.0
-                reward_rescued = (self.env.num_rescued[b].item() - prev_rescued[b].item()) * 20.0
-                reward_turns = (self.env.manager_turns[b].item() - prev_manager_turns[b].item()) * -0.5
+                # 1. 구출 보상 하향 (중복 보상 방지): 20.0 → 10.0
+                reward_rescued = (num_rescued_cpu[i] - prev_rescued[b].item()) * 10.0
+                reward_turns = (manager_turns_cpu[i] - prev_manager_turns[b].item()) * -0.5
                 
                 # 워커 이동 횟수(Step) 대신 물리적 소요 시간(Time) 기준 페널티
-                elapsed_time = self.env.current_time[b].item() - prev_elapsed_time[b].item()
+                elapsed_time = current_time_cpu[i] - prev_elapsed_time[b].item()
                 reward_time = elapsed_time * -0.1
                 
                 # PBRS: 계수 축소 5.0 → 2.0 (과도한 밀집 보상이 스파스 보상을 압도하는 문제 해결)
-                c_node_idx_after = int(self.env.env.curr_nodes[b].item())
-                t_idx = t_act[i].item()
-                target_node_idx = int(self.env.targets[b, t_idx].item())
+                c_node_idx_after = int(curr_nodes_after_cpu[i])
+                t_idx = int(t_act_cpu[i])
+                target_node_idx = int(targets_cpu[i, t_idx])
                 d_curr = self.env.env.dist_matrix[c_node_idx_after, target_node_idx]
                 if d_curr == float('inf') or np.isinf(d_curr):
                     d_curr = self.env.env.max_dist
@@ -222,12 +240,14 @@ class ManagerTrainer:
                         self.env.target_failed[b, ti]):
                         turn_reward -= 5.0
                 
-                # [Phase 2C] 여유 시간 보너스 (데드라인 내 충분한 여유로 구출 시)
+                # [NEW] Slack Bonus (조기 구출 보상: 빨리 구출할수록 최대 +20.0 부여)
                 if reward_rescued > 0:
-                    t_idx_for_slack = t_act[i].item()
-                    slack = self.env.deadlines[b, t_idx_for_slack].item() - self.env.current_time[b].item()
-                    if slack > 0:
-                        turn_reward += min(slack / self.env.max_time * 5.0, 3.0)
+                    t_idx_urg = int(t_act_cpu[i])
+                    dline = float(deadlines_cpu[i, t_idx_urg])
+                    rem_time = max(0.0, dline - current_time_cpu[i])
+                    tot_time = max(1.0, dline)
+                    slack_bonus = 20.0 * (rem_time / tot_time)
+                    turn_reward += max(0.0, min(20.0, slack_bonus))
                 
                 # 명령 불복종(제자리 이탈) 페널티
                 if events[b] == 'zone_escaped':
@@ -245,7 +265,14 @@ class ManagerTrainer:
                 prev_start_zones[b] = curr_start_zones[b]
                 prev_target_failed[b] = self.env.target_failed[b].clone()
                 
-                ep_rewards[b].append(turn_reward)
+                # [NEW] Global Rescue Rate Bonus (에피소드 종료 시 구출률 비례 성과급 지급)
+                if new_dones[b].item() and not done_flags[b]:
+                    rescue_rate = num_rescued_cpu[i] / num_targets
+                    global_bonus = 50.0 * rescue_rate
+                    turn_reward += global_bonus
+                
+                ep_raw_rewards[b].append(turn_reward)
+                ep_rewards[b].append(turn_reward * REWARD_SCALE)
                 done_flags[b] = new_dones[b].item()
 
         # GAE 계산 및 버퍼 취합
@@ -282,7 +309,7 @@ class ManagerTrainer:
             buffer['returns'].extend(ret_tensor.cpu().numpy())
             buffer['advantages'].extend(adv_tensor.cpu().numpy())
             
-            batch_mean_reward += sum(r_list)
+            batch_mean_reward += sum(ep_raw_rewards[b])
             batch_mean_rescued += self.env.num_rescued[b].item()
             batch_mean_turns += self.env.manager_turns[b].item()
             batch_mean_steps += self.env.worker_steps[b].item()
@@ -354,7 +381,7 @@ class ManagerTrainer:
                 A = mb_zf.size(0)
                 
                 # GNN 포워드 (미분 활성화)
-                flat_zf = mb_zf.view(A * K_zones, 6)
+                flat_zf = mb_zf.view(A * K_zones, 7)
                 ai = torch.arange(A, device=self.device).repeat_interleave(K_zones)
                 aei = torch.cat([zone_edge_index + i*K_zones for i in range(A)], dim=1)
                 

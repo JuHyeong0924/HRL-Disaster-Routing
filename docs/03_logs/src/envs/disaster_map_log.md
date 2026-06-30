@@ -17,3 +17,9 @@
 
 ### Trial & Error
 - **오류 없음**: 첫 구현에서 8/8 테스트 통과
+
+## Phase 1E: Delta-based Disaster Shock (2026-06-30)
+
+### 핵심 변경 사항
+- `apply_disaster_damage()`가 누적 파괴도 기반이 아닌, 순간 충격량(Delta) 딕셔너리(`{node_id: damage_increase}`)를 반환하도록 수정.
+- 물리적 현실성을 위해 건물이나 에이전트의 파괴 기준을 누적 피해가 아닌 순간 가해진 충격의 크기로 변경함.

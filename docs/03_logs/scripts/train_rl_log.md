@@ -38,3 +38,36 @@ Manager 생성자 `target_dim=6`, 커리큘럼 4→5 Phases로 확장.
     *   **평균 Worker Step 수**: 64.4 스텝
 *   **체크포인트 저장 위치**: `logs/rl_manager_stage/2026-06-24_180420_manager/best_manager.pt`
 
+## Worker Default Hyperparameters 갱신 (2026-06-26)
+*   **배경**: Layer-4 Worker 모델이 Layer-2, 3 대비 재계산 횟수(Recomputes)와 지연시간(Latency)에서 압도적인 성능을 보임에 따라 Layer-4를 공식 워커로 채택.
+*   **Layer별 성능 비교 (평가 환경 기준)**:
+    | Worker 구조 | 구출률 (Rescue Rate) | 지연 시간 (Latency) | 총 이동거리 (Dist) | 경로 재계산 횟수 | 차량 파괴 (Destroys) |
+    |---|---|---|---|---|---|
+    | **Layer-2** | 76.67 % | 2.017 s | 126.6 | 48.0 회 | 0 대 |
+    | **Layer-3** | 77.33 % | 1.960 s | 127.2 | 47.6 회 | 0 대 |
+    | **Layer-4** | **79.33 %** | **1.537 s** | **127.0** | **39.6 회** | **0 대** |
+*   **변경 사항**: `train_rl.py`의 기본값(Defaults)을 다음과 같이 고정.
+    *   `--num_layers`: 4
+    *   `--batch_size`: 32
+    *   `--mini_batch_size`: 192 (VRAM 24GB OOM 방지)
+    *   `--use_gae`: True
+    *   `--use_cosine_lr`: True
+
+## Manager OOM 방지 및 하이퍼파라미터 동적 할당 (2026-06-26)
+### 1. `batch_size` / `mini_batch_size` 동적 분기
+*   **배경**: Worker와 Manager는 구조적으로 요구하는 배치 사이즈가 크게 다름. argparse에서 단계(Stage)별로 분기 처리.
+*   **Manager 셋팅**:
+    *   `batch_size=256`: Worker 추론이 `no_grad()`로 동결되어 속도가 빠르므로 수집량 대폭 증가.
+    *   `mini_batch_size=1024`: PPO 업데이트 단위.
+
+### 2. OOM(Out of Memory) 디버깅 내역
+*   **증상**: Manager 커리큘럼이 `P2:Multi`(타겟 수 3~7개)로 진입하면서 `torch.OutOfMemoryError` 발생. (PyTorch 할당 14.8GB + 단편화 7.1GB 낭비).
+*   **원인**: Manager의 `loss.backward()` 시 생성되는 GNN 역전파 계산 그래프 크기는 `mini_batch_size × num_targets × K_zones`에 비례함. Phase 1(타겟 1개)에서는 문제가 없었으나, Phase 2에서 7배로 연산 그래프가 폭증하며 VRAM 24GB를 초과함.
+*   **해결책**:
+    1.  `mini_batch_size`를 2048에서 **1024**로 축소하여 1회 역전파 시 올라가는 텐서 덩어리를 절반으로 감소.
+    2.  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 환경 변수를 추가하여 PyTorch 내부의 7.1GB 달하는 메모리 단편화(Fragmentation)를 해소, 가용 공간 확충.
+*   **결과**: Phase 1~5 전체 커리큘럼(최대 타겟 15개)을 OOM 없이 돌파할 수 있는 안정성 확보.
+
+### 3. tqdm 디스플레이 개선
+*   **변경**: `ncols=200`으로 확장.
+*   **이유**: 80~140자에서는 성공률(SR)이 Truncate(잘림) 현상으로 보이지 않았으나, 이를 해결하여 실시간 모니터링 편의성 강화.

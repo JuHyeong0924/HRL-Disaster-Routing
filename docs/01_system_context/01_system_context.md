@@ -34,8 +34,8 @@ HRL 구조는 두 단계(Phase)의 학습 및 실행으로 구성됩니다.
 ## 4. Key Capabilities & Features
 - **HAZUS-based Soft Closure**: FEMA HAZUS Earthquake Model의 Residual Capacity 기반 간선 가중치 체계(×1.0/2.0/4.0/20.0). 간선을 물리적으로 제거하지 않아 그래프 연결성을 항상 보장하며, Dijkstra가 손상 간선을 자연스럽게 회피.
 - **Continuous Aftershock**: 시간 축 기반(Omori's Law) 여진 스케줄링(8~15회). Manager/Worker 턴과 무관하게 `current_time`이 여진 시각을 넘기면 자동 트리거.
-- **UGV Destruction Model**: Complete(Closed) 간선 통과 시 30% 파괴 확률, Extensive(Danger) 간선 10% Trap 확률. Neural Worker는 damage 채널로 회피 학습 가능.
-- **Deadline-aware Manager**: 6-dim target features (deadline, time_remaining, dist, urgency_ratio, feasibility, slack)와 4-dim context (elapsed, rescued, num_feasible, avg_urgency)로 데드라인 인식 강화.
+- **UGV Destruction Model & Target KIA**: Closed 간선 통과 시 50% 파괴 확률, Danger 간선 20% 파괴 확률. 여진 발생 시 노드 파괴도의 순간 변화량(Delta)이 0.3 이상이면 에이전트 즉사(Agent KIA), 0.5 이상이면 타겟 건물이 붕괴하여 구조 미션이 실패(Target KIA)하는 물리 엔진 탑재.
+- **Deadline-aware Manager**: 조기 구출을 장려하는 Slack Bonus와 에피소드 종료 시 구출률에 비례하는 Global Rescue Rate Bonus를 도입하여 Reward Hacking(벼랑 끝 전술)을 방지함. 텐서 위험도를 Max로 매핑하여 거시적 위험 회피 능력을 갖춤.
 - **Cross-map Zero-shot Transfer**: 특정 맵(예: Anaheim)에서 학습된 Worker가 다른 맵에서도 재학습 없이 동작하도록 설계.
 - **Dynamic Masking & PBRS**: Action Masking과 PBRS를 도입하여 순환 궤적 제한 및 빠른 목표 도달 유도.
 - **Ablation Ready**: 다양한 구조적 변형을 플래그를 통해 실험 가능.

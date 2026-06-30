@@ -179,7 +179,7 @@ class HRLEnv:
         # 근거: Omori's Law — 여진은 시간 축에서 독립 발생 (물리적 타당성)
         self.global_step = 0
         if getattr(self.env, 'dynamic_disaster', False):
-            num_aftershocks = random.randint(8, 15)
+            num_aftershocks = random.randint(15, 25)
             total_time = self.max_time
             interval = total_time / (num_aftershocks + 1)
             self.aftershock_times = sorted([
@@ -236,10 +236,10 @@ class HRLEnv:
         }
         
     def get_zone_features(self):
-        """Zone 레벨 features [B, K_zones, 6]"""
+        """Zone 레벨 features [B, K_zones, 7]"""
         B = self.batch_size
         K_zones = self.env.k
-        feats = torch.zeros(B, K_zones, 6, device=self.env.device)
+        feats = torch.zeros(B, K_zones, 7, device=self.env.device)
         
         # ===== Ch.3 disaster_intensity 벡터화 (배치 공유, 1회 계산) =====
         adj_float = self.env._adj_matrix_tensor.float()                          # [N, N]
@@ -252,34 +252,35 @@ class HRLEnv:
         zone_adj_count_sum = zone_one_hot.T @ node_adj_count                      # [K]
         zone_avg_damage = zone_damage_sum / zone_adj_count_sum.clamp(min=1)       # [K]
         
-        for b in range(B):
-            c_node_idx = int(self.env.curr_nodes[b].item())
-            c_zone = int(self.env._node_zone_tensor[c_node_idx].item())
-            
-            # is_current (Ch.0)
-            feats[b, c_zone, 0] = 1.0
-            
-            # has_target (Ch.1)
-            for i in range(self.num_targets):
-                if not self.target_rescued[b, i]:
-                    tz = self.target_zones[b, i].item()
-                    feats[b, tz, 1] = 1.0
-                    
-            # is_visited (Ch.2)
-            v_nodes = self.env.visited_nodes[b].nonzero(as_tuple=True)[0]
-            for vn in v_nodes:
-                vz = int(self.env._node_zone_tensor[int(vn)].item())
-                feats[b, vz, 2] = 1.0
-            
-            # disaster_intensity (Ch.3) — 벡터화된 결과 사용
-            feats[b, :, 3] = zone_avg_damage
-                
-            # dist_from_curr (Ch.4)
-            p1 = self.env.zone_centroids[c_zone]
-            for z in range(K_zones):
-                p2 = self.env.zone_centroids[z]
-                dist = float(torch.norm(p1 - p2))
-                feats[b, z, 4] = dist / max(self.env.max_dist, 1.0)
+        # [NEW] Ch.6 node_damage 기반 disaster_intensity 벡터화 (Max로 변경)
+        zone_max_node_dmg = torch.zeros(K_zones, device=self.env.device)
+        zone_max_node_dmg.scatter_reduce_(0, self.env._node_zone_tensor.long(), self.env._node_damage_tensor, reduce='amax', include_self=False)
+        zone_avg_node_dmg = zone_max_node_dmg   # 변수명은 하위 호환성을 위해 유지하되 Max 값이 들어감
+        
+        # ===== [NEW] 100% Pure PyTorch Tensor Vectorization =====
+        # 1. Ch.0: is_current
+        curr_zones = self.env._node_zone_tensor[self.env.curr_nodes]  # [B]
+        feats[:, :, 0].scatter_(1, curr_zones.unsqueeze(1), 1.0)
+        
+        # 2. Ch.1: has_target
+        ch1 = torch.zeros(B, K_zones, device=self.env.device)
+        ch1.scatter_add_(1, self.target_zones, (~self.target_rescued).float())
+        feats[:, :, 1] = (ch1 > 0).float()
+        
+        # 3. Ch.2: is_visited
+        ch2 = self.env.visited_nodes @ zone_one_hot  # [B, N] @ [N, K] -> [B, K]
+        feats[:, :, 2] = (ch2 > 0).float()
+        
+        # 4. Ch.3 & Ch.6: Broadcast Damage metrics
+        feats[:, :, 3] = zone_avg_damage.unsqueeze(0).expand(B, K_zones)
+        feats[:, :, 6] = zone_avg_node_dmg.unsqueeze(0).expand(B, K_zones)
+        
+        # 5. Ch.4: dist_from_curr
+        all_centroids = self.env.zone_centroids.to(self.env.device)  # [K, 2]
+        curr_centroids = all_centroids[curr_zones]  # [B, 2]
+        diff = curr_centroids.unsqueeze(1) - all_centroids.unsqueeze(0)  # [B, K, 2]
+        ch4 = torch.norm(diff, dim=-1)  # [B, K]
+        feats[:, :, 4] = ch4 / max(self.env.max_dist, 1.0)
                 
         return feats
         
@@ -454,18 +455,17 @@ class HRLEnv:
                 if prev_idx != new_idx and self.env._adj_matrix_tensor[prev_idx, new_idx]:
                     status = self.env._status_matrix[prev_idx, new_idx].item()
                     # status: 0=Normal, 1=Caution, 2=Danger, 3=Closed
-                    if status == 3 and random.random() < 0.3:
+                    if status == 3 and random.random() < 0.5:
                         events[b] = 'agent_destroyed'
                         self.dones[b] = True
                         worker_done[b] = True
                         self.ugv_destroys[b] += 1
-                    elif status == 2 and random.random() < 0.1:
-                        # Extensive 등급: 10% Trap 확률 (시간 페널티, 복귀)
-                        self.current_time[b] += 30.0
-                        self.env.curr_nodes[b] = prev_nodes[b]
-                        events[b] = 'agent_trapped'
+                    elif status == 2 and random.random() < 0.2:
+                        # Extensive 등급: 20% 확률로 즉사 (Trap -> Destroy로 강화)
+                        events[b] = 'agent_destroyed'
+                        self.dones[b] = True
                         worker_done[b] = True
-                        need_rebuild = True
+                        self.ugv_destroys[b] += 1
             
             # [BUG FIX] 시간 기반 여진 체크 — per-batch 루프 밖에서 max(current_time) 기준으로 통합
             # 여진은 물리적 글로벌 이벤트이므로, 가장 빠른 배치가 해당 시각을 넘기면 모든 배치에 적용
@@ -473,13 +473,42 @@ class HRLEnv:
                 max_time = max(self.current_time[b].item() for b in active)
                 while (self.aftershock_cursor < len(self.aftershock_times) and
                        max_time >= self.aftershock_times[self.aftershock_cursor]):
-                    # 미세 여진 적용 (damage_prob=0.03: 3% 간선 영향)
-                    self.env.dm.apply_disaster_damage(damage_prob=0.03)
+                    # 미세 여진 적용 (damage_prob=0.05: 5% 간선 영향)
+                    affected_nodes = self.env.dm.apply_disaster_damage(damage_prob=0.05)
                     self.env.sync_tensors_from_graph()
                     self.env._update_zone_graph_weights()
                     self.env._update_dist_matrix()
                     self._recompute_zone_dist_matrix()  # ← [BUG FIX] 여진 후 Zone 거리 갱신
                     need_rebuild = True  # Worker edge_attr 갱신
+                    
+                    # [NEW] Dynamic Time-Window (동적 데드라인 축소)
+                    if affected_nodes:
+                        affected_zones = {self.env.n2z[n] for n in affected_nodes}
+                        # [PERF] GPU-CPU Sync Lock 방지: target_zones 일괄 다운로드
+                        tz_cpu = self.target_zones.cpu().numpy()
+                        for b in active:
+                            for i in range(self.num_targets):
+                                if not self.target_rescued[b, i] and tz_cpu[b, i] in affected_zones:
+                                    reduction = self.deadlines[b, i] * random.uniform(0.2, 0.4)
+                                    self.deadlines[b, i] = max(self.current_time[b].item() + 10.0, self.deadlines[b, i] - reduction)
+                                    
+                        # [NEW] Aftershock Strike (변화량 기반 직격타 파괴 및 타겟 압사)
+                        for b in active:
+                            # 1. Agent KIA (UGV 파괴: 순간 충격량 >= 0.3)
+                            c_node = int(self.env.curr_nodes[b].item())
+                            if c_node in affected_nodes and affected_nodes[c_node] >= 0.3:
+                                events[b] = 'agent_destroyed'
+                                self.dones[b] = True
+                                worker_done[b] = True
+                                self.ugv_destroys[b] += 1
+                                
+                            # 2. Target KIA (타겟 건물의 붕괴로 인한 구조 실패 처리: 순간 충격량 >= 0.5)
+                            for i in range(self.num_targets):
+                                if not self.target_rescued[b, i] and not self.target_failed[b, i]:
+                                    t_node = int(self.targets[b, i].item())
+                                    if t_node in affected_nodes and affected_nodes[t_node] >= 0.5:
+                                        self.target_failed[b, i] = True
+                    
                     self.aftershock_cursor += 1
                 
             if visualizer is not None and save_dir is not None and frame_idx_ref is not None:

@@ -157,7 +157,10 @@ class DisasterMap:
                 edge['injured'] = 0
                 if edge['has_building']:
                     edge['healthy'] = edge['total_people']
-            return
+            # [NEW] 노드 상태 초기화
+            for n in list(self.graph.nodes()):
+                self.graph.nodes[n]['damage'] = 0.0
+            return {}
         
         # ── 데미지 모드: 누적 데미지 + HAZUS Residual Capacity 기반 Soft Closure ──
         # [HAZUS Earthquake Model Technical Manual, Transportation Systems Chapter]
@@ -213,6 +216,29 @@ class DisasterMap:
                     num_injured = int(total_pop * injury_rate)
                     edge['injured'] = num_injured
                     edge['healthy'] = total_pop - num_injured
+                    
+        # [NEW] 노드 단위 재난 부여
+        affected_nodes = {}
+        for n in list(self.graph.nodes()):
+            node_data = self.graph.nodes[n]
+            if random.random() < damage_prob:
+                severity_roll = random.random()
+                if severity_roll < 0.40:
+                    new_damage = random.uniform(0.01, 0.2)
+                elif severity_roll < 0.70:
+                    new_damage = random.uniform(0.2, 0.5)
+                elif severity_roll < 0.95:
+                    new_damage = random.uniform(0.5, 0.8)
+                else:
+                    new_damage = random.uniform(0.8, 1.0)
+                
+                curr_dmg = node_data.get('damage', 0.0)
+                damage = min(1.0, curr_dmg + new_damage)
+                if damage > curr_dmg:
+                    affected_nodes[n] = damage - curr_dmg
+                node_data['damage'] = damage
+                
+        return affected_nodes
 
     def get_shortest_path(self, start_node, end_node):
         try:

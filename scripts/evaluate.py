@@ -26,8 +26,12 @@ def parse_args():
     parser.add_argument('--episodes', type=int, default=None, help="실행할 에피소드 수 (미지정시 mode별 기본값)")
     parser.add_argument('--map', type=str, default='Anaheim')
     parser.add_argument('--num_targets', type=int, default=15)
-    parser.add_argument('--worker_ckpt', type=str, default='logs/rl_worker_stage/2026-06-17_000139_worker/best.pt')
-    parser.add_argument('--manager_ckpt', type=str, default='logs/rl_manager_stage/2026-06-17_044403_manager_ppo/best_manager.pt')
+    parser.add_argument('--worker_ckpt', type=str, default='logs/rl_worker_stage/2026-06-26_151453_worker/best.pt')
+    parser.add_argument('--manager_ckpt', type=str, default='logs/rl_manager_stage/2026-06-26_190100_manager/best_manager.pt')
+    parser.add_argument('--num_layers', type=int, default=4, help="Worker GNN 레이어 수")
+    parser.add_argument('--disaster_prob', type=float, default=0.2, help="재난 발생 확률")
+    parser.add_argument('--dynamic_disaster', action='store_true', default=True, help="동적 여진 활성화")
+    parser.add_argument('--no_dynamic_disaster', action='store_true', help="동적 여진 비활성화")
     return parser.parse_args()
 
 def main():
@@ -38,8 +42,11 @@ def main():
     if args.episodes is None:
         args.episodes = {'benchmark': 10, 'analyze': 5, 'visualize': 1}[args.mode]
         
+    if args.no_dynamic_disaster:
+        args.dynamic_disaster = False
+
     print(f"Loading Models on {device}...")
-    neural_worker, neural_manager = load_neural_models(device, args.worker_ckpt, args.manager_ckpt)
+    neural_worker, neural_manager = load_neural_models(device, args.worker_ckpt, args.manager_ckpt, num_layers=args.num_layers)
     
     if args.mode == 'benchmark':
         models_to_test = [
@@ -51,7 +58,7 @@ def main():
             ('ALNS-Dijkstra', ALNS_Manager(None), None)
         ]
         
-        results = {m[0]: {'rescued': [], 'latency': [], 'recompute': [], 'failures': 0, 'total_dist': []} for m in models_to_test}
+        results = {m[0]: {'rescued': [], 'latency': [], 'recompute': [], 'ugv_destroys': [], 'total_dist': []} for m in models_to_test}
         print(f"\n🚀 Starting Benchmark on {args.map} ({args.episodes} Episodes)")
         print("=" * 80)
         
@@ -61,7 +68,12 @@ def main():
             for name, manager, worker in models_to_test:
                 set_seed(seed)
                 if name not in envs_cache:
-                    worker_env, hrl_env = load_eval_env(args.map, device)
+                    worker_env, hrl_env = load_eval_env(
+                        args.map, device, 
+                        disaster_prob=args.disaster_prob, 
+                        dynamic_disaster=args.dynamic_disaster, 
+                        num_layers=args.num_layers
+                    )
                     envs_cache[name] = (worker_env, hrl_env)
                 else:
                     worker_env, hrl_env = envs_cache[name]
@@ -69,16 +81,15 @@ def main():
                 actual_worker = worker if worker is not None else Dijkstra_Worker(worker_env)
                 hrl_env.worker = actual_worker
                 
-                rescued, latency, recompute, failed, total_dist = run_evaluation_episode(
+                rescued, latency, recompute, ugv_destroys, total_dist = run_evaluation_episode(
                     manager, actual_worker, hrl_env, args.num_targets, device, mode='benchmark'
                 )
                 
                 results[name]['rescued'].append(rescued)
                 results[name]['latency'].append(latency)
                 results[name]['recompute'].append(recompute)
+                results[name]['ugv_destroys'].append(ugv_destroys)
                 results[name]['total_dist'].append(total_dist)
-                if failed:
-                    results[name]['failures'] += 1
                     
             print(f"Episode {ep+1}/{args.episodes} completed.")
             
@@ -90,8 +101,8 @@ def main():
             lat = np.mean(results[name]['latency'])
             dist = np.mean(results[name]['total_dist'])
             recomp = np.mean(results[name]['recompute'])
-            fails = results[name]['failures']
-            print(f"{name:<15} | {resc:>13.2f} % | {lat:>13.3f} s | {dist:>10.1f} | {recomp:>10.1f} | {fails:>10}")
+            destroys = np.mean(results[name]['ugv_destroys'])
+            print(f"{name:<15} | {resc:>13.2f} % | {lat:>13.3f} s | {dist:>10.1f} | {recomp:>10.1f} | {destroys:>10.1f}")
         print("=" * 100)
 
     elif args.mode == 'analyze':

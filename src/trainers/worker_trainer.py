@@ -305,13 +305,13 @@ class HRLWorkerTrainer:
             while ep_count < episodes:
                 
                 # ---------------------------------------------------------
-                # HRL 단계별 커리큘럼 전환 로직 (25% : 25% : 50% 비율)
+                # HRL 단계별 커리큘럼 전환 로직 (10% : 30% : 60% 비율)
                 # ---------------------------------------------------------
-                if ep_count <= int(episodes * 0.25):
+                if ep_count <= int(episodes * 0.10):
                     self.env.disaster_prob = 0.0
                     self.env.dynamic_disaster = False
                     phase_str = 'P1:Normal'
-                elif ep_count <= int(episodes * 0.50):
+                elif ep_count <= int(episodes * 0.40):
                     self.env.disaster_prob = 0.2
                     self.env.dynamic_disaster = False
                     phase_str = 'P2:Static'

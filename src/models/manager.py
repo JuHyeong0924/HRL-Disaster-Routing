@@ -11,7 +11,7 @@ class Manager(nn.Module):
     Transformer Self-Attention으로 전역 컨텍스트를 추가한 뒤,
     Dual Head 디코더로 Target과 Zone을 단계적으로 선택합니다.
     """
-    def __init__(self, zone_dim=6, target_dim=6, hidden_dim=256,
+    def __init__(self, zone_dim=7, target_dim=6, hidden_dim=256,
                  num_gat_layers=3, gat_heads=4, num_transformer_layers=3,
                  transformer_heads=4, dropout=0.1):
         super().__init__()

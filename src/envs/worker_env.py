@@ -144,6 +144,11 @@ class WorkerEnv:
                 self._damage_matrix[i, j] = dmg
                 self._status_matrix[i, j] = st
 
+        # [NEW] 노드 데미지 텐서 (7번째 채널용)
+        self._node_damage_tensor = torch.zeros(self.num_nodes, dtype=torch.float32, device=device)
+        for i in range(self.num_nodes):
+            self._node_damage_tensor[i] = self.G.nodes[self.idx_to_node[i]].get('damage', 0.0)
+
         # Zone Adjacency Matrix Tensor (Manager Masking용) — 변경 없음
         self._zone_adj_matrix_tensor = torch.zeros((self.k, self.k), dtype=torch.bool, device=device)
         for u in self.ZG.nodes():
@@ -280,6 +285,10 @@ class WorkerEnv:
                 self._damage_matrix[i, j] = dmg
                 self._status_matrix[i, j] = st
         
+        # [NEW] 노드 데미지 동기화
+        for i in range(self.num_nodes):
+            self._node_damage_tensor[i] = self.G.nodes[self.idx_to_node[i]].get('damage', 0.0)
+        
         # dist_matrix GPU 텐서 갱신
         self._dist_matrix_tensor = torch.from_numpy(self.dist_matrix).float().to(self.device)
 
@@ -307,7 +316,7 @@ class WorkerEnv:
             
     def apply_dynamic_disaster(self):
         """[Phase 1 Stage 3] 에피소드 진행 중 동적 재난 발생 시뮬레이션"""
-        self.dm.apply_disaster_damage(damage_prob=self.disaster_prob)
+        affected_nodes = self.dm.apply_disaster_damage(damage_prob=self.disaster_prob)
         self.sync_tensors_from_graph()        # ← 텐서 먼저 동기화
         self._update_zone_graph_weights()
         self._update_dist_matrix()
@@ -330,11 +339,12 @@ class WorkerEnv:
                 
     def apply_aftershock(self):
         """[Phase 2 HRL] 에피소드 진행 중 동적 재난(여진) 발생 시뮬레이션 (Manager 경로 덮어쓰기 방지)"""
-        self.dm.apply_disaster_damage(damage_prob=self.disaster_prob)
+        affected_nodes = self.dm.apply_disaster_damage(damage_prob=self.disaster_prob)
         self.sync_tensors_from_graph()       # ← 텐서 먼저 동기화
         self._update_zone_graph_weights()    # ← 텐서 기반으로 Zone weight 갱신
         self._update_dist_matrix()
         # 주의: HRL 구조에서는 zone_sequences를 재계산하지 않음 (Manager의 z_act를 유지하기 위함)
+        return affected_nodes
                 
     def _get_current_and_next_zone_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """배치별 현재 Zone과 다음 Zone 반환. [B] 텐서 2개."""
@@ -354,7 +364,7 @@ class WorkerEnv:
         """배치 Worker 입력 상태 구성 [B, N, D] (Fully Vectorized)."""
         B = self.batch_size
         N = self.num_nodes
-        state_dim = 6
+        state_dim = 7
         state = torch.zeros(B, N, state_dim, device=self.device)
         
         curr_z, next_z = self._get_current_and_next_zone_batch()
@@ -409,6 +419,9 @@ class WorkerEnv:
                 
         # is_visited 채널 (Ch.5)
         state[:, :, 5] = self.visited_nodes
+            
+        # [NEW] node_damage 채널 (Ch.6)
+        state[:, :, 6] = self._node_damage_tensor.unsqueeze(0).expand(B, N)
             
         return state
     
@@ -484,15 +497,29 @@ class WorkerEnv:
         curr_z, next_z = self._get_current_and_next_zone_batch()
         nz_tensor = self._node_zone_tensor
         
+        # [PERF] GPU-CPU Sync Lock 병목 제거: 스칼라 반복 추출용 1D 텐서 일괄 다운로드
+        actions_cpu = actions.cpu().numpy()
+        curr_nodes_cpu = self.curr_nodes.cpu().numpy()
+        if self.subgoal_mode == 'node':
+            subgoal_nodes_cpu = self.subgoal_nodes.cpu().numpy()
+        else:
+            subgoal_nodes_cpu = None
+        target_nodes_cpu = self.target_nodes.cpu().numpy()
+        nz_tensor_cpu = nz_tensor.cpu().numpy()
+        curr_z_cpu = curr_z.cpu().numpy()
+        next_z_cpu = next_z.cpu().numpy()
+        steps_count_cpu = self.steps_count.cpu().numpy()
+        node_damage_cpu = self._node_damage_tensor.cpu().numpy()
+
         # [PBRS] 이동 전 거리 기록
         prev_dists = torch.zeros(B)
         for b in range(B):
             if not self.dones[b]:
-                ci = int(self.curr_nodes[b].item())
+                ci = int(curr_nodes_cpu[b])
                 if self.subgoal_mode == 'node':
-                    ti = int(self.subgoal_nodes[b].item())
+                    ti = int(subgoal_nodes_cpu[b])
                 else:
-                    ti = int(self.target_nodes[b].item())
+                    ti = int(target_nodes_cpu[b])
                 d = self._dist_matrix_tensor[ci, ti].item()
                 if d == float('inf') or np.isinf(d):
                     d = self.max_dist
@@ -503,23 +530,23 @@ class WorkerEnv:
                 continue
                 
             self.steps_count[b] += 1
-            action_idx = int(actions[b].item())
-            curr_idx = int(self.curr_nodes[b].item())
-            action_zone = int(nz_tensor[action_idx].item())
+            action_idx = int(actions_cpu[b])
+            curr_idx = int(curr_nodes_cpu[b])
+            action_zone = int(nz_tensor_cpu[action_idx])
             
             # 물리적 인접성 검사 (모든 모드 공통)
             if action_idx not in self._adj_list[curr_idx]:
                 # 물리적으로 연결되지 않은 노드 선택 → 무조건 에피소드 종료
                 rewards[b] = self.INVALID_PENALTY
                 self.dones[b] = True
-                infos[b] = {'reason': 'invalid', 'path_len': int(self.steps_count[b].item())}
+                infos[b] = {'reason': 'invalid', 'path_len': int(steps_count_cpu[b]) + 1}
                 continue
             
             # 제자리 선택 → stagnation 종료 (모든 모드 공통)
             if action_idx == curr_idx:
                 rewards[b] = self.INVALID_PENALTY
                 self.dones[b] = True
-                infos[b] = {'reason': 'stagnation', 'path_len': int(self.steps_count[b].item())}
+                infos[b] = {'reason': 'stagnation', 'path_len': int(steps_count_cpu[b]) + 1}
                 continue
             
             # 재방문 패널티 추가 (무한루프 방지)
@@ -529,22 +556,22 @@ class WorkerEnv:
             # Zone 위반 여부 판정 (masking_mode별 분기)
             is_oob = False
             if self.masking_mode == 'hard':
-                allowed = {int(curr_z[b].item()), int(next_z[b].item())}
+                allowed = {int(curr_z_cpu[b]), int(next_z_cpu[b])}
                 if action_zone not in allowed:
                     rewards[b] = self.INVALID_PENALTY
                     self.dones[b] = True
-                    infos[b] = {'reason': 'invalid', 'path_len': int(self.steps_count[b].item())}
+                    infos[b] = {'reason': 'invalid', 'path_len': int(steps_count_cpu[b]) + 1}
                     continue
             elif self.masking_mode == 'hard_full_seq':
                 allowed = set(self.zone_sequences[b])
                 if action_zone not in allowed:
                     rewards[b] = self.INVALID_PENALTY
                     self.dones[b] = True
-                    infos[b] = {'reason': 'invalid', 'path_len': int(self.steps_count[b].item())}
+                    infos[b] = {'reason': 'invalid', 'path_len': int(steps_count_cpu[b]) + 1}
                     continue
             elif self.masking_mode == 'soft_curr_next':
                 # Soft: 종료하지 않고 OOB 페널티만 부과
-                allowed = {int(curr_z[b].item()), int(next_z[b].item())}
+                allowed = {int(curr_z_cpu[b]), int(next_z_cpu[b])}
                 if action_zone not in allowed:
                     is_oob = True
             elif self.masking_mode == 'soft_flex':
@@ -557,8 +584,17 @@ class WorkerEnv:
             if curr_idx != action_idx and not self._adj_matrix_tensor[curr_idx, action_idx]:
                 rewards[b] = self.INVALID_PENALTY
                 self.dones[b] = True
-                infos[b] = {'reason': 'destroyed', 'path_len': int(self.steps_count[b].item())}
+                infos[b] = {'reason': 'destroyed', 'path_len': int(steps_count_cpu[b]) + 1}
                 continue
+                
+            # [NEW] 노드가 심각하게 파손된 경우 진입 페널티 및 파괴 판정
+            if node_damage_cpu[action_idx] > 0.8:
+                rewards[b] -= 30.0
+                if random.random() < 0.2: # 20% 확률로 함몰 파괴
+                    rewards[b] = self.INVALID_PENALTY
+                    self.dones[b] = True
+                    infos[b] = {'reason': 'destroyed', 'path_len': int(self.steps_count[b].item())}
+                    continue
                 
             self.curr_nodes[b] = action_idx
             # 물리적 이동 거리 누적

@@ -9,7 +9,7 @@ from src.models.worker import Worker
 from src.models.manager import Manager
 from src.envs.hrl_env import HRLEnv
 
-def load_eval_env(map_name: str, device: torch.device, disaster_prob: float = 0.05, dynamic_disaster: bool = True) -> tuple[WorkerEnv, HRLEnv]:
+def load_eval_env(map_name: str, device: torch.device, disaster_prob: float = 0.2, dynamic_disaster: bool = True, num_layers: int = 4) -> tuple[WorkerEnv, HRLEnv]:
     worker_env = WorkerEnv(
         f'data/{map_name}_node.tntp', f'data/{map_name}_net.tntp',
         zone_json=f'data/grid_{map_name}_node_to_zone.json',
@@ -21,12 +21,12 @@ def load_eval_env(map_name: str, device: torch.device, disaster_prob: float = 0.
     )
     
     # Dummy worker for env creation, it will be loaded later
-    worker = Worker(node_dim=6, hidden_dim=256, num_layers=2, dropout=0.0).to(device)
+    worker = Worker(node_dim=7, hidden_dim=256, num_layers=num_layers, dropout=0.0).to(device)
     hrl_env = HRLEnv(worker, worker_env)
     return worker_env, hrl_env
 
-def load_neural_models(device: torch.device, worker_ckpt: str, manager_ckpt: str) -> tuple[Worker, Manager]:
-    worker = Worker(node_dim=6, hidden_dim=256, num_layers=2, dropout=0.0).to(device)
+def load_neural_models(device: torch.device, worker_ckpt: str, manager_ckpt: str, num_layers: int = 4) -> tuple[Worker, Manager]:
+    worker = Worker(node_dim=7, hidden_dim=256, num_layers=num_layers, dropout=0.0).to(device)
     if os.path.exists(worker_ckpt):
         ckpt = torch.load(worker_ckpt, map_location=device, weights_only=False)
         state = ckpt.get('worker_state', ckpt.get('state_dict', ckpt))
@@ -36,7 +36,7 @@ def load_neural_models(device: torch.device, worker_ckpt: str, manager_ckpt: str
     worker.eval()
     
     manager = Manager(
-        zone_dim=6, target_dim=6, hidden_dim=256,  # [Phase 2B] target_dim 4→6
+        zone_dim=7, target_dim=6, hidden_dim=256,  # [Phase 2B] target_dim 4→6
         num_gat_layers=3, gat_heads=4, num_transformer_layers=3, transformer_heads=4
     ).to(device)
     if os.path.exists(manager_ckpt):
@@ -66,7 +66,7 @@ def get_manager_action(manager: Manager, hrl_env: HRLEnv, device: torch.device, 
         num_targets = hrl_env.num_targets
         K_zones = hrl_env.env.k
         
-        flat_zf = zf.view(K_zones, 6)
+        flat_zf = zf.view(K_zones, 7)
         ai = torch.arange(B, device=device).repeat_interleave(K_zones)
         zam = hrl_env.get_zone_adj_mask()[0]
         
@@ -238,4 +238,5 @@ def run_evaluation_episode(manager, worker, hrl_env, num_targets, device, mode="
             
     latency = time.time() - start_time
     total_dist = hrl_env.env.total_dist[0].item()
-    return rescued, latency, recompute_count, failed, total_dist
+    ugv_destroys = hrl_env.ugv_destroys[0].item()
+    return rescued, latency, recompute_count, ugv_destroys, total_dist

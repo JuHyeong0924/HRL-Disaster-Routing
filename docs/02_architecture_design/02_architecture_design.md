@@ -62,7 +62,7 @@
 
 #### `hrl_env.py` (`HRLEnv`)
 - **역할**: Manager가 여러 개의 타겟(Multi-OD)을 동시다발적으로 처리하고 데드라인(Deadline)을 관리할 수 있도록 래핑한 최상위 통합 환경.
-- **Phase 1B — 시간 기반 Continuous Aftershock**: 여진은 Manager/Worker 턴과 무관하게 `current_time` 축에서 독립적으로 발생 (Omori's Law 근거). `reset()` 시 8~15회 여진 스케줄 생성, Worker 루프 내에서 `aftershock_cursor`로 진행.
+- **Phase 1B — 시간 기반 Continuous Aftershock**: 여진은 Manager/Worker 턴과 무관하게 `current_time` 축에서 독립적으로 발생 (Omori's Law 근거). `reset()` 시 15~25회 여진 스케줄 생성, 여진 1회당 damage_prob=0.05 적용, Worker 루프 내에서 `aftershock_cursor`로 진행.
 - **Phase 1C — UGV 파괴 판정**: Worker step 직후 통과한 간선의 status 확인. Closed 간선 30% 파괴, Danger 간선 10% Trap(시간 페널티 +30.0, 복귀).
 - **Phase 2A — Target Features `[B, N, 6]`**:
   | Channel | 의미 | 범위 |
@@ -114,7 +114,7 @@
 
 ### 1.3. Trainers (`src/trainers/`)
 - **Trainer 기반 구조**: PPO (Proximal Policy Optimization)
-- **`worker_trainer.py`**: Worker PPO 학습. GAE 기반 어드밴티지 계산.
+- **`worker_trainer.py`**: Worker PPO 학습. GAE 기반 어드밴티지 계산. Normal (10%), Static (30%), Dynamic (60%) 단계의 재난 강화형 커리큘럼 적용.
 - **`manager_trainer.py` (Phase 2C, 2F)**:
   - **Context 생성**: `generate_context(elapsed, rescued, num_feasible, avg_urgency)` — h_last 제거
   - **보상 체계 (Phase 2C)**:
@@ -140,3 +140,51 @@
 3. **벤치마크 평가 (`evaluate_algorithms.py`)**:
    - `python scripts/evaluate_algorithms.py --episodes 100 --map Anaheim`
    - HRL(Neural), GA-Neural, ALNS-Neural, GA-Dijkstra, ALNS-Dijkstra 5개 모델에 대해 Rescue Rate, Latency, Recomputes, UGV Destroys 지표를 정량 비교. `src/models/heuristics.py`에 구현된 고전적 휴리스틱 매니저(GA, ALNS) 및 워커(Dijkstra)와 HRL 신경망을 동일한 시드 하에서 대결시켜 성능을 검증합니다.
+
+4. **Worker 전용 벤치마크 (`compare_workers.py`)**:
+   - `python scripts/compare_workers.py`
+   - ALNS Manager 하에서 Worker 모델(Layer-2, Layer-3, Layer-4) 간의 자율 주행 성능(Recomputes 감소, Latency 단축 등)을 정량 평가.
+
+## 3. Recent Architectural Refinements (2026-06-26)
+*   **Manager Tensor State Sync (`hrl_env.py`)**: 재난 발생(`reset()`) 직후 `zone_dist_matrix`가 갱신되지 않던 문제를 해결하여 Manager가 실시간 피해가 반영된 물리적 최단거리를 참조하도록 아키텍처 수정.
+*   **Per-Batch Aftershock Cursor (`hrl_env.py`)**: `aftershock_cursor`를 스칼라에서 `[B]` 형태의 독립 텐서로 변경하여 미니배치 내 개별 환경들의 동적 재난 스케줄 완전 격리.
+*   **Worker Edge-Attribute Sync (`worker_trainer.py`)**: WorkerTrainer 미니배치 수집 시 `env._build_graph_data()`를 명시적으로 호출하여 GNN이 최신 데미지(Damage) 채널 값을 기반으로 Attention 가중치를 연산하도록 데이터 파이프라인 동기화 보장.
+# Update: Node-Level Disasters, Dynamic Time-Windows, and Manager Urgency Reward
+
+## Worker State (7-dim)
+- **Shape**: `[B, N, 7]`
+- **Channels**:
+  - `0`: `is_curr` (1.0 if current node, 0.0 otherwise)
+  - `1`: `is_tgt` (1.0 if node is target, 0.0 otherwise)
+  - `2`: `zone_info` (1.0 if next zone, -1.0 if target zone, 0.0 otherwise)
+  - `3`: `dist_to_tgt` (Normalized distance)
+  - `4`: `dist_to_next_z` (Normalized distance)
+  - `5`: `is_visited` (1.0 if visited, 0.0 otherwise - Anti-Loop)
+  - `6`: `node_damage` (0.0 to 1.0, representing physical infrastructure collapse - Preemptive Detour)
+  
+## Manager Zone Features (7-dim)
+- **Shape**: `[B, K, 7]`
+- **Channels**:
+  - `0`: `is_current`
+  - `1`: `has_target`
+  - `2`: `is_visited`
+  - `3`: `disaster_intensity` (Edge-based Zone Average Damage)
+  - `4`: `dist_from_curr`
+  - `5`: `has_failed_target`
+  - `6`: `zone_max_node_damage` (Node-based Zone Max Damage - 최댓값을 추출하여 지뢰밭 회피 유도)
+  
+## Dynamic Time-Window
+When an aftershock occurs (`apply_aftershock` returns `affected_nodes`), the deadline of any target residing in the `affected_zones` shrinks by 20% to 40% uniformly:
+`reduction = deadlines * random.uniform(0.2, 0.4)`
+`deadline = max(current_time + 10.0, deadline - reduction)`
+
+## Slack Bonus & Global Rescue Rate (Manager Reward)
+Instead of rewarding the Manager for rescuing targets late (which caused reward hacking), we now use:
+- **Slack Bonus**: `slack_bonus = 20.0 * (rem_time / tot_time)`. Rescuing a target earlier yields a higher bonus (max +20.0).
+- **Global Rescue Rate Bonus**: `global_bonus = 50.0 * rescue_rate`. Granted at the end of the episode to emphasize overall success rather than local greedy rescues.
+- **Base Rescue Reward**: Reduced to `10.0` to prevent inflation.
+
+## Target KIA (Mission Evaporation) & Agent KIA
+When an aftershock occurs, the `affected_nodes` dictionary returns the **Delta (instant increase in damage)**.
+- **Agent KIA**: If the UGV's current node delta is $\ge 0.3$, the UGV is instantly destroyed (`agent_destroyed`).
+- **Target KIA**: If a unrescued target's node delta is $\ge 0.5$, the building collapses, the target dies (`target_failed = True`), and the manager receives a `-5.0` penalty.

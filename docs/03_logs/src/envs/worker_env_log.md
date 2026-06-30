@@ -18,3 +18,4 @@
 ## 텐서화 및 완전 벡터화 (2026-06-25)
 - **변경 로직**: 런타임(`step_batch`, `_get_state_batch`, `get_action_mask_batch` 등)에서 NetworkX의 파이썬 Dict 조회 구조를 완전히 제거. `__init__` 및 `sync_tensors_from_graph()`에서 GPU 메모리에 텐서(`_adj_matrix_tensor`, `_weight_matrix`, `_damage_matrix`, `_status_matrix`)로 구조를 캐싱하고, PyTorch 고급 인덱싱 문법만 사용하여 시뮬레이션 전이 연산을 $O(1)$ 배칭 행렬 연산으로 탈바꿈.
 - **의도**: CPU와 GPU 간의 병목 현상 및 파이썬 Loop 오버헤드 원천 차단. `test_phase1_env.py` 혹은 `verify_optimizations.py`를 통해 모든 로직이 동일하게 작동함을 무결점 증명.
+- [2026-06-29] Cache GPU tensors via cpu().numpy() for node_damage and active actions to remove sync locks.
